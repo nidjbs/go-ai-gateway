@@ -1,0 +1,11 @@
+services:
+  gateway:
+    build: .
+    command: ["--config", "/etc/light-llm-gateway/config.yaml"]
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    environment:
+      UPSTREAM_API_KEY: local-development-token
+    volumes:
+      - ./configs/config.example.yaml:/etc/light-llm-gateway/config.yaml:ro

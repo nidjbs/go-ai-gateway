@@ -1,0 +1,204 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+type Config struct {
+	Listen    string              `yaml:"listen"`
+	Healthz   string              `yaml:"healthz"`
+	Auth      AuthConfig          `yaml:"auth"`
+	Providers map[string]Provider `yaml:"providers"`
+	Aliases   map[string]Alias    `yaml:"aliases"`
+	Retry     RetryConfig         `yaml:"retry"`
+	Failover  FailoverConfig      `yaml:"failover"`
+}
+
+type AuthConfig struct {
+	Mode     string `yaml:"mode"`
+	TokenEnv string `yaml:"token_env"`
+}
+
+type Provider struct {
+	Type           string        `yaml:"type"`
+	APIKeyEnv      string        `yaml:"api_key_env"`
+	APIKey         string        `yaml:"-"`
+	BaseURL        string        `yaml:"base_url"`
+	RequestTimeout time.Duration `yaml:"request_timeout"`
+}
+
+type Alias struct {
+	Provider  string          `yaml:"provider,omitempty"`
+	Model     string          `yaml:"model,omitempty"`
+	Providers []AliasProvider `yaml:"providers,omitempty"`
+}
+
+type AliasProvider struct {
+	Name     string `yaml:"name"`
+	Model    string `yaml:"model"`
+	Priority int    `yaml:"priority"`
+}
+
+type RetryConfig struct {
+	Enabled                bool          `yaml:"enabled"`
+	MaxAttemptsPerProvider uint          `yaml:"max_attempts_per_provider"`
+	MaxElapsedTime         time.Duration `yaml:"max_elapsed_time"`
+	PerAttemptTimeout      time.Duration `yaml:"per_attempt_timeout"`
+	InitialInterval        time.Duration `yaml:"initial_interval"`
+	MaxInterval            time.Duration `yaml:"max_interval"`
+	Multiplier             float64       `yaml:"multiplier"`
+	Jitter                 float64       `yaml:"jitter"`
+	RetryableStatuses      []int         `yaml:"retryable_statuses"`
+}
+
+type FailoverConfig struct {
+	Enabled      bool `yaml:"enabled"`
+	MaxProviders uint `yaml:"max_providers"`
+}
+
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	cfg.applyDefaults()
+	if err := cfg.resolveSecrets(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (c *Config) applyDefaults() {
+	if c.Listen == "" {
+		c.Listen = "127.0.0.1:8080"
+	}
+	if c.Healthz == "" {
+		c.Healthz = c.Listen
+	}
+	if c.Auth.Mode == "" {
+		c.Auth.Mode = "none"
+	}
+	if c.Retry.MaxAttemptsPerProvider == 0 {
+		c.Retry.MaxAttemptsPerProvider = 1
+	}
+	if c.Retry.MaxElapsedTime == 0 {
+		c.Retry.MaxElapsedTime = 2 * time.Minute
+	}
+	if c.Retry.InitialInterval == 0 {
+		c.Retry.InitialInterval = 200 * time.Millisecond
+	}
+	if c.Retry.MaxInterval == 0 {
+		c.Retry.MaxInterval = 5 * time.Second
+	}
+	if c.Retry.Multiplier == 0 {
+		c.Retry.Multiplier = 2
+	}
+	if c.Retry.Jitter == 0 {
+		c.Retry.Jitter = 0.2
+	}
+	if c.Retry.RetryableStatuses == nil {
+		c.Retry.RetryableStatuses = []int{408, 429, 500, 502, 503, 504}
+	}
+	if !c.Retry.Enabled {
+		c.Retry.Enabled = true
+	}
+	if !c.Failover.Enabled {
+		c.Failover.Enabled = true
+	}
+}
+
+func (c *Config) resolveSecrets() error {
+	for name, provider := range c.Providers {
+		if provider.APIKeyEnv == "" {
+			continue
+		}
+		value, ok := os.LookupEnv(provider.APIKeyEnv)
+		if !ok || strings.TrimSpace(value) == "" {
+			return fmt.Errorf("provider %q: api_key_env %q is unset or empty", name, provider.APIKeyEnv)
+		}
+		provider.APIKey = value
+		c.Providers[name] = provider
+	}
+	return nil
+}
+
+func (c *Config) Validate() error {
+	for _, address := range []struct{ name, value string }{{"listen", c.Listen}, {"healthz", c.Healthz}} {
+		if _, _, err := net.SplitHostPort(address.value); err != nil {
+			return fmt.Errorf("invalid %s address %q: %w", address.name, address.value, err)
+		}
+	}
+	if c.Auth.Mode != "none" && c.Auth.Mode != "static" {
+		return fmt.Errorf("auth.mode %q is unsupported", c.Auth.Mode)
+	}
+	if c.Auth.Mode == "static" && strings.TrimSpace(c.Auth.TokenEnv) == "" {
+		return errors.New("auth.token_env is required when auth.mode is static")
+	}
+	if len(c.Providers) == 0 {
+		return errors.New("at least one provider is required")
+	}
+	for name, provider := range c.Providers {
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(provider.BaseURL) == "" {
+			return fmt.Errorf("provider %q: base_url is required", name)
+		}
+		if provider.Type != "" && provider.Type != "openai" {
+			return fmt.Errorf("provider %q: type %q is unsupported", name, provider.Type)
+		}
+	}
+	if len(c.Aliases) == 0 {
+		return errors.New("at least one alias is required")
+	}
+	for alias, definition := range c.Aliases {
+		providers := definition.Providers
+		if len(providers) == 0 && definition.Provider != "" {
+			providers = []AliasProvider{{Name: definition.Provider, Model: definition.Model}}
+		}
+		if len(providers) == 0 {
+			return fmt.Errorf("alias %q: provider is required", alias)
+		}
+		for i, candidate := range providers {
+			if _, ok := c.Providers[candidate.Name]; !ok {
+				return fmt.Errorf("alias %q providers[%d]: unknown provider %q", alias, i, candidate.Name)
+			}
+			if strings.TrimSpace(candidate.Model) == "" {
+				return fmt.Errorf("alias %q providers[%d]: model is required", alias, i)
+			}
+		}
+	}
+	return nil
+}
+
+func (a Alias) NormalizedProviders() []AliasProvider {
+	if len(a.Providers) > 0 {
+		out := append([]AliasProvider(nil), a.Providers...)
+		return out
+	}
+	if a.Provider == "" {
+		return nil
+	}
+	return []AliasProvider{{Name: a.Provider, Model: a.Model}}
+}
+
+func (c *Config) AliasNames() []string {
+	names := make([]string, 0, len(c.Aliases))
+	for name := range c.Aliases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}

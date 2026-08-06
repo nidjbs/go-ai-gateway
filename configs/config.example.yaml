@@ -1,0 +1,36 @@
+listen: 127.0.0.1:8080
+healthz: 127.0.0.1:8081
+
+auth:
+  mode: none
+  token_env: GATEWAY_STATIC_TOKEN
+
+providers:
+  local:
+    type: openai
+    base_url: http://host.docker.internal:19090/v1
+    api_key_env: UPSTREAM_API_KEY
+    request_timeout: 30s
+
+aliases:
+  chat:
+    provider: local
+    model: mock-chat
+  embedding:
+    provider: local
+    model: mock-embedding
+
+retry:
+  enabled: true
+  max_attempts_per_provider: 2
+  max_elapsed_time: 30s
+  per_attempt_timeout: 10s
+  initial_interval: 200ms
+  max_interval: 2s
+  multiplier: 2
+  jitter: 0.2
+  retryable_statuses: [408, 429, 500, 502, 503, 504]
+
+failover:
+  enabled: true
+  max_providers: 0
