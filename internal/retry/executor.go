@@ -14,7 +14,11 @@ import (
 	"example.com/light-llm-gateway/internal/routing"
 )
 
-type Attempts struct{ Total int }
+type Attempts struct {
+	Total     int
+	Retries   int
+	Failovers int
+}
 
 func Execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error)) (T, routing.Candidate, Attempts, error) {
 	return execute(ctx, retryCfg, failoverCfg, candidates, attempt, sleep, rand.Float64)
@@ -34,10 +38,16 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 		maxAttempts = 1
 	}
 	for i := 0; i < limit; i++ {
+		if i > 0 {
+			attempts.Failovers++
+		}
 		candidate := candidates[i]
 		lastCandidate = candidate
 		started := time.Now()
 		for n := uint(0); n < maxAttempts; n++ {
+			if n > 0 {
+				attempts.Retries++
+			}
 			attempts.Total++
 			attemptCtx := ctx
 			cancel := func() {}

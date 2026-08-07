@@ -133,6 +133,7 @@ wait_for "${backup_url}/healthz" backup
 cat >"$tmp_dir/config.yaml" <<EOF
 listen: 127.0.0.1:${gateway_port}
 healthz: 127.0.0.1:${health_port}
+readyz_wait_time: 0s
 auth:
   mode: static
   token_env: GATEWAY_STATIC_TOKEN
@@ -170,6 +171,13 @@ EOF
 GATEWAY_STATIC_TOKEN=gateway-token PRIMARY_UPSTREAM_TOKEN=primary-token BACKUP_UPSTREAM_TOKEN=backup-token "$tmp_dir/gateway" --config "$tmp_dir/config.yaml" >"$tmp_dir/gateway.log" 2>&1 &
 gateway_pid=$!
 wait_for "http://127.0.0.1:${health_port}/healthz" gateway
+
+run_case "operational endpoints"
+assert_status 200 "$(request GET /livez '' '' "$tmp_dir/livez.json")" "$tmp_dir/livez.json"
+readyz_status="$(curl --silent --show-error --output "$tmp_dir/readyz.json" --write-out '%{http_code}' "http://127.0.0.1:${health_port}/readyz")"
+assert_status 204 "$readyz_status" "$tmp_dir/readyz.json"
+curl --fail --silent "http://127.0.0.1:${health_port}/metrics" >"$tmp_dir/metrics.txt"
+pass_case "operational endpoints"
 
 run_case "health, auth, and model aliases"
 assert_status 200 "$(request GET /healthz '' '' "$tmp_dir/health.json")" "$tmp_dir/health.json"
@@ -254,6 +262,10 @@ assert_status 400 "$(request POST /v1/chat/completions "$unknown" gateway-token 
 empty_embedding='{"model":"embedding","input":""}'
 assert_status 400 "$(request POST /v1/embeddings "$empty_embedding" gateway-token "$tmp_dir/empty-embedding.json")" "$tmp_dir/empty-embedding.json"
 pass_case "embeddings and validation"
+
+curl --fail --silent "http://127.0.0.1:${health_port}/metrics" >"$tmp_dir/metrics-after-requests.txt"
+grep -q 'ai_gateway_llm_request_duration_seconds' "$tmp_dir/metrics-after-requests.txt"
+grep -q 'ai_gateway_llm_token_usage' "$tmp_dir/metrics-after-requests.txt"
 
 failed=0
 printf 'All E2E cases passed.\n'

@@ -13,13 +13,26 @@ import (
 )
 
 type Config struct {
-	Listen    string              `yaml:"listen"`
-	Healthz   string              `yaml:"healthz"`
-	Auth      AuthConfig          `yaml:"auth"`
-	Providers map[string]Provider `yaml:"providers"`
-	Aliases   map[string]Alias    `yaml:"aliases"`
-	Retry     RetryConfig         `yaml:"retry"`
-	Failover  FailoverConfig      `yaml:"failover"`
+	Listen            string              `yaml:"listen"`
+	Healthz           string              `yaml:"healthz"`
+	ReadyzWaitTime    time.Duration       `yaml:"readyz_wait_time"`
+	Auth              AuthConfig          `yaml:"auth"`
+	Providers         map[string]Provider `yaml:"providers"`
+	Aliases           map[string]Alias    `yaml:"aliases"`
+	Retry             RetryConfig         `yaml:"retry"`
+	Failover          FailoverConfig      `yaml:"failover"`
+	readyzWaitTimeSet bool
+}
+
+func (c *Config) UnmarshalYAML(value *yaml.Node) error {
+	type raw Config
+	var decoded raw
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	*c = Config(decoded)
+	c.readyzWaitTimeSet = hasYAMLKey(value, "readyz_wait_time")
+	return nil
 }
 
 type AuthConfig struct {
@@ -129,6 +142,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Healthz == "" {
 		c.Healthz = c.Listen
+	}
+	if !c.readyzWaitTimeSet {
+		c.ReadyzWaitTime = 10 * time.Second
 	}
 	if c.Auth.Mode == "" {
 		c.Auth.Mode = "none"

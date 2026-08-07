@@ -12,7 +12,11 @@ export UPSTREAM_API_KEY=replace-with-upstream-key
 go run ./cmd/gateway --config configs/config.yaml
 ```
 
-The sample configuration serves the API at `http://127.0.0.1:8080` and health checks at `http://127.0.0.1:8081/healthz`.
+The sample configuration serves the API at `http://127.0.0.1:8080` and operational endpoints at `http://127.0.0.1:8081`.
+
+- `GET /healthz` and `GET /livez` return process liveness.
+- `GET /readyz` returns `204` when the startup readiness window has elapsed.
+- `GET /metrics` exposes Prometheus metrics, including SIU-compatible LLM request latency, TTFT, output-token pacing, and token-usage histograms.
 
 ```bash
 curl http://127.0.0.1:8080/v1/models
@@ -54,6 +58,9 @@ The gateway retries eligible failures against the current provider before failin
 ## API Surface
 
 - `GET /healthz`
+- `GET /livez`
+- `GET /readyz` (operational listener)
+- `GET /metrics` (operational listener)
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/embeddings`

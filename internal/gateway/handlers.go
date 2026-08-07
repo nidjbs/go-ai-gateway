@@ -17,6 +17,7 @@ import (
 	"example.com/light-llm-gateway/internal/apierr"
 	"example.com/light-llm-gateway/internal/auth"
 	"example.com/light-llm-gateway/internal/config"
+	"example.com/light-llm-gateway/internal/metrics"
 	"example.com/light-llm-gateway/internal/provider"
 	"example.com/light-llm-gateway/internal/retry"
 	"example.com/light-llm-gateway/internal/routing"
@@ -33,6 +34,7 @@ type handler struct {
 	authenticator auth.Authenticator
 	usageSink     usage.Sink
 	provider      *provider.Client
+	metrics       *metrics.Recorder
 }
 
 func (h handler) healthz(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
@@ -90,12 +92,14 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		h.recordUsage(r.Context(), started, "chat.completions", request.Model, candidate, 0, 0, false, http.StatusBadGateway)
+		h.recordMetrics(r.Context(), started, "chat.completions", request.Model, candidate, 0, 0, time.Time{}, http.StatusBadGateway, "upstream_error")
 		h.writeUpstreamError(w, r, "chat.completions", err)
 		return
 	}
 	out := replaceModel(result.Body, request.Model)
 	writeRawJSON(w, http.StatusOK, out)
 	h.recordUsage(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, false, http.StatusOK)
+	h.recordMetrics(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, http.StatusOK, "")
 	h.logger.Info("request complete", "request_id", requestID(r), "endpoint", "chat.completions", "provider", candidate.Name, "attempts", attempts.Total, "status", http.StatusOK, "upstream_duration_ms", time.Since(started).Milliseconds())
 }
 
@@ -128,6 +132,8 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 		return h.provider.OpenStream(ctx, bodyWithModel(body, c.Model), c)
 	})
 	if err != nil {
+		h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, true, http.StatusBadGateway)
+		h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, time.Time{}, http.StatusBadGateway, "upstream_error")
 		h.writeUpstreamError(w, r, "chat.completions", err)
 		return
 	}
@@ -142,6 +148,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	seen := false
+	var firstToken time.Time
 	scanner := bufio.NewScanner(stream.Response.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -153,9 +160,13 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, true, http.StatusOK)
+			h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, http.StatusOK, "")
 			return
 		}
 		seen = true
+		if firstToken.IsZero() {
+			firstToken = time.Now()
+		}
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", string(replaceModel([]byte(payload), alias)))
 		flusher.Flush()
 	}
@@ -164,6 +175,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 		flusher.Flush()
 	}
 	h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, true, http.StatusBadGateway)
+	h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, http.StatusBadGateway, "upstream_error")
 }
 
 func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
@@ -190,11 +202,14 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		return h.provider.Request(ctx, "embeddings", bodyWithModel(body, c.Model), c)
 	})
 	if err != nil {
+		h.recordUsage(r.Context(), started, "embeddings", request.Model, candidate, 0, 0, false, http.StatusBadGateway)
+		h.recordMetrics(r.Context(), started, "embeddings", request.Model, candidate, 0, 0, time.Time{}, http.StatusBadGateway, "upstream_error")
 		h.writeUpstreamError(w, r, "embeddings", err)
 		return
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.recordUsage(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, 0, false, http.StatusOK)
+	h.recordMetrics(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, 0, time.Time{}, http.StatusOK, "")
 }
 
 func (h handler) writeUpstreamError(w http.ResponseWriter, r *http.Request, endpoint string, err error) {
@@ -266,10 +281,17 @@ func requestID(r *http.Request) string {
 	return "unknown"
 }
 
+func (h handler) recordMetrics(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate, input, output int, firstToken time.Time, status int, errorType string) {
+	responseModel := candidate.Model
+	h.metrics.Record(ctx, metrics.Request{Operation: endpoint, Provider: candidate.Name, Model: alias, UpstreamModel: candidate.Model, StartedAt: started}, metrics.Result{StatusCode: status, ErrorType: errorType, ResponseModel: responseModel, InputTokens: input, OutputTokens: output, FirstTokenAt: firstToken, CompletedAt: time.Now()})
+}
+
 func (h handler) recordUsage(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate, input, output int, streaming bool, status int) {
+	completed := time.Now()
+	event := usage.Event{RequestID: middleware.GetReqID(ctx), Endpoint: endpoint, Alias: alias, RequestedModel: alias, ResolvedModel: candidate.Model, Provider: candidate.Name, UpstreamModel: candidate.Model, StatusCode: status, Success: status >= 200 && status < 300, InputTokens: input, OutputTokens: output, TotalTokens: input + output, DurationMS: completed.Sub(started).Milliseconds(), StartedAt: started, CompletedAt: completed, Streaming: streaming}
 	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
-	if err := h.usageSink.Record(recordCtx, usage.Event{RequestID: middleware.GetReqID(ctx), Endpoint: endpoint, Alias: alias, Provider: candidate.Name, UpstreamModel: candidate.Model, StatusCode: status, StartedAt: started, CompletedAt: time.Now(), InputTokens: input, OutputTokens: output, Streaming: streaming}); err != nil {
+	if err := h.usageSink.Record(recordCtx, event); err != nil {
 		h.logger.Warn("usage sink failed", "endpoint", endpoint, "error", err)
 	}
 }
