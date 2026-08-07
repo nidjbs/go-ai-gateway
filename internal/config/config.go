@@ -57,12 +57,52 @@ type RetryConfig struct {
 	Multiplier             float64       `yaml:"multiplier"`
 	Jitter                 float64       `yaml:"jitter"`
 	RetryableStatuses      []int         `yaml:"retryable_statuses"`
+	enabledSet             bool
 }
 
 type FailoverConfig struct {
 	Enabled      bool `yaml:"enabled"`
 	MaxProviders uint `yaml:"max_providers"`
+	enabledSet   bool
 }
+
+func (c *RetryConfig) UnmarshalYAML(value *yaml.Node) error {
+	type raw RetryConfig
+	var decoded raw
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	*c = RetryConfig(decoded)
+	c.enabledSet = hasYAMLKey(value, "enabled")
+	return nil
+}
+
+func (c *FailoverConfig) UnmarshalYAML(value *yaml.Node) error {
+	type raw FailoverConfig
+	var decoded raw
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	*c = FailoverConfig(decoded)
+	c.enabledSet = hasYAMLKey(value, "enabled")
+	return nil
+}
+
+func hasYAMLKey(value *yaml.Node, key string) bool {
+	if value.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		if value.Content[i].Value == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (c RetryConfig) IsEnabled() bool { return !c.enabledSet || c.Enabled }
+
+func (c FailoverConfig) IsEnabled() bool { return !c.enabledSet || c.Enabled }
 
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -114,12 +154,6 @@ func (c *Config) applyDefaults() {
 	if c.Retry.RetryableStatuses == nil {
 		c.Retry.RetryableStatuses = []int{408, 429, 500, 502, 503, 504}
 	}
-	if !c.Retry.Enabled {
-		c.Retry.Enabled = true
-	}
-	if !c.Failover.Enabled {
-		c.Failover.Enabled = true
-	}
 }
 
 func (c *Config) resolveSecrets() error {
@@ -148,6 +182,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Auth.Mode == "static" && strings.TrimSpace(c.Auth.TokenEnv) == "" {
 		return errors.New("auth.token_env is required when auth.mode is static")
+	}
+	if c.Retry.Multiplier <= 0 {
+		return errors.New("retry.multiplier must be greater than zero")
+	}
+	if c.Retry.Jitter < 0 || c.Retry.Jitter >= 1 {
+		return errors.New("retry.jitter must be greater than or equal to zero and less than one")
 	}
 	if len(c.Providers) == 0 {
 		return errors.New("at least one provider is required")

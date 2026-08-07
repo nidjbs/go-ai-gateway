@@ -84,16 +84,28 @@ func decodeHTTPError(status int, data []byte) error {
 type Stream struct {
 	Response  *http.Response
 	StartedAt time.Time
+	cancel    context.CancelFunc
+}
+
+func (s *Stream) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	if s.Response == nil || s.Response.Body == nil {
+		return nil
+	}
+	return s.Response.Body.Close()
 }
 
 func (c *Client) OpenStream(ctx context.Context, body json.RawMessage, candidate routing.Candidate) (*Stream, error) {
+	cancel := func() {}
 	if candidate.Timeout > 0 {
-		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, candidate.Timeout)
-		defer cancel()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(candidate.BaseURL, "chat/completions"), bytes.NewReader(body))
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("create upstream stream: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -101,12 +113,14 @@ func (c *Client) OpenStream(ctx context.Context, body json.RawMessage, candidate
 	req.Header.Set("Authorization", "Bearer "+candidate.APIKey)
 	response, err := c.HTTPClient.Do(req)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	if response.StatusCode >= http.StatusBadRequest {
 		defer response.Body.Close()
+		defer cancel()
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		return nil, decodeHTTPError(response.StatusCode, data)
 	}
-	return &Stream{Response: response, StartedAt: time.Now()}, nil
+	return &Stream{Response: response, StartedAt: time.Now(), cancel: cancel}, nil
 }

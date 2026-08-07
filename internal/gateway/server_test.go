@@ -24,7 +24,7 @@ func TestChatForwardsProviderModelAndReturnsAlias(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := New(Deps{Config: &config.Config{Listen: "127.0.0.1:0", Providers: map[string]config.Provider{"local": {BaseURL: upstream.URL, APIKey: "upstream-token"}}, Aliases: map[string]config.Alias{"chat": {Provider: "local", Model: "provider-model"}}, Retry: config.RetryConfig{MaxAttemptsPerProvider: 1}, Failover: config.FailoverConfig{Enabled: true}}, Authenticator: auth.NoopAuthenticator{}})
+	server := newTestServer(upstream.URL)
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat","messages":[{"role":"user","content":"hi"}]}`))
 	response := httptest.NewRecorder()
 	server.HTTP.Handler.ServeHTTP(response, request)
@@ -38,4 +38,63 @@ func TestChatForwardsProviderModelAndReturnsAlias(t *testing.T) {
 	if body["model"] != "chat" {
 		t.Fatalf("response model = %v, want chat", body["model"])
 	}
+}
+
+func TestUpstreamErrorsAreSanitized(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"internal-provider-secret"}}`))
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(upstream.URL)
+	for _, endpoint := range []string{"/v1/chat/completions", "/v1/embeddings"} {
+		t.Run(endpoint, func(t *testing.T) {
+			body := `{"model":"chat","messages":[{"role":"user","content":"hi"}]}`
+			if endpoint == "/v1/embeddings" {
+				body = `{"model":"chat","input":"hi"}`
+			}
+			request := httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
+			response := httptest.NewRecorder()
+			server.HTTP.Handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			if strings.Contains(response.Body.String(), "internal-provider-secret") {
+				t.Fatalf("response leaked upstream detail: %s", response.Body.String())
+			}
+			if !strings.Contains(response.Body.String(), upstreamErrorMessage) {
+				t.Fatalf("response = %s, want sanitized upstream message", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestStreamOpenErrorIsSanitized(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"internal-stream-secret"}}`))
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(upstream.URL)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	response := httptest.NewRecorder()
+	server.HTTP.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "internal-stream-secret") || !strings.Contains(response.Body.String(), upstreamErrorMessage) {
+		t.Fatalf("unexpected response body: %s", response.Body.String())
+	}
+}
+
+func newTestServer(upstreamURL string) *Server {
+	return New(Deps{Config: &config.Config{
+		Listen:    "127.0.0.1:0",
+		Providers: map[string]config.Provider{"local": {BaseURL: upstreamURL, APIKey: "upstream-token"}},
+		Aliases:   map[string]config.Alias{"chat": {Provider: "local", Model: "provider-model"}},
+		Retry:     config.RetryConfig{MaxAttemptsPerProvider: 1},
+		Failover:  config.FailoverConfig{},
+	}, Authenticator: auth.NoopAuthenticator{}})
 }

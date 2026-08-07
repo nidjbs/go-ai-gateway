@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
+	"math/rand/v2"
 	"net"
 	"time"
 
@@ -15,6 +17,10 @@ import (
 type Attempts struct{ Total int }
 
 func Execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error)) (T, routing.Candidate, Attempts, error) {
+	return execute(ctx, retryCfg, failoverCfg, candidates, attempt, sleep, rand.Float64)
+}
+
+func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error), sleepFn func(context.Context, time.Duration) error, random func() float64) (T, routing.Candidate, Attempts, error) {
 	var zero T
 	var lastCandidate routing.Candidate
 	var lastErr error
@@ -23,11 +29,15 @@ func Execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 	if failoverCfg.MaxProviders > 0 && int(failoverCfg.MaxProviders) < limit {
 		limit = int(failoverCfg.MaxProviders)
 	}
+	maxAttempts := retryCfg.MaxAttemptsPerProvider
+	if maxAttempts == 0 || !retryCfg.IsEnabled() {
+		maxAttempts = 1
+	}
 	for i := 0; i < limit; i++ {
 		candidate := candidates[i]
 		lastCandidate = candidate
 		started := time.Now()
-		for n := uint(0); n < retryCfg.MaxAttemptsPerProvider; n++ {
+		for n := uint(0); n < maxAttempts; n++ {
 			attempts.Total++
 			attemptCtx := ctx
 			cancel := func() {}
@@ -40,18 +50,39 @@ func Execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 				return value, candidate, attempts, nil
 			}
 			lastErr = err
-			if !retryable(err, retryCfg) || n+1 == retryCfg.MaxAttemptsPerProvider || time.Since(started) >= retryCfg.MaxElapsedTime {
+			if !retryable(err, retryCfg) || n+1 == maxAttempts || (retryCfg.MaxElapsedTime > 0 && time.Since(started) >= retryCfg.MaxElapsedTime) {
 				break
 			}
-			if err := sleep(ctx, retryCfg.InitialInterval); err != nil {
+			if err := sleepFn(ctx, backoffDuration(retryCfg, n, random)); err != nil {
 				return zero, candidate, attempts, err
 			}
 		}
-		if !failoverCfg.Enabled {
+		if !failoverCfg.IsEnabled() {
 			break
 		}
 	}
 	return zero, lastCandidate, attempts, lastErr
+}
+
+func backoffDuration(cfg config.RetryConfig, retryIndex uint, random func() float64) time.Duration {
+	if cfg.InitialInterval <= 0 {
+		return 0
+	}
+	multiplier := cfg.Multiplier
+	if multiplier <= 0 {
+		multiplier = 1
+	}
+	base := float64(cfg.InitialInterval) * math.Pow(multiplier, float64(retryIndex))
+	if cfg.MaxInterval > 0 {
+		base = math.Min(base, float64(cfg.MaxInterval))
+	}
+	if cfg.Jitter > 0 {
+		base *= 1 + (2*random()-1)*cfg.Jitter
+	}
+	if cfg.MaxInterval > 0 {
+		base = math.Min(base, float64(cfg.MaxInterval))
+	}
+	return time.Duration(math.Max(0, base))
 }
 
 func retryable(err error, cfg config.RetryConfig) bool {

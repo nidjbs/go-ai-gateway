@@ -65,6 +65,9 @@ gofmt -w $(find . -name '*.go')
 go test ./...
 go vet ./...
 go build ./cmd/gateway
+scripts/e2e.sh
 ```
+
+`scripts/e2e.sh` builds the gateway and local mock providers, then runs an end-to-end agent flow without a real model or credentials. It requires Go, Bash, curl, and Python 3; it covers static authentication, multi-turn chat, tool-call continuation, streaming, retry/failover, embeddings, and validation errors.
 
 See [architecture](docs/architecture.md) and [extending](docs/extending.md) for component and extension boundaries.

@@ -2,46 +2,197 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", chat)
-	mux.HandleFunc("/v1/embeddings", embeddings)
-	log.Fatal(http.ListenAndServe("127.0.0.1:19090", mux))
+type server struct {
+	role string
+
+	mu    sync.Mutex
+	stats stats
 }
 
-func chat(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("X-Mock-Fail") != "" {
-		http.Error(w, `{"error":{"message":"requested mock failure"}}`, http.StatusServiceUnavailable)
+type stats struct {
+	Role   string         `json:"role"`
+	Total  int            `json:"total"`
+	ByCase map[string]int `json:"by_case"`
+}
+
+type chatRequest struct {
+	Model    string `json:"model"`
+	Messages []struct {
+		Role       string `json:"role"`
+		Content    any    `json:"content"`
+		ToolCallID string `json:"tool_call_id"`
+		ToolCalls  []struct {
+			ID string `json:"id"`
+		} `json:"tool_calls"`
+	} `json:"messages"`
+	Stream   bool  `json:"stream"`
+	Tools    []any `json:"tools"`
+	Metadata struct {
+		Case string `json:"e2e_case"`
+	} `json:"metadata"`
+}
+
+type embeddingRequest struct {
+	Model    string `json:"model"`
+	Input    any    `json:"input"`
+	Metadata struct {
+		Case string `json:"e2e_case"`
+	} `json:"metadata"`
+}
+
+func main() {
+	listen := flag.String("listen", "127.0.0.1:19090", "listen address")
+	role := flag.String("role", "primary", "mock provider role")
+	flag.Parse()
+
+	s := &server{role: *role, stats: stats{Role: *role, ByCase: make(map[string]int)}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/debug/stats", s.handleStats)
+	mux.HandleFunc("/v1/chat/completions", s.chat)
+	mux.HandleFunc("/v1/embeddings", s.embeddings)
+	log.Printf("mock upstream role=%s listen=%s", *role, *listen)
+	log.Fatal(http.ListenAndServe(*listen, mux))
+}
+
+func (s *server) handleStats(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = json.NewEncoder(w).Encode(s.stats)
+}
+
+func (s *server) record(caseName string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stats.Total++
+	s.stats.ByCase[caseName]++
+	return s.stats.ByCase[caseName]
+}
+
+func (s *server) chat(w http.ResponseWriter, r *http.Request) {
+	var request chatRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, `{"error":{"message":"invalid mock request"}}`, http.StatusBadRequest)
 		return
 	}
-	var request struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&request)
-	if request.Stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintf(w, "data: {\"id\":\"mock-stream\",\"object\":\"chat.completion.chunk\",\"created\":%d,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"mock response\"}}]}\n\n", time.Now().Unix(), request.Model)
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	caseName := request.Metadata.Case
+	attempt := s.record(caseName)
+	if request.Model != s.role+"-chat" || r.Header.Get("Authorization") != "Bearer "+s.role+"-token" {
+		http.Error(w, `{"error":{"message":"mock request verification failed"}}`, http.StatusInternalServerError)
 		return
 	}
+
+	switch caseName {
+	case "tool_round_1":
+		if len(request.Messages) != 1 || request.Messages[0].Role != "user" || len(request.Tools) == 0 {
+			http.Error(w, `{"error":{"message":"tool request was not preserved"}}`, http.StatusInternalServerError)
+			return
+		}
+		s.writeCompletion(w, request.Model, map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{"id": "call_weather_1", "type": "function", "function": map[string]string{"name": "get_weather", "arguments": `{"city":"Shanghai","units":"metric"}`}}}}, "tool_calls")
+	case "tool_round_2":
+		if len(request.Messages) != 3 || request.Messages[1].Role != "assistant" || len(request.Messages[1].ToolCalls) != 1 || request.Messages[1].ToolCalls[0].ID != "call_weather_1" || request.Messages[2].Role != "tool" || request.Messages[2].ToolCallID != "call_weather_1" {
+			http.Error(w, `{"error":{"message":"tool history was not preserved"}}`, http.StatusInternalServerError)
+			return
+		}
+		s.writeCompletion(w, request.Model, map[string]string{"role": "assistant", "content": "tool result accepted"}, "stop")
+	case "multi_turn":
+		if len(request.Messages) != 3 || request.Messages[0].Role != "user" || request.Messages[1].Role != "assistant" || request.Messages[2].Role != "user" {
+			http.Error(w, `{"error":{"message":"conversation history was not preserved"}}`, http.StatusInternalServerError)
+			return
+		}
+		s.writeCompletion(w, request.Model, map[string]string{"role": "assistant", "content": "multi-turn accepted"}, "stop")
+	case "chat_retry":
+		if s.role == "primary" && attempt == 1 {
+			s.writeFailure(w)
+			return
+		}
+		s.writeCompletion(w, request.Model, map[string]string{"role": "assistant", "content": s.role + " retry success"}, "stop")
+	case "chat_failover":
+		if s.role == "primary" {
+			s.writeFailure(w)
+			return
+		}
+		s.writeCompletion(w, request.Model, map[string]string{"role": "assistant", "content": "backup failover success"}, "stop")
+	case "stream_failover":
+		if s.role == "primary" {
+			s.writeFailure(w)
+			return
+		}
+		s.writeStream(w, request.Model, "backup stream", false)
+	case "stream_abort_after_chunk":
+		s.writeStream(w, request.Model, "primary partial", true)
+	case "stream_success":
+		s.writeStream(w, request.Model, "stream success", false)
+	default:
+		if request.Stream {
+			s.writeStream(w, request.Model, "mock response", false)
+			return
+		}
+		s.writeCompletion(w, request.Model, map[string]string{"role": "assistant", "content": "mock response"}, "stop")
+	}
+}
+
+func (s *server) embeddings(w http.ResponseWriter, r *http.Request) {
+	var request embeddingRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, `{"error":{"message":"invalid mock request"}}`, http.StatusBadRequest)
+		return
+	}
+	caseName := request.Metadata.Case
+	s.record(caseName)
+	if request.Model != s.role+"-embedding" || r.Header.Get("Authorization") != "Bearer "+s.role+"-token" {
+		http.Error(w, `{"error":{"message":"mock embedding verification failed"}}`, http.StatusInternalServerError)
+		return
+	}
+	if caseName == "embedding_failover" && s.role == "primary" {
+		s.writeFailure(w)
+		return
+	}
+	count := 1
+	if inputs, ok := request.Input.([]any); ok {
+		count = len(inputs)
+	}
+	data := make([]any, count)
+	for i := range data {
+		data[i] = map[string]any{"object": "embedding", "index": i, "embedding": []float64{0.1, 0.2}}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "model": request.Model, "data": data, "usage": map[string]int{"prompt_tokens": count, "total_tokens": count}})
+}
+
+func (s *server) writeCompletion(w http.ResponseWriter, model string, message any, finishReason string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"id": "mock-chat", "object": "chat.completion", "created": time.Now().Unix(), "model": request.Model,
-		"choices": []any{map[string]any{"index": 0, "message": map[string]string{"role": "assistant", "content": "mock response"}, "finish_reason": "stop"}},
+		"id": "mock-chat", "object": "chat.completion", "created": time.Now().Unix(), "model": model,
+		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReason}},
 		"usage":   map[string]int{"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
 	})
 }
 
-func embeddings(w http.ResponseWriter, r *http.Request) {
-	var request struct {
-		Model string `json:"model"`
+func (s *server) writeStream(w http.ResponseWriter, model, content string, abort bool) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	flusher := w.(http.Flusher)
+	_, _ = fmt.Fprintf(w, "data: {\"id\":\"mock-stream\",\"object\":\"chat.completion.chunk\",\"created\":%d,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":%q}}]}\n\n", time.Now().Unix(), model, content)
+	flusher.Flush()
+	if abort {
+		if hijacker, ok := w.(http.Hijacker); ok {
+			connection, _, err := hijacker.Hijack()
+			if err == nil {
+				_ = connection.Close()
+			}
+		}
+		return
 	}
-	_ = json.NewDecoder(r.Body).Decode(&request)
-	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "model": request.Model, "data": []any{map[string]any{"object": "embedding", "index": 0, "embedding": []float64{0.1, 0.2}}}, "usage": map[string]int{"prompt_tokens": 1, "total_tokens": 1}})
+	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+func (s *server) writeFailure(w http.ResponseWriter) {
+	http.Error(w, `{"error":{"message":"mock provider secret detail"}}`, http.StatusServiceUnavailable)
 }

@@ -25,6 +25,8 @@ import (
 
 const maxRequestBodyBytes = 1 << 20
 
+const upstreamErrorMessage = "upstream request failed"
+
 type handler struct {
 	config        *config.Config
 	logger        *slog.Logger
@@ -88,7 +90,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		h.recordUsage(r.Context(), started, "chat.completions", request.Model, candidate, 0, 0, false, http.StatusBadGateway)
-		apierr.Write(w, http.StatusBadGateway, "upstream_error", "api_error", err.Error())
+		h.writeUpstreamError(w, r, "chat.completions", err)
 		return
 	}
 	out := replaceModel(result.Body, request.Model)
@@ -126,10 +128,10 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 		return h.provider.OpenStream(ctx, bodyWithModel(body, c.Model), c)
 	})
 	if err != nil {
-		apierr.Write(w, http.StatusBadGateway, "upstream_error", "api_error", err.Error())
+		h.writeUpstreamError(w, r, "chat.completions", err)
 		return
 	}
-	defer stream.Response.Body.Close()
+	defer stream.Close()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		apierr.Write(w, http.StatusInternalServerError, "streaming_unsupported", "server_error", "response streaming unavailable")
@@ -158,7 +160,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 		flusher.Flush()
 	}
 	if err := scanner.Err(); err != nil && seen {
-		_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", err.Error())
+		_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
 		flusher.Flush()
 	}
 	h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, true, http.StatusBadGateway)
@@ -188,11 +190,16 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		return h.provider.Request(ctx, "embeddings", bodyWithModel(body, c.Model), c)
 	})
 	if err != nil {
-		apierr.Write(w, http.StatusBadGateway, "upstream_error", "api_error", err.Error())
+		h.writeUpstreamError(w, r, "embeddings", err)
 		return
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.recordUsage(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, 0, false, http.StatusOK)
+}
+
+func (h handler) writeUpstreamError(w http.ResponseWriter, r *http.Request, endpoint string, err error) {
+	h.logger.Warn("upstream request failed", "request_id", requestID(r), "endpoint", endpoint, "error", err)
+	apierr.Write(w, http.StatusBadGateway, "upstream_error", "api_error", upstreamErrorMessage)
 }
 
 func readBody(w http.ResponseWriter, r *http.Request) (json.RawMessage, error) {
