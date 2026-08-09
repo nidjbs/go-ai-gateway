@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,7 +24,6 @@ import (
 )
 
 const maxRequestBodyBytes = 1 << 20
-
 const upstreamErrorMessage = "upstream request failed"
 
 type handler struct {
@@ -36,8 +34,6 @@ type handler struct {
 	provider      *provider.Client
 	metrics       *metrics.Recorder
 }
-
-func (h handler) healthz(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
 
 func (h handler) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,10 +67,9 @@ func (h handler) models(w http.ResponseWriter, _ *http.Request) {
 }
 
 type chatRequest struct {
-	Model    string                     `json:"model"`
-	Messages json.RawMessage            `json:"messages"`
-	Stream   bool                       `json:"stream"`
-	Extra    map[string]json.RawMessage `json:"-"`
+	Model    string          `json:"model"`
+	Messages json.RawMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
 }
 
 func (h handler) chat(w http.ResponseWriter, r *http.Request) {
@@ -87,18 +82,16 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	started := time.Now()
+	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
 	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
-		return h.provider.Request(ctx, "chat/completions", bodyWithModel(body, c.Model), c)
+		return h.provider.Do(ctx, adapterRequest, c)
 	})
 	if err != nil {
-		h.recordUsage(r.Context(), started, "chat.completions", request.Model, candidate, 0, 0, false, http.StatusBadGateway)
-		h.recordMetrics(r.Context(), started, "chat.completions", request.Model, candidate, 0, 0, time.Time{}, http.StatusBadGateway, "upstream_error")
-		h.writeUpstreamError(w, r, "chat.completions", err)
+		h.writeProviderError(w, r, started, "chat.completions", request.Model, candidate, false, err)
 		return
 	}
-	out := replaceModel(result.Body, request.Model)
-	writeRawJSON(w, http.StatusOK, out)
-	h.recordUsage(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, false, http.StatusOK)
+	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
+	h.recordUsage(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, false, http.StatusOK, attempts)
 	h.recordMetrics(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, http.StatusOK, "")
 	h.logger.Info("request complete", "request_id", requestID(r), "endpoint", "chat.completions", "provider", candidate.Name, "attempts", attempts.Total, "status", http.StatusOK, "upstream_duration_ms", time.Since(started).Milliseconds())
 }
@@ -123,18 +116,27 @@ func (h handler) parseChat(w http.ResponseWriter, r *http.Request) (json.RawMess
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
 		return nil, request, nil, false
 	}
+	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
+	candidates, err = h.provider.Filter(candidates, adapterRequest)
+	if err != nil {
+		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
+		return nil, request, nil, false
+	}
+	if len(candidates) == 0 {
+		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", "no configured provider supports chat.completions")
+		return nil, request, nil, false
+	}
 	return body, request, candidates, true
 }
 
 func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.RawMessage, alias string, candidates []routing.Candidate) {
 	started := time.Now()
-	stream, candidate, _, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, candidates, func(ctx context.Context, c routing.Candidate) (*provider.Stream, error) {
-		return h.provider.OpenStream(ctx, bodyWithModel(body, c.Model), c)
+	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
+	stream, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
+		return h.provider.OpenStream(ctx, adapterRequest, c)
 	})
 	if err != nil {
-		h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, true, http.StatusBadGateway)
-		h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, time.Time{}, http.StatusBadGateway, "upstream_error")
-		h.writeUpstreamError(w, r, "chat.completions", err)
+		h.writeProviderError(w, r, started, "chat.completions", alias, candidate, true, err)
 		return
 	}
 	defer stream.Close()
@@ -149,33 +151,31 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	flusher.Flush()
 	seen := false
 	var firstToken time.Time
-	scanner := bufio.NewScanner(stream.Response.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimPrefix(line, "data: ")
-		if payload == "[DONE]" {
-			_, _ = io.WriteString(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, true, http.StatusOK)
-			h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, http.StatusOK, "")
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			if err != io.EOF && seen {
+				_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
+				flusher.Flush()
+			}
+			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, true, http.StatusBadGateway, attempts)
+			h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, http.StatusBadGateway, "upstream_error")
 			return
 		}
-		seen = true
+		if event.Done {
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, event.InputTokens, event.OutputTokens, true, http.StatusOK, attempts)
+			h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, event.InputTokens, event.OutputTokens, firstToken, http.StatusOK, "")
+			return
+		}
 		if firstToken.IsZero() {
 			firstToken = time.Now()
 		}
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", string(replaceModel([]byte(payload), alias)))
+		seen = true
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(event.Data, alias))
 		flusher.Flush()
 	}
-	if err := scanner.Err(); err != nil && seen {
-		_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
-		flusher.Flush()
-	}
-	h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, true, http.StatusBadGateway)
-	h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, http.StatusBadGateway, "upstream_error")
 }
 
 func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
@@ -197,22 +197,37 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
 		return
 	}
+	adapterRequest := provider.Request{Operation: provider.Embeddings, Body: body}
+	candidates, err = h.provider.Filter(candidates, adapterRequest)
+	if err != nil {
+		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
+		return
+	}
+	if len(candidates) == 0 {
+		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", "no configured provider supports embeddings")
+		return
+	}
 	started := time.Now()
-	result, candidate, _, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
-		return h.provider.Request(ctx, "embeddings", bodyWithModel(body, c.Model), c)
+	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
+		return h.provider.Do(ctx, adapterRequest, c)
 	})
 	if err != nil {
-		h.recordUsage(r.Context(), started, "embeddings", request.Model, candidate, 0, 0, false, http.StatusBadGateway)
-		h.recordMetrics(r.Context(), started, "embeddings", request.Model, candidate, 0, 0, time.Time{}, http.StatusBadGateway, "upstream_error")
-		h.writeUpstreamError(w, r, "embeddings", err)
+		h.writeProviderError(w, r, started, "embeddings", request.Model, candidate, false, err)
 		return
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
-	h.recordUsage(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, 0, false, http.StatusOK)
-	h.recordMetrics(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, 0, time.Time{}, http.StatusOK, "")
+	h.recordUsage(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, result.OutputTokens, false, http.StatusOK, attempts)
+	h.recordMetrics(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, http.StatusOK, "")
 }
 
-func (h handler) writeUpstreamError(w http.ResponseWriter, r *http.Request, endpoint string, err error) {
+func (h handler) writeProviderError(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, candidate routing.Candidate, streaming bool, err error) {
+	var requestErr *provider.RequestError
+	if errors.As(err, &requestErr) {
+		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", requestErr.Error())
+		return
+	}
+	h.recordUsage(r.Context(), started, endpoint, alias, candidate, 0, 0, streaming, http.StatusBadGateway, retry.Attempts{})
+	h.recordMetrics(r.Context(), started, endpoint, alias, candidate, 0, 0, time.Time{}, http.StatusBadGateway, "upstream_error")
 	h.logger.Warn("upstream request failed", "request_id", requestID(r), "endpoint", endpoint, "error", err)
 	apierr.Write(w, http.StatusBadGateway, "upstream_error", "api_error", upstreamErrorMessage)
 }
@@ -225,6 +240,7 @@ func readBody(w http.ResponseWriter, r *http.Request) (json.RawMessage, error) {
 	}
 	return data, nil
 }
+
 func validEmbeddingInput(raw json.RawMessage) bool {
 	var one string
 	if json.Unmarshal(raw, &one) == nil {
@@ -241,16 +257,7 @@ func validEmbeddingInput(raw json.RawMessage) bool {
 	}
 	return true
 }
-func bodyWithModel(body json.RawMessage, model string) json.RawMessage {
-	var value map[string]json.RawMessage
-	if json.Unmarshal(body, &value) != nil {
-		return body
-	}
-	encoded, _ := json.Marshal(model)
-	value["model"] = encoded
-	out, _ := json.Marshal(value)
-	return out
-}
+
 func replaceModel(body []byte, model string) []byte {
 	var value map[string]json.RawMessage
 	if json.Unmarshal(body, &value) != nil {
@@ -264,16 +271,19 @@ func replaceModel(body []byte, model string) []byte {
 	}
 	return out
 }
+
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
+
 func writeRawJSON(w http.ResponseWriter, status int, data []byte) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = w.Write(data)
 }
+
 func requestID(r *http.Request) string {
 	if id := middleware.GetReqID(r.Context()); id != "" {
 		return id
@@ -282,13 +292,12 @@ func requestID(r *http.Request) string {
 }
 
 func (h handler) recordMetrics(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate, input, output int, firstToken time.Time, status int, errorType string) {
-	responseModel := candidate.Model
-	h.metrics.Record(ctx, metrics.Request{Operation: endpoint, Provider: candidate.Name, Model: alias, UpstreamModel: candidate.Model, StartedAt: started}, metrics.Result{StatusCode: status, ErrorType: errorType, ResponseModel: responseModel, InputTokens: input, OutputTokens: output, FirstTokenAt: firstToken, CompletedAt: time.Now()})
+	h.metrics.Record(ctx, metrics.Request{Operation: endpoint, Provider: candidate.Name, Model: alias, UpstreamModel: candidate.Model, StartedAt: started}, metrics.Result{StatusCode: status, ErrorType: errorType, ResponseModel: candidate.Model, InputTokens: input, OutputTokens: output, FirstTokenAt: firstToken, CompletedAt: time.Now()})
 }
 
-func (h handler) recordUsage(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate, input, output int, streaming bool, status int) {
+func (h handler) recordUsage(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate, input, output int, streaming bool, status int, attempts retry.Attempts) {
 	completed := time.Now()
-	event := usage.Event{RequestID: middleware.GetReqID(ctx), Endpoint: endpoint, Alias: alias, RequestedModel: alias, ResolvedModel: candidate.Model, Provider: candidate.Name, UpstreamModel: candidate.Model, StatusCode: status, Success: status >= 200 && status < 300, InputTokens: input, OutputTokens: output, TotalTokens: input + output, DurationMS: completed.Sub(started).Milliseconds(), StartedAt: started, CompletedAt: completed, Streaming: streaming}
+	event := usage.Event{RequestID: middleware.GetReqID(ctx), Endpoint: endpoint, Alias: alias, RequestedModel: alias, ResolvedModel: candidate.Model, Provider: candidate.Name, UpstreamModel: candidate.Model, StatusCode: status, Success: status >= 200 && status < 300, InputTokens: input, OutputTokens: output, TotalTokens: input + output, DurationMS: completed.Sub(started).Milliseconds(), StartedAt: started, CompletedAt: completed, Streaming: streaming, AttemptCount: attempts.Total, RetryCount: attempts.Retries, FailoverCount: attempts.Failovers}
 	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
 	if err := h.usageSink.Record(recordCtx, event); err != nil {

@@ -10,6 +10,7 @@ import (
 
 type Candidate struct {
 	Name     string
+	Type     string
 	Model    string
 	BaseURL  string
 	APIKey   string
@@ -29,7 +30,11 @@ func Resolve(cfg *config.Config, alias string) ([]Candidate, error) {
 		if !ok {
 			return nil, fmt.Errorf("alias %q references unknown provider %q", alias, item.Name)
 		}
-		out = append(out, Candidate{Name: item.Name, Model: item.Model, BaseURL: provider.BaseURL, APIKey: provider.APIKey, Timeout: provider.RequestTimeout, Priority: item.Priority})
+		providerType := provider.Type
+		if providerType == "" {
+			providerType = "openai"
+		}
+		out = append(out, Candidate{Name: item.Name, Type: providerType, Model: item.Model, BaseURL: provider.BaseURL, APIKey: provider.APIKey, Timeout: provider.RequestTimeout, Priority: item.Priority})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
 	return out, nil

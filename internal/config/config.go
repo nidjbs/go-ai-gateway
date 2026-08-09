@@ -212,7 +212,7 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(name) == "" || strings.TrimSpace(provider.BaseURL) == "" {
 			return fmt.Errorf("provider %q: base_url is required", name)
 		}
-		if provider.Type != "" && provider.Type != "openai" {
+		if provider.Type != "" && provider.Type != "openai" && provider.Type != "anthropic" {
 			return fmt.Errorf("provider %q: type %q is unsupported", name, provider.Type)
 		}
 	}

@@ -146,6 +146,14 @@ providers:
     type: openai
     base_url: ${backup_url}/v1
     api_key_env: BACKUP_UPSTREAM_TOKEN
+  primary-anthropic:
+    type: anthropic
+    base_url: ${primary_url}/v1
+    api_key_env: PRIMARY_UPSTREAM_TOKEN
+  backup-anthropic:
+    type: anthropic
+    base_url: ${backup_url}/v1
+    api_key_env: BACKUP_UPSTREAM_TOKEN
 aliases:
   chat:
     providers:
@@ -155,6 +163,14 @@ aliases:
     providers:
       - {name: backup, model: backup-embedding, priority: 1}
       - {name: primary, model: primary-embedding, priority: 0}
+  anthro:
+    providers:
+      - {name: backup-anthropic, model: backup-anthropic, priority: 1}
+      - {name: primary-anthropic, model: primary-anthropic, priority: 0}
+  mixed-embedding:
+    providers:
+      - {name: primary-anthropic, model: primary-anthropic, priority: 0}
+      - {name: backup, model: backup-embedding, priority: 1}
 retry:
   enabled: true
   max_attempts_per_provider: 2
@@ -184,7 +200,7 @@ assert_status 200 "$(request GET /healthz '' '' "$tmp_dir/health.json")" "$tmp_d
 assert_status 401 "$(request GET /v1/models '' '' "$tmp_dir/models-unauthorized.json")" "$tmp_dir/models-unauthorized.json"
 assert_status 401 "$(request GET /v1/models '' wrong-token "$tmp_dir/models-wrong-token.json")" "$tmp_dir/models-wrong-token.json"
 assert_status 200 "$(request GET /v1/models '' gateway-token "$tmp_dir/models.json")" "$tmp_dir/models.json"
-assert_json "$tmp_dir/models.json" 'ids = {item["id"] for item in value["data"]}; assert_true(ids == {"chat", "embedding"}, ids)'
+assert_json "$tmp_dir/models.json" 'ids = {item["id"] for item in value["data"]}; assert_true(ids == {"chat", "embedding", "anthro", "mixed-embedding"}, ids)'
 pass_case "health, auth, and model aliases"
 
 run_case "agent tool-call loop"
@@ -202,6 +218,39 @@ multi_turn='{"model":"chat","messages":[{"role":"user","content":"hello"},{"role
 assert_status 200 "$(request POST /v1/chat/completions "$multi_turn" gateway-token "$tmp_dir/multi-turn.json")" "$tmp_dir/multi-turn.json"
 assert_json "$tmp_dir/multi-turn.json" 'assert_true(value["choices"][0]["message"]["content"] == "multi-turn accepted", value)'
 pass_case "multi-turn chat"
+
+run_case "Anthropic adapter chat and tools"
+anthropic_chat='{"model":"anthro","messages":[{"role":"system","content":"be concise"},{"role":"user","content":"hello"}],"metadata":{"e2e_case":"anthropic_chat"}}'
+assert_status 200 "$(request POST /v1/chat/completions "$anthropic_chat" gateway-token "$tmp_dir/anthropic-chat.json")" "$tmp_dir/anthropic-chat.json"
+assert_json "$tmp_dir/anthropic-chat.json" 'assert_true(value["model"] == "anthro" and value["choices"][0]["message"]["content"] == "anthropic response", value)'
+anthropic_tool_one='{"model":"anthro","messages":[{"role":"user","content":"weather"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],"tool_choice":"auto","metadata":{"e2e_case":"anthropic_tool_round_1"}}'
+assert_status 200 "$(request POST /v1/chat/completions "$anthropic_tool_one" gateway-token "$tmp_dir/anthropic-tool-one.json")" "$tmp_dir/anthropic-tool-one.json"
+assert_json "$tmp_dir/anthropic-tool-one.json" 'choice = value["choices"][0]; call = choice["message"]["tool_calls"][0]; assert_true(choice["finish_reason"] == "tool_calls" and call["id"] == "anthropic_tool_1" and call["function"]["name"] == "get_weather", value)'
+anthropic_tool_two='{"model":"anthro","messages":[{"role":"user","content":"weather"},{"role":"assistant","content":null,"tool_calls":[{"id":"anthropic_tool_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Shanghai\"}"}}]},{"role":"tool","tool_call_id":"anthropic_tool_1","content":"26 degrees"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],"metadata":{"e2e_case":"anthropic_tool_round_2"}}'
+assert_status 200 "$(request POST /v1/chat/completions "$anthropic_tool_two" gateway-token "$tmp_dir/anthropic-tool-two.json")" "$tmp_dir/anthropic-tool-two.json"
+assert_json "$tmp_dir/anthropic-tool-two.json" 'assert_true(value["choices"][0]["message"]["content"] == "anthropic tool result accepted", value)'
+pass_case "Anthropic adapter chat and tools"
+
+run_case "Anthropic adapter retry, failover, and streaming"
+anthropic_retry='{"model":"anthro","messages":[{"role":"user","content":"retry"}],"metadata":{"e2e_case":"anthropic_retry"}}'
+assert_status 200 "$(request POST /v1/chat/completions "$anthropic_retry" gateway-token "$tmp_dir/anthropic-retry.json")" "$tmp_dir/anthropic-retry.json"
+grep -q 'anthropic retry success' "$tmp_dir/anthropic-retry.json"
+[[ "$(stats_count "$primary_url" anthropic_retry)" == 2 && "$(stats_count "$backup_url" anthropic_retry)" == 0 ]]
+anthropic_failover='{"model":"anthro","messages":[{"role":"user","content":"failover"}],"metadata":{"e2e_case":"anthropic_failover"}}'
+assert_status 200 "$(request POST /v1/chat/completions "$anthropic_failover" gateway-token "$tmp_dir/anthropic-failover.json")" "$tmp_dir/anthropic-failover.json"
+grep -q 'anthropic backup failover success' "$tmp_dir/anthropic-failover.json"
+[[ "$(stats_count "$primary_url" anthropic_failover)" == 2 && "$(stats_count "$backup_url" anthropic_failover)" == 1 ]]
+anthropic_stream='{"model":"anthro","stream":true,"messages":[{"role":"user","content":"stream"}],"metadata":{"e2e_case":"anthropic_stream"}}'
+assert_status 200 "$(request POST /v1/chat/completions "$anthropic_stream" gateway-token "$tmp_dir/anthropic-stream.sse")" "$tmp_dir/anthropic-stream.sse"
+grep -q 'anthropic stream' "$tmp_dir/anthropic-stream.sse"
+grep -q 'data: \[DONE\]' "$tmp_dir/anthropic-stream.sse"
+anthropic_abort='{"model":"anthro","stream":true,"messages":[{"role":"user","content":"stream"}],"metadata":{"e2e_case":"anthropic_stream_abort"}}'
+assert_status 200 "$(request POST /v1/chat/completions "$anthropic_abort" gateway-token "$tmp_dir/anthropic-abort.sse")" "$tmp_dir/anthropic-abort.sse"
+grep -q 'anthropic stream' "$tmp_dir/anthropic-abort.sse"
+grep -q 'upstream request failed' "$tmp_dir/anthropic-abort.sse"
+! grep -q 'data: \[DONE\]' "$tmp_dir/anthropic-abort.sse"
+[[ "$(stats_count "$primary_url" anthropic_stream_abort)" == 1 && "$(stats_count "$backup_url" anthropic_stream_abort)" == 0 ]]
+pass_case "Anthropic adapter retry, failover, and streaming"
 
 run_case "successful SSE stream"
 stream_success='{"model":"chat","stream":true,"messages":[{"role":"user","content":"stream"}],"metadata":{"e2e_case":"stream_success"}}'
@@ -257,6 +306,9 @@ assert_json "$tmp_dir/embedding-many.json" 'assert_true(value["model"] == "embed
 embedding_failover='{"model":"embedding","input":["one","two"],"metadata":{"e2e_case":"embedding_failover"}}'
 assert_status 200 "$(request POST /v1/embeddings "$embedding_failover" gateway-token "$tmp_dir/embedding-failover.json")" "$tmp_dir/embedding-failover.json"
 [[ "$(stats_count "$primary_url" embedding_failover)" == 2 && "$(stats_count "$backup_url" embedding_failover)" == 1 ]]
+mixed_embedding='{"model":"mixed-embedding","input":"hello","metadata":{"e2e_case":"mixed_embedding"}}'
+assert_status 200 "$(request POST /v1/embeddings "$mixed_embedding" gateway-token "$tmp_dir/mixed-embedding.json")" "$tmp_dir/mixed-embedding.json"
+[[ "$(stats_count "$primary_url" mixed_embedding)" == 0 && "$(stats_count "$backup_url" mixed_embedding)" == 1 ]]
 unknown='{"model":"missing","messages":[{"role":"user","content":"hello"}]}'
 assert_status 400 "$(request POST /v1/chat/completions "$unknown" gateway-token "$tmp_dir/unknown.json")" "$tmp_dir/unknown.json"
 empty_embedding='{"model":"embedding","input":""}'

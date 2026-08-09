@@ -8,6 +8,7 @@ auth:
 
 providers:
   local:
+    # Supported types: openai and anthropic. The public API remains OpenAI Chat Completions.
     type: openai
     base_url: http://host.docker.internal:19090/v1
     api_key_env: UPSTREAM_API_KEY

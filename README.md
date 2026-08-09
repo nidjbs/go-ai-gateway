@@ -1,8 +1,8 @@
 # light-llm-gateway
 
-A lightweight OpenAI-compatible LLM gateway with model aliases, retry, and provider failover.
+A lightweight OpenAI-compatible LLM gateway with model aliases, retry, provider failover, and protocol adapters.
 
-It is intentionally small: running the gateway requires Go and an OpenAI-compatible upstream only. PostgreSQL, Kafka, and ClickHouse are not runtime dependencies.
+Clients always use the OpenAI API surface. Upstream providers can use either `openai` (OpenAI-compatible endpoints) or `anthropic` (Messages API); the gateway translates the supported chat subset for Anthropic.
 
 ## Quick Start
 
@@ -54,6 +54,12 @@ aliases:
 ```
 
 The gateway retries eligible failures against the current provider before failing over. It does not retry after an SSE response has emitted data, so a streamed response is never mixed between providers.
+
+## Provider Adapters
+
+The public API remains OpenAI-compatible. `provider.type: openai` uses OpenAI-compatible upstream endpoints; `provider.type: anthropic` calls the Anthropic Messages API with `x-api-key` authentication and the `anthropic-version: 2023-06-01` header.
+
+For Anthropic providers, Chat Completions supports system and text messages, function tools, tool results, `tool_choice`, non-streaming responses, SSE, and token usage. Embeddings are routed only to OpenAI-compatible providers. Images, audio, documents/files, non-function tools, structured response formats, logprobs, penalties, seed, non-default `n`, user attribution, and reasoning-specific fields return a local OpenAI-style `400` rather than being sent upstream.
 
 ## API Surface
 

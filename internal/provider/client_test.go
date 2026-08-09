@@ -24,7 +24,7 @@ func TestOpenStreamKeepsContextUntilClose(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	stream, err := NewClient().OpenStream(context.Background(), json.RawMessage(`{"model":"test","stream":true}`), routing.Candidate{BaseURL: upstream.URL, Timeout: time.Second})
+	stream, err := NewClient().OpenStream(context.Background(), Request{Operation: ChatCompletions, Body: json.RawMessage(`{"model":"test","stream":true,"messages":[{"role":"user","content":"hi"}]}`)}, routing.Candidate{BaseURL: upstream.URL, Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

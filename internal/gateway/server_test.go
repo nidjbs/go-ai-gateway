@@ -40,6 +40,28 @@ func TestChatForwardsProviderModelAndReturnsAlias(t *testing.T) {
 	}
 }
 
+func TestAnthropicUnsupportedRequestIsLocalBadRequest(t *testing.T) {
+	called := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	defer upstream.Close()
+
+	server := New(Deps{Config: &config.Config{
+		Listen: "127.0.0.1:0",
+		Providers: map[string]config.Provider{
+			"anthropic": {Type: "anthropic", BaseURL: upstream.URL, APIKey: "token"},
+		},
+		Aliases:  map[string]config.Alias{"chat": {Provider: "anthropic", Model: "claude-test"}},
+		Retry:    config.RetryConfig{MaxAttemptsPerProvider: 1},
+		Failover: config.FailoverConfig{},
+	}, Authenticator: auth.NoopAuthenticator{}})
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}`))
+	response := httptest.NewRecorder()
+	server.HTTP.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || called {
+		t.Fatalf("status=%d called=%v body=%s", response.Code, called, response.Body.String())
+	}
+}
+
 func TestUpstreamErrorsAreSanitized(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
