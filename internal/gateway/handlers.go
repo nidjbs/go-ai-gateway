@@ -42,12 +42,15 @@ type handler struct {
 
 func (h handler) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := h.now()
 		principal, err := h.authenticator.Authenticate(r.Context(), r)
 		if err != nil {
 			if errors.Is(err, auth.ErrUnauthorized) {
+				h.recordUsage(r.Context(), started, requestEndpoint(r), "", routing.Candidate{}, 0, 0, time.Time{}, false, http.StatusUnauthorized, "unauthorized", "", retry.Attempts{})
 				apierr.Write(w, http.StatusUnauthorized, "invalid_api_key", "invalid_request_error", "Invalid API key")
 				return
 			}
+			h.recordUsage(r.Context(), started, requestEndpoint(r), "", routing.Candidate{}, 0, 0, time.Time{}, false, http.StatusInternalServerError, "auth_internal", "", retry.Attempts{})
 			apierr.Write(w, http.StatusInternalServerError, "authentication_error", "server_error", "Authentication failed")
 			return
 		}
@@ -58,6 +61,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 				decision := h.limiter.Allow(principal.APIKeyID, limits, h.now())
 				writeRateLimitHeaders(w, limits, decision)
 				if !decision.Allowed {
+					h.recordUsage(ctx, started, requestEndpoint(r), "", routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID}, 0, 0, time.Time{}, false, http.StatusTooManyRequests, "rate_limit_exceeded", "", retry.Attempts{})
 					apierr.Write(w, http.StatusTooManyRequests, "rate_limit_exceeded", "rate_limit_error", "API key rate limit exceeded")
 					return
 				}
@@ -66,6 +70,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 				status := h.quotaStore.Peek(principal.APIKeyID, limits.PredayTokens, h.now())
 				writeQuotaHeaders(w, status)
 				if status.Remaining <= 0 {
+					h.recordUsage(ctx, started, requestEndpoint(r), "", routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID}, 0, 0, time.Time{}, false, http.StatusTooManyRequests, "quota_exceeded", "", retry.Attempts{})
 					apierr.Write(w, http.StatusTooManyRequests, "rate_limit_exceeded", "rate_limit_error", "API key daily quota exceeded")
 					return
 				}
@@ -123,38 +128,45 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
-	h.recordUsage(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, false, http.StatusOK, attempts)
+	h.recordUsage(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, false, http.StatusOK, "", "", attempts)
 	h.recordMetrics(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, http.StatusOK, "")
 	h.logger.Info("request complete", "request_id", requestID(r), "endpoint", "chat.completions", "provider", candidate.Name, "attempts", attempts.Total, "status", http.StatusOK, "upstream_duration_ms", time.Since(started).Milliseconds())
 }
 
 func (h handler) parseChat(w http.ResponseWriter, r *http.Request) (json.RawMessage, chatRequest, []routing.Candidate, bool) {
+	started := h.now()
 	var request chatRequest
 	body, err := readBody(w, r)
 	if err != nil {
+		h.recordUsage(r.Context(), started, requestEndpoint(r), "", routing.Candidate{}, 0, 0, time.Time{}, false, http.StatusBadRequest, "validation_error", "", retry.Attempts{})
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
 		return nil, request, nil, false
 	}
 	if err := json.Unmarshal(body, &request); err != nil {
+		h.recordUsage(r.Context(), started, requestEndpoint(r), "", routing.Candidate{}, 0, 0, time.Time{}, false, http.StatusBadRequest, "validation_error", "", retry.Attempts{})
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
 		return nil, request, nil, false
 	}
 	if strings.TrimSpace(request.Model) == "" || len(request.Messages) == 0 || string(request.Messages) == "null" {
+		h.recordUsage(r.Context(), started, requestEndpoint(r), "", routing.Candidate{Name: request.Model, Model: request.Model}, 0, 0, time.Time{}, false, http.StatusBadRequest, "validation_error", "", retry.Attempts{})
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", "model and messages are required")
 		return nil, request, nil, false
 	}
 	candidates, err := routing.Resolve(h.config, request.Model)
 	if err != nil {
+		h.recordUsage(r.Context(), started, requestEndpoint(r), request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, 0, 0, time.Time{}, false, http.StatusBadRequest, "validation_error", "", retry.Attempts{})
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
 		return nil, request, nil, false
 	}
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
 	candidates, err = h.provider.Filter(candidates, adapterRequest)
 	if err != nil {
+		h.recordUsage(r.Context(), started, requestEndpoint(r), request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, 0, 0, time.Time{}, false, http.StatusBadRequest, "validation_error", "", retry.Attempts{})
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
 		return nil, request, nil, false
 	}
 	if len(candidates) == 0 {
+		h.recordUsage(r.Context(), started, requestEndpoint(r), request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, 0, 0, time.Time{}, false, http.StatusBadRequest, "validation_error", "", retry.Attempts{})
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", "no configured provider supports chat.completions")
 		return nil, request, nil, false
 	}
@@ -186,23 +198,32 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	for {
 		event, err := stream.Next()
 		if err != nil {
-			if err != io.EOF && seen {
+			if err != io.EOF && seen && !errors.Is(err, context.Canceled) {
 				_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
 				flusher.Flush()
 			}
-			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, true, http.StatusBadGateway, attempts)
-			h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, http.StatusBadGateway, "upstream_error")
+			errorType := "upstream_error"
+			streamOutcome := "upstream_error"
+			status := http.StatusBadGateway
+			if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
+				errorType = "client_aborted"
+				streamOutcome = "client_aborted"
+				status = 499
+			}
+			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, true, status, errorType, streamOutcome, attempts)
+			h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, status, errorType)
 			return
 		}
 		if event.Done {
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
 			flusher.Flush()
-			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, event.InputTokens, event.OutputTokens, true, http.StatusOK, attempts)
+			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, event.InputTokens, event.OutputTokens, firstToken, true, http.StatusOK, "", "completed", attempts)
 			h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, event.InputTokens, event.OutputTokens, firstToken, http.StatusOK, "")
 			return
 		}
 		if firstToken.IsZero() {
 			firstToken = h.now()
+			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, true, http.StatusOK, "", "first_token", attempts)
 		}
 		seen = true
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(event.Data, alias))
@@ -254,7 +275,7 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
-	h.recordUsage(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, result.OutputTokens, false, http.StatusOK, attempts)
+	h.recordUsage(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, false, http.StatusOK, "", "", attempts)
 	h.recordMetrics(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, http.StatusOK, "")
 }
 
@@ -264,7 +285,7 @@ func (h handler) writeProviderError(w http.ResponseWriter, r *http.Request, star
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", requestErr.Error())
 		return
 	}
-	h.recordUsage(r.Context(), started, endpoint, alias, candidate, 0, 0, streaming, http.StatusBadGateway, retry.Attempts{})
+	h.recordUsage(r.Context(), started, endpoint, alias, candidate, 0, 0, time.Time{}, streaming, http.StatusBadGateway, "upstream_error", "", retry.Attempts{})
 	h.recordMetrics(r.Context(), started, endpoint, alias, candidate, 0, 0, time.Time{}, http.StatusBadGateway, "upstream_error")
 	h.logger.Warn("upstream request failed", "request_id", requestID(r), "endpoint", endpoint, "error", err)
 	apierr.Write(w, http.StatusBadGateway, "upstream_error", "api_error", upstreamErrorMessage)
@@ -334,10 +355,43 @@ func (h handler) recordMetrics(ctx context.Context, started time.Time, endpoint,
 	h.metrics.Record(ctx, metrics.Request{Operation: endpoint, Provider: candidate.Name, Model: alias, UpstreamModel: candidate.Model, APIKeyID: principal.APIKeyID, TeamID: principal.TeamID, StartedAt: started}, metrics.Result{StatusCode: status, ErrorType: errorType, ResponseModel: candidate.Model, InputTokens: input, OutputTokens: output, FirstTokenAt: firstToken, CompletedAt: h.now()})
 }
 
-func (h handler) recordUsage(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate, input, output int, streaming bool, status int, attempts retry.Attempts) {
+func (h handler) recordUsage(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate, input, output int, ttft time.Time, streaming bool, status int, errorType, streamOutcome string, attempts retry.Attempts) {
 	completed := h.now()
 	principal, _ := auth.PrincipalFromContext(ctx)
-	event := usage.Event{RequestID: middleware.GetReqID(ctx), APIKeyID: principal.APIKeyID, TeamID: principal.TeamID, Endpoint: endpoint, Alias: alias, RequestedModel: alias, ResolvedModel: candidate.Model, Provider: candidate.Name, UpstreamModel: candidate.Model, StatusCode: status, Success: status >= 200 && status < 300, InputTokens: input, OutputTokens: output, TotalTokens: input + output, DurationMS: completed.Sub(started).Milliseconds(), StartedAt: started, CompletedAt: completed, Streaming: streaming, AttemptCount: attempts.Total, RetryCount: attempts.Retries, FailoverCount: attempts.Failovers}
+	event := usage.Event{
+		EventID:        usage.NewEventID(),
+		RequestID:      middleware.GetReqID(ctx),
+		APIKeyID:       principal.APIKeyID,
+		TeamID:         principal.TeamID,
+		Endpoint:       endpoint,
+		Alias:          alias,
+		RequestedModel: alias,
+		ResolvedModel:  candidate.Model,
+		Provider:       candidate.Name,
+		UpstreamModel:  candidate.Model,
+		ErrorType:      errorType,
+		StreamOutcome:  streamOutcome,
+		StatusCode:     status,
+		Success:        status >= 200 && status < 300,
+		Streaming:      streaming,
+		AttemptCount:   attempts.Total,
+		RetryCount:     attempts.Retries,
+		FailoverCount:  attempts.Failovers,
+		InputTokens:    input,
+		OutputTokens:   output,
+		TotalTokens:    input + output,
+		DurationMS:     completed.Sub(started).Milliseconds(),
+		StartedAt:      started,
+		CompletedAt:    completed,
+		ClientIP:       clientIP(ctx),
+		UserAgent:      userAgent(ctx),
+	}
+	if !ttft.IsZero() {
+		event.TimeToFirstTokenMS = ttft.Sub(started).Milliseconds()
+		if event.TimeToFirstTokenMS < 0 {
+			event.TimeToFirstTokenMS = 0
+		}
+	}
 	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
 	if err := h.usageSink.Record(recordCtx, event); err != nil {

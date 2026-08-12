@@ -60,31 +60,34 @@ type Server struct {
 	apiKeyLimit map[string]config.KeyLimits
 }
 
-func New(deps Deps) *Server {
+func New(deps Deps) (*Server, error) {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
 	}
 	if deps.Authenticator == nil {
 		deps.Authenticator = auth.NoopAuthenticator{}
 	}
-	if deps.UsageSink == nil {
-		deps.UsageSink = usage.NoopSink{}
+	limiter, err := pickLimiter(deps)
+	if err != nil {
+		return nil, err
+	}
+	quotaStore, err := pickQuotaStore(deps)
+	if err != nil {
+		return nil, err
+	}
+	usageSink, err := pickUsageSink(deps)
+	if err != nil {
+		return nil, err
 	}
 	if deps.Provider == nil {
 		deps.Provider = provider.NewClient()
 	}
 	if deps.Metrics == nil {
-		var err error
-		deps.Metrics, err = metrics.New()
-		if err != nil {
-			panic(err)
+		var mErr error
+		deps.Metrics, mErr = metrics.New()
+		if mErr != nil {
+			return nil, mErr
 		}
-	}
-	if deps.Limiter == nil {
-		deps.Limiter = ratelimit.NewMemoryLimiter()
-	}
-	if deps.QuotaStore == nil {
-		deps.QuotaStore = ratelimit.NewMemoryQuotaStore()
 	}
 	if deps.Now == nil {
 		deps.Now = func() time.Time { return time.Now().UTC() }
@@ -94,7 +97,7 @@ func New(deps Deps) *Server {
 	}
 
 	ready := &readiness{startedAt: time.Now(), waitTime: deps.Config.ReadyzWaitTime}
-	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: deps.UsageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: deps.Limiter, quotaStore: deps.QuotaStore, now: deps.Now, apiKeyLimits: deps.APIKeyLimits}
+	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, now: deps.Now, apiKeyLimits: deps.APIKeyLimits}
 	ops := chi.NewRouter()
 	ops.Get("/healthz", ready.healthz)
 	ops.Get("/livez", ready.healthz)
@@ -102,7 +105,7 @@ func New(deps Deps) *Server {
 	ops.Handle("/metrics", deps.Metrics.Handler())
 
 	router := chi.NewRouter()
-	router.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
+	router.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, clientInfoMiddleware)
 	router.Get("/healthz", ready.healthz)
 	router.Get("/livez", ready.healthz)
 	if deps.Config.Healthz == deps.Config.Listen {
@@ -122,11 +125,47 @@ func New(deps Deps) *Server {
 		ready:       ready,
 		config:      deps.Config,
 		logger:      deps.Logger,
-		limiter:     deps.Limiter,
-		quotaStore:  deps.QuotaStore,
+		limiter:     limiter,
+		quotaStore:  quotaStore,
 		now:         deps.Now,
 		apiKeyLimit: deps.APIKeyLimits,
+	}, nil
+}
+
+// pickLimiter resolves the Limiter in priority order: explicit Deps injection,
+// config-driven driver lookup, then the in-process memory fallback.
+func pickLimiter(deps Deps) (ratelimit.Limiter, error) {
+	if deps.Limiter != nil {
+		return deps.Limiter, nil
 	}
+	if driver := deps.Config.RateLimit.Driver; driver != "" {
+		return ratelimit.LimiterRegistry.Build(driver, deps.Config.RateLimit.Options)
+	}
+	return ratelimit.NewMemoryLimiter(), nil
+}
+
+// pickQuotaStore mirrors pickLimiter for the daily-quota tracker.
+func pickQuotaStore(deps Deps) (ratelimit.QuotaStore, error) {
+	if deps.QuotaStore != nil {
+		return deps.QuotaStore, nil
+	}
+	if driver := deps.Config.Quota.Driver; driver != "" {
+		return ratelimit.QuotaRegistry.Build(driver, deps.Config.Quota.Options)
+	}
+	return ratelimit.NewMemoryQuotaStore(), nil
+}
+
+// pickUsageSink resolves the usage sink. The production behavior is to write
+// audit records to slog; binaries that want a different sink can inject it
+// directly via Deps or register a custom driver in config.
+func pickUsageSink(deps Deps) (usage.Sink, error) {
+	if deps.UsageSink != nil {
+		return deps.UsageSink, nil
+	}
+	if driver := deps.Config.Usage.Driver; driver != "" {
+		return usage.Registry.Build(driver, deps.Config.Usage.Options)
+	}
+	return usage.NewAuditSink(deps.Logger), nil
 }
 
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
@@ -140,7 +179,10 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 			limits[key.ID] = key.Limits
 		}
 	}
-	server := New(Deps{Config: cfg, Logger: logger, Authenticator: authenticator, APIKeyLimits: limits})
+	server, err := New(Deps{Config: cfg, Logger: logger, Authenticator: authenticator, APIKeyLimits: limits})
+	if err != nil {
+		return err
+	}
 	health := &http.Server{Addr: cfg.Healthz, Handler: server.Ops, ReadHeaderTimeout: 10 * time.Second}
 	errCh := make(chan error, 2)
 	serve := func(s *http.Server) {

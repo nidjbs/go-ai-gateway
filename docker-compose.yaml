@@ -1,11 +1,23 @@
 services:
+  mock:
+    build:
+      context: .
+      target: mock
+    command: ["--listen", "0.0.0.0:19090", "--role", "primary"]
+
   gateway:
-    build: .
+    build:
+      context: .
+      target: gateway
     command: ["--config", "/etc/light-llm-gateway/config.yaml"]
     ports:
       - "8080:8080"
       - "8081:8081"
     environment:
-      UPSTREAM_API_KEY: local-development-token
+      UPSTREAM_API_KEY: primary-token
     volumes:
-      - ./configs/config.example.yaml:/etc/light-llm-gateway/config.yaml:ro
+      - ./configs/config.docker.yaml:/etc/light-llm-gateway/config.yaml:ro
+    depends_on:
+      mock:
+        condition: service_started
+    restart: on-failure

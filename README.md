@@ -25,6 +25,24 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   --data '{"model":"chat","messages":[{"role":"user","content":"hello"}]}'
 ```
 
+### Docker
+
+A two-service stack ships in the repo: the gateway plus a built-in mock
+upstream so you can `up` and see a working chat response without configuring
+any real provider.
+
+```bash
+docker compose up --build
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data '{"model":"chat","messages":[{"role":"user","content":"hello"}]}'
+```
+
+To point the containerised gateway at a real upstream, edit
+`configs/config.docker.yaml` (it is bind-mounted into the container) and
+restart with `docker compose up -d --force-recreate`. The same config keys
+apply as in the non-Docker Quick Start above.
+
 ## Authentication
 
 Authentication supports three modes configured via `auth.mode`:

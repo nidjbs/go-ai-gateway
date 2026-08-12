@@ -22,7 +22,18 @@ type Config struct {
 	Retry             RetryConfig         `yaml:"retry"`
 	Failover          FailoverConfig      `yaml:"failover"`
 	Teams             []TeamConfig        `yaml:"teams"`
+	RateLimit         StorageDriver       `yaml:"rate_limit,omitempty"`
+	Quota             StorageDriver       `yaml:"quota,omitempty"`
+	Usage             StorageDriver       `yaml:"usage,omitempty"`
 	readyzWaitTimeSet bool
+}
+
+// StorageDriver is a generic named-driver selector. Driver names are matched
+// against the registries in ratelimit/usage; an empty Driver falls back to the
+// in-tree default (no config required for the existing behavior).
+type StorageDriver struct {
+	Driver  string         `yaml:"driver"`
+	Options map[string]any `yaml:"options,omitempty"`
 }
 
 func (c *Config) UnmarshalYAML(value *yaml.Node) error {

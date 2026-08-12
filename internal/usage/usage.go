@@ -34,6 +34,8 @@ type Event struct {
 	TimeToFirstTokenMS int64
 	StartedAt          time.Time
 	CompletedAt        time.Time
+	ClientIP           string
+	UserAgent          string
 }
 
 type Sink interface {

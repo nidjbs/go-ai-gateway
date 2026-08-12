@@ -45,7 +45,7 @@ func TestAnthropicUnsupportedRequestIsLocalBadRequest(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
 	defer upstream.Close()
 
-	server := New(Deps{Config: &config.Config{
+	server, err := New(Deps{Config: &config.Config{
 		Listen: "127.0.0.1:0",
 		Providers: map[string]config.Provider{
 			"anthropic": {Type: "anthropic", BaseURL: upstream.URL, APIKey: "token"},
@@ -54,6 +54,9 @@ func TestAnthropicUnsupportedRequestIsLocalBadRequest(t *testing.T) {
 		Retry:    config.RetryConfig{MaxAttemptsPerProvider: 1},
 		Failover: config.FailoverConfig{},
 	}, Authenticator: auth.NoopAuthenticator{}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}`))
 	response := httptest.NewRecorder()
 	server.HTTP.Handler.ServeHTTP(response, request)
@@ -112,11 +115,15 @@ func TestStreamOpenErrorIsSanitized(t *testing.T) {
 }
 
 func newTestServer(upstreamURL string) *Server {
-	return New(Deps{Config: &config.Config{
+	server, err := New(Deps{Config: &config.Config{
 		Listen:    "127.0.0.1:0",
 		Providers: map[string]config.Provider{"local": {BaseURL: upstreamURL, APIKey: "upstream-token"}},
 		Aliases:   map[string]config.Alias{"chat": {Provider: "local", Model: "provider-model"}},
 		Retry:     config.RetryConfig{MaxAttemptsPerProvider: 1},
 		Failover:  config.FailoverConfig{},
 	}, Authenticator: auth.NoopAuthenticator{}})
+	if err != nil {
+		panic(err)
+	}
+	return server
 }
