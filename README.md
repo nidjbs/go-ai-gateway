@@ -27,7 +27,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## Authentication
 
-Authentication defaults to `none`, which is appropriate only for local use or when an outer proxy authenticates callers. To enable a static Bearer token:
+Authentication supports three modes configured via `auth.mode`:
+
+- `none`: no authentication. Local use only.
+- `static`: a single Bearer token from a configured environment variable.
+- `api-key`: per-key Bearer authentication, with per-key rate limits and daily token quotas. Keys are organized under one or more teams.
+
+### Static token
 
 ```yaml
 auth:
@@ -40,6 +46,57 @@ export GATEWAY_STATIC_TOKEN=replace-with-gateway-token
 curl http://127.0.0.1:8080/v1/models \
   -H "Authorization: Bearer $GATEWAY_STATIC_TOKEN"
 ```
+
+### API keys with team grouping
+
+```yaml
+auth:
+  mode: api-key
+
+teams:
+  - id: team-frontend
+    name: Frontend
+    api_keys:
+      - id: key-prod
+        key: sk-replace-me-with-a-generated-key
+        limits:
+          rps: 20
+          burst: 40
+          preday_tokens: 5000000
+      - id: key-batch
+        key: sk-replace-me-too
+        limits:
+          rps: 5
+          burst: 10
+          preday_tokens: 1000000
+```
+
+```bash
+curl http://127.0.0.1:8080/v1/models \
+  -H "Authorization: Bearer sk-replace-me-with-a-generated-key"
+```
+
+Generate a fresh key with the bundled helper:
+
+```bash
+go run ./cmd/keygen
+./scripts/genkey.sh
+```
+
+The command only prints a key. Paste it into `configs/config.yaml` under the appropriate `api_keys[].key`. The YAML file is the single source of truth.
+
+Per-key limits:
+
+- `rps` (float): sustained token-bucket rate. `0` means unlimited.
+- `burst` (int): bucket capacity. Defaults to `ceil(rps)` when omitted.
+- `preday_tokens` (int): daily token quota reset at UTC midnight. Charges on successful chat completions and embeddings. `0` means unlimited.
+
+Responses carry the following headers when the relevant limit is configured:
+
+- `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `Retry-After`
+- `X-Quota-Limit-Tokens`, `X-Quota-Used-Tokens`, `X-Quota-Remaining-Tokens`, `X-Quota-Reset-At`
+
+Limits are enforced per process. In multi-replica deployments each replica enforces its own budget; cross-replica coordination is intentionally out of scope for the in-memory default.
 
 ## Routing and Failover
 

@@ -15,6 +15,7 @@ import (
 	"example.com/light-llm-gateway/internal/config"
 	"example.com/light-llm-gateway/internal/metrics"
 	"example.com/light-llm-gateway/internal/provider"
+	"example.com/light-llm-gateway/internal/ratelimit"
 	"example.com/light-llm-gateway/internal/usage"
 )
 
@@ -25,6 +26,10 @@ type Deps struct {
 	UsageSink     usage.Sink
 	Provider      *provider.Client
 	Metrics       *metrics.Recorder
+	Limiter       ratelimit.Limiter
+	QuotaStore    ratelimit.QuotaStore
+	Now           func() time.Time
+	APIKeyLimits  map[string]config.KeyLimits
 }
 
 type readiness struct {
@@ -44,11 +49,15 @@ func (r *readiness) readyz(w http.ResponseWriter, _ *http.Request) {
 }
 
 type Server struct {
-	HTTP   *http.Server
-	Ops    http.Handler
-	ready  *readiness
-	config *config.Config
-	logger *slog.Logger
+	HTTP        *http.Server
+	Ops         http.Handler
+	ready       *readiness
+	config      *config.Config
+	logger      *slog.Logger
+	limiter     ratelimit.Limiter
+	quotaStore  ratelimit.QuotaStore
+	now         func() time.Time
+	apiKeyLimit map[string]config.KeyLimits
 }
 
 func New(deps Deps) *Server {
@@ -71,9 +80,21 @@ func New(deps Deps) *Server {
 			panic(err)
 		}
 	}
+	if deps.Limiter == nil {
+		deps.Limiter = ratelimit.NewMemoryLimiter()
+	}
+	if deps.QuotaStore == nil {
+		deps.QuotaStore = ratelimit.NewMemoryQuotaStore()
+	}
+	if deps.Now == nil {
+		deps.Now = func() time.Time { return time.Now().UTC() }
+	}
+	if deps.APIKeyLimits == nil {
+		deps.APIKeyLimits = map[string]config.KeyLimits{}
+	}
 
 	ready := &readiness{startedAt: time.Now(), waitTime: deps.Config.ReadyzWaitTime}
-	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: deps.UsageSink, provider: deps.Provider, metrics: deps.Metrics}
+	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: deps.UsageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: deps.Limiter, quotaStore: deps.QuotaStore, now: deps.Now, apiKeyLimits: deps.APIKeyLimits}
 	ops := chi.NewRouter()
 	ops.Get("/healthz", ready.healthz)
 	ops.Get("/livez", ready.healthz)
@@ -96,20 +117,30 @@ func New(deps Deps) *Server {
 	})
 
 	return &Server{
-		HTTP:   &http.Server{Addr: deps.Config.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second},
-		Ops:    ops,
-		ready:  ready,
-		config: deps.Config,
-		logger: deps.Logger,
+		HTTP:        &http.Server{Addr: deps.Config.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second},
+		Ops:         ops,
+		ready:       ready,
+		config:      deps.Config,
+		logger:      deps.Logger,
+		limiter:     deps.Limiter,
+		quotaStore:  deps.QuotaStore,
+		now:         deps.Now,
+		apiKeyLimit: deps.APIKeyLimits,
 	}
 }
 
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
-	authenticator, err := auth.New(cfg.Auth)
+	authenticator, err := auth.New(cfg.Auth, cfg.Teams)
 	if err != nil {
 		return err
 	}
-	server := New(Deps{Config: cfg, Logger: logger, Authenticator: authenticator})
+	limits := make(map[string]config.KeyLimits, len(cfg.Teams))
+	for _, team := range cfg.Teams {
+		for _, key := range team.APIKeys {
+			limits[key.ID] = key.Limits
+		}
+	}
+	server := New(Deps{Config: cfg, Logger: logger, Authenticator: authenticator, APIKeyLimits: limits})
 	health := &http.Server{Addr: cfg.Healthz, Handler: server.Ops, ReadHeaderTimeout: 10 * time.Second}
 	errCh := make(chan error, 2)
 	serve := func(s *http.Server) {

@@ -27,6 +27,8 @@ type Request struct {
 	Provider      string
 	Model         string
 	UpstreamModel string
+	APIKeyID      string
+	TeamID        string
 	StartedAt     time.Time
 }
 
@@ -108,6 +110,12 @@ func llmAttributes(request Request, result Result, success bool) []attribute.Key
 		attribute.String("upstream_model", request.UpstreamModel),
 		attribute.String("response_model", responseModel),
 		attribute.Bool("success", success),
+	}
+	if request.APIKeyID != "" {
+		attrs = append(attrs, attribute.String("api_key_id", request.APIKeyID))
+	}
+	if request.TeamID != "" {
+		attrs = append(attrs, attribute.String("team_id", request.TeamID))
 	}
 	if result.ErrorType != "" {
 		attrs = append(attrs, attribute.String("error.type", result.ErrorType))

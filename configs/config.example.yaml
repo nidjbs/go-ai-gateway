@@ -6,6 +6,21 @@ auth:
   mode: none
   token_env: GATEWAY_STATIC_TOKEN
 
+# `auth.mode` accepts `none`, `static`, or `api-key`.
+# When `auth.mode = api-key`, configure one or more teams below.
+# When `auth.mode = static`, set `token_env` to the env var holding the bearer token.
+# When `auth.mode = api-key`, `token_env` is ignored.
+teams:
+  - id: team-demo
+    name: Demo Team
+    api_keys:
+      - id: key-demo
+        key: sk-replace-me-with-a-generated-key
+        limits:
+          rps: 10
+          burst: 20
+          preday_tokens: 100000
+
 providers:
   local:
     # Supported types: openai and anthropic. The public API remains OpenAI Chat Completions.

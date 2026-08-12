@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -53,5 +54,35 @@ func TestRecorderFailureOnlyRecordsDuration(t *testing.T) {
 	}
 	if strings.Contains(body, "ai_gateway_llm_token_usage_token") {
 		t.Errorf("failure should not record token usage:\n%s", body)
+	}
+}
+
+func TestRecorderAddsAPIKeyAndTeamLabels(t *testing.T) {
+	recorder, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().Add(-50 * time.Millisecond)
+	recorder.Record(context.Background(), Request{
+		Operation:     "chat.completions",
+		Provider:      "primary",
+		Model:         "chat",
+		UpstreamModel: "provider-chat",
+		APIKeyID:      "key-a",
+		TeamID:        "team-a",
+		StartedAt:     started,
+	}, Result{
+		StatusCode:    http.StatusOK,
+		ResponseModel: "provider-chat",
+		InputTokens:   3,
+		OutputTokens:  5,
+		CompletedAt:   time.Now(),
+	})
+
+	response := httptest.NewRecorder()
+	recorder.Handler().ServeHTTP(response, httptest.NewRequest("GET", "/metrics", nil))
+	body := response.Body.String()
+	if !strings.Contains(body, `api_key_id="key-a"`) || !strings.Contains(body, `team_id="team-a"`) {
+		t.Fatalf("expected api_key_id and team_id labels, body=%s", body)
 	}
 }

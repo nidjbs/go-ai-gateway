@@ -21,6 +21,7 @@ type Config struct {
 	Aliases           map[string]Alias    `yaml:"aliases"`
 	Retry             RetryConfig         `yaml:"retry"`
 	Failover          FailoverConfig      `yaml:"failover"`
+	Teams             []TeamConfig        `yaml:"teams"`
 	readyzWaitTimeSet bool
 }
 
@@ -58,6 +59,24 @@ type AliasProvider struct {
 	Name     string `yaml:"name"`
 	Model    string `yaml:"model"`
 	Priority int    `yaml:"priority"`
+}
+
+type TeamConfig struct {
+	ID      string         `yaml:"id"`
+	Name    string         `yaml:"name"`
+	APIKeys []APIKeyConfig `yaml:"api_keys"`
+}
+
+type APIKeyConfig struct {
+	ID     string    `yaml:"id"`
+	Key    string    `yaml:"key"`
+	Limits KeyLimits `yaml:"limits"`
+}
+
+type KeyLimits struct {
+	RPS          float64 `yaml:"rps"`
+	Burst        int     `yaml:"burst"`
+	PredayTokens int64   `yaml:"preday_tokens"`
 }
 
 type RetryConfig struct {
@@ -133,6 +152,7 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	cfg.FinalizeAPIKeys()
 	return cfg, nil
 }
 
@@ -193,11 +213,16 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid %s address %q: %w", address.name, address.value, err)
 		}
 	}
-	if c.Auth.Mode != "none" && c.Auth.Mode != "static" {
+	if c.Auth.Mode != "none" && c.Auth.Mode != "static" && c.Auth.Mode != "api-key" {
 		return fmt.Errorf("auth.mode %q is unsupported", c.Auth.Mode)
 	}
 	if c.Auth.Mode == "static" && strings.TrimSpace(c.Auth.TokenEnv) == "" {
 		return errors.New("auth.token_env is required when auth.mode is static")
+	}
+	if c.Auth.Mode == "api-key" {
+		if err := c.validateTeams(); err != nil {
+			return err
+		}
 	}
 	if c.Retry.Multiplier <= 0 {
 		return errors.New("retry.multiplier must be greater than zero")
@@ -257,4 +282,96 @@ func (c *Config) AliasNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func (c *Config) TeamsEnabled() bool {
+	return c.Auth.Mode == "api-key"
+}
+
+func (c *Config) validateTeams() error {
+	if len(c.Teams) == 0 {
+		return errors.New("auth.mode is api-key but no teams are configured")
+	}
+	teamIDs := make(map[string]struct{}, len(c.Teams))
+	apiKeyIDs := make(map[string]struct{})
+	rawKeys := make(map[string]struct{})
+	for i, team := range c.Teams {
+		id := strings.TrimSpace(team.ID)
+		if id == "" {
+			return fmt.Errorf("teams[%d]: id is required", i)
+		}
+		if !validIdentifier(id) {
+			return fmt.Errorf("teams[%d]: id %q contains invalid characters", i, id)
+		}
+		if _, ok := teamIDs[id]; ok {
+			return fmt.Errorf("teams[%d]: duplicate team id %q", i, id)
+		}
+		teamIDs[id] = struct{}{}
+		if len(team.APIKeys) == 0 {
+			return fmt.Errorf("teams[%d] %q: api_keys must not be empty", i, id)
+		}
+		for j, key := range team.APIKeys {
+			keyID := strings.TrimSpace(key.ID)
+			if keyID == "" {
+				return fmt.Errorf("teams[%d].api_keys[%d]: id is required", i, j)
+			}
+			if !validIdentifier(keyID) {
+				return fmt.Errorf("teams[%d].api_keys[%d]: id %q contains invalid characters", i, j, keyID)
+			}
+			if _, ok := apiKeyIDs[keyID]; ok {
+				return fmt.Errorf("teams[%d].api_keys[%d]: duplicate api key id %q", i, j, keyID)
+			}
+			apiKeyIDs[keyID] = struct{}{}
+			raw := strings.TrimSpace(key.Key)
+			if raw == "" {
+				return fmt.Errorf("teams[%d].api_keys[%d]: key is required", i, j)
+			}
+			if _, ok := rawKeys[raw]; ok {
+				return fmt.Errorf("teams[%d].api_keys[%d]: duplicate api key", i, j)
+			}
+			rawKeys[raw] = struct{}{}
+			if key.Limits.RPS < 0 {
+				return fmt.Errorf("teams[%d].api_keys[%d]: limits.rps must be non-negative", i, j)
+			}
+			if key.Limits.Burst < 0 {
+				return fmt.Errorf("teams[%d].api_keys[%d]: limits.burst must be non-negative", i, j)
+			}
+			if key.Limits.PredayTokens < 0 {
+				return fmt.Errorf("teams[%d].api_keys[%d]: limits.preday_tokens must be non-negative", i, j)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Config) FinalizeAPIKeys() {
+	for i, team := range c.Teams {
+		for j, key := range team.APIKeys {
+			if key.Limits.RPS > 0 && key.Limits.Burst == 0 {
+				key.Limits.Burst = int(key.Limits.RPS)
+				if key.Limits.Burst < 1 {
+					key.Limits.Burst = 1
+				}
+				team.APIKeys[j] = key
+			}
+		}
+		c.Teams[i] = team
+	}
+}
+
+func validIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }

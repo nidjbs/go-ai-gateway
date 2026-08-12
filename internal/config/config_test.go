@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,5 +73,126 @@ failover:
 	}
 	if cfg.Failover.IsEnabled() {
 		t.Error("failover should be disabled")
+	}
+}
+
+func TestLoadSupportsAPIKeyTeams(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`auth:
+  mode: api-key
+providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+aliases:
+  chat:
+    provider: local
+    model: mock-chat
+teams:
+  - id: team-a
+    name: Team A
+    api_keys:
+      - id: key-a
+        key: sk-abcdefghijklmnopqrstuvwxyz123456
+        limits:
+          rps: 10
+          burst: 20
+          preday_tokens: 5000
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Auth.Mode != "api-key" {
+		t.Fatalf("Auth.Mode = %q, want api-key", cfg.Auth.Mode)
+	}
+	if len(cfg.Teams) != 1 || len(cfg.Teams[0].APIKeys) != 1 {
+		t.Fatalf("unexpected teams: %+v", cfg.Teams)
+	}
+	if cfg.Teams[0].APIKeys[0].Limits.Burst != 20 {
+		t.Fatalf("Burst = %d, want 20", cfg.Teams[0].APIKeys[0].Limits.Burst)
+	}
+}
+
+func TestLoadRejectsDuplicateAPIKeysAcrossTeams(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`auth:
+  mode: api-key
+providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+aliases:
+  chat:
+    provider: local
+    model: mock-chat
+teams:
+  - id: team-a
+    api_keys:
+      - id: key-a
+        key: sk-duplicate-key-1234567890
+  - id: team-b
+    api_keys:
+      - id: key-b
+        key: sk-duplicate-key-1234567890
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "duplicate api key") {
+		t.Fatalf("err = %v, want duplicate api key error", err)
+	}
+}
+
+func TestLoadRejectsAPIKeyWithoutTeams(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`auth:
+  mode: api-key
+providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+aliases:
+  chat:
+    provider: local
+    model: mock-chat
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "no teams") {
+		t.Fatalf("err = %v, want no teams error", err)
+	}
+}
+
+func TestLoadDefaultsBurstToRPS(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`auth:
+  mode: api-key
+providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+aliases:
+  chat:
+    provider: local
+    model: mock-chat
+teams:
+  - id: team-a
+    api_keys:
+      - id: key-a
+        key: sk-default-burst-1234567890
+        limits:
+          rps: 7
+          preday_tokens: 100
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Teams[0].APIKeys[0].Limits.Burst != 7 {
+		t.Fatalf("Burst = %d, want 7", cfg.Teams[0].APIKeys[0].Limits.Burst)
 	}
 }

@@ -67,7 +67,7 @@
 - Produces: `config.Load(path string) (*config.Config, error)` and `config.Config` used by all later tasks.
 - Produces: a binary command `gateway --config <path>` that loads valid configuration and exits cleanly on SIGINT/SIGTERM.
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 ```go
 func TestLoadAppliesDefaults(t *testing.T) {
@@ -90,13 +90,13 @@ aliases:
 }
 ```
 
-- [ ] **Step 2: Run the new test and verify it fails**
+- [x] **Step 2: Run the new test and verify it fails**
 
 Run: `go test ./internal/config -run TestLoadAppliesDefaults -count=1`
 
 Expected: FAIL because `Load` and its configuration types do not exist.
 
-- [ ] **Step 3: Implement a minimal standalone configuration loader**
+- [x] **Step 3: Implement a minimal standalone configuration loader**
 
 ```go
 type Config struct {
@@ -122,7 +122,7 @@ func Load(path string) (*Config, error) {
 
 Validate host:port values, non-empty providers/aliases, supported provider type `openai`, valid retry values, alias/provider references, and required API key environment variables. Create the example configuration with only `UPSTREAM_API_KEY` as a placeholder environment variable.
 
-- [ ] **Step 4: Implement the process entry point**
+- [x] **Step 4: Implement the process entry point**
 
 ```go
 func main() {
@@ -140,7 +140,7 @@ func main() {
 
 Initially add a temporary `gateway.Run` stub returning `nil`; later tasks replace it with the HTTP server.
 
-- [ ] **Step 5: Run focused validation**
+- [x] **Step 5: Run focused validation**
 
 Run: `gofmt -w cmd/gateway internal/config && go test ./internal/config -count=1`
 
