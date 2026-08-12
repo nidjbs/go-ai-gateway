@@ -68,7 +68,11 @@ func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candida
 	if request.Operation != ChatCompletions {
 		return nil, unsupportedField(string(request.Operation))
 	}
-	req, cancel, err := a.client.newRequest(ctx, http.MethodPost, endpointURL(candidate.BaseURL, "chat/completions"), bodyWithModel(request.Body, candidate.Model), candidate.Timeout)
+	// Detach from the caller's cancel: a stream outlives the attempt that produced it,
+	// and retry/per-attempt cancellation must not abort reads of subsequent chunks.
+	// candidate.Timeout still bounds the request via newRequest below.
+	streamCtx := context.WithoutCancel(ctx)
+	req, cancel, err := a.client.newRequest(streamCtx, http.MethodPost, endpointURL(candidate.BaseURL, "chat/completions"), bodyWithModel(request.Body, candidate.Model), candidate.Timeout)
 	if err != nil {
 		return nil, err
 	}

@@ -2,7 +2,10 @@ package retry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
@@ -62,6 +65,55 @@ func TestExecuteZeroAttemptsStillCallsOnce(t *testing.T) {
 	}, func(context.Context, time.Duration) error { return nil }, func() float64 { return 0.5 })
 	if err == nil || calls != 1 {
 		t.Fatalf("calls = %d, err = %v; want one call and an error", calls, err)
+	}
+}
+
+func TestExecuteStreamSurvivesAttemptContextCancel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		for _, chunk := range []string{
+			"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+			"data: [DONE]\n\n",
+		} {
+			_, _ = w.Write([]byte(chunk))
+			flusher.Flush()
+			time.Sleep(40 * time.Millisecond)
+		}
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	cfg := retryConfig(t, true)
+	cfg.PerAttemptTimeout = 30 * time.Millisecond
+	candidates := []routing.Candidate{{Name: "primary", BaseURL: upstream.URL, Timeout: 2 * time.Second}}
+	body := json.RawMessage(`{"model":"test","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	stream, _, _, err := Execute[provider.Stream](context.Background(), cfg, config.FailoverConfig{}, candidates, func(ctx context.Context, _ routing.Candidate) (provider.Stream, error) {
+		return provider.NewClient().OpenStream(ctx, provider.Request{Operation: provider.ChatCompletions, Body: body}, candidates[0])
+	})
+	if err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	defer stream.Close()
+
+	for i := 0; i < 2; i++ {
+		event, err := stream.Next()
+		if err != nil {
+			t.Fatalf("Next #%d: %v", i+1, err)
+		}
+		if event.Done || len(event.Data) == 0 {
+			t.Fatalf("Next #%d: unexpected empty event %+v", i+1, event)
+		}
+	}
+	done, err := stream.Next()
+	if err != nil {
+		t.Fatalf("Next DONE: %v", err)
+	}
+	if !done.Done {
+		t.Fatalf("final event not Done: %+v", done)
 	}
 }
 

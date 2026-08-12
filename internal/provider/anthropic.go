@@ -58,7 +58,11 @@ func (a *anthropicAdapter) OpenStream(ctx context.Context, request Request, cand
 	if err != nil {
 		return nil, err
 	}
-	response, cancel, err := a.open(ctx, body, candidate, true)
+	// Detach from the caller's cancel: a stream outlives the attempt that produced it,
+	// and retry/per-attempt cancellation must not abort reads of subsequent chunks.
+	// candidate.Timeout still bounds the request via a.open below.
+	streamCtx := context.WithoutCancel(ctx)
+	response, cancel, err := a.open(streamCtx, body, candidate, true)
 	if err != nil {
 		return nil, err
 	}

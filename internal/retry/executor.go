@@ -55,17 +55,25 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 				attemptCtx, cancel = context.WithTimeout(ctx, retryCfg.PerAttemptTimeout)
 			}
 			value, err := attempt(attemptCtx, candidate)
-			cancel()
-			if err == nil {
-				return value, candidate, attempts, nil
+			if err != nil {
+				cancel()
+				lastErr = err
+				if !retryable(err, retryCfg) || n+1 == maxAttempts || (retryCfg.MaxElapsedTime > 0 && time.Since(started) >= retryCfg.MaxElapsedTime) {
+					break
+				}
+				if err := sleepFn(ctx, backoffDuration(retryCfg, n, random)); err != nil {
+					return zero, candidate, attempts, err
+				}
+				continue
 			}
-			lastErr = err
-			if !retryable(err, retryCfg) || n+1 == maxAttempts || (retryCfg.MaxElapsedTime > 0 && time.Since(started) >= retryCfg.MaxElapsedTime) {
-				break
-			}
-			if err := sleepFn(ctx, backoffDuration(retryCfg, n, random)); err != nil {
-				return zero, candidate, attempts, err
-			}
+			// On success, hand attempt-context ownership to the returned value.
+			// For streams, the underlying HTTP request and scanner rely on attemptCtx;
+			// cancelling it here would abort reads of subsequent chunks. The value's
+			// Close (or per-call context, for non-stream results) is responsible for
+			// releasing attemptCtx. If T does not retain cancel, the attempt's timer
+			// is reclaimed when attemptCtx expires via PerAttemptTimeout.
+			_ = cancel
+			return value, candidate, attempts, nil
 		}
 		if !failoverCfg.IsEnabled() {
 			break
