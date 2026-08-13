@@ -146,6 +146,58 @@ For Anthropic providers, Chat Completions supports system and text messages, fun
 - `POST /v1/chat/completions`
 - `POST /v1/embeddings`
 
+## Usage Persistence
+
+Each business event (chat completion, embeddings, validation failure,
+unauthorized / rate-limit / quota rejection, stream first-token,
+stream client abort, etc.) is recorded as a `usage.Event`. The default sink
+emits a structured slog record (audit) for every event — useful for live
+debugging and tail-based alerting. To persist events to disk, point
+`usage.driver` at a SQL backend; the bundled `sqlite` driver writes to a
+single file with no external service:
+
+```yaml
+usage:
+  driver: sqlite
+  options:
+    path: ./usage.db
+```
+
+The schema lives with the driver (`CREATE TABLE IF NOT EXISTS usage_events`)
+and is created on first start. Indexes on `started_at`, `api_key_id`, and
+`team_id` are created in the same statement.
+
+### Swapping the database
+
+The storage layer is built around a generic `Sink` interface and a
+driver registry (`usage.Registry`). Third-party packages plug in their own
+driver in `init()`:
+
+```go
+import _ "github.com/example/light-llm-gateway-usage-postgres"
+
+func init() {
+    usage.Registry.Register("postgres", func(opts map[string]any) (usage.Sink, error) {
+        // open *sql.DB using a postgres driver (e.g. github.com/lib/pq),
+        // supply your own CREATE TABLE / INDEX DDL, and return a *usage.SQLSink
+        return usage.NewSQLSink(db, myDDL, usage.DefaultInsertSQL("usage_events", "$1, $2, ..."))
+    })
+}
+```
+
+With the driver imported, switching the gateway is one config line:
+
+```yaml
+usage:
+  driver: postgres
+  options:
+    dsn: postgres://user:pass@host:5432/db?sslmode=disable
+```
+
+The same mechanism covers `rate_limit` and `quota` (their registries
+already exist; only the matching driver implementations need to be
+registered).
+
 ## Development
 
 ```bash

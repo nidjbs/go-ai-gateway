@@ -182,6 +182,10 @@ retry:
   retryable_statuses: [503]
 failover:
   enabled: true
+usage:
+  driver: sqlite
+  options:
+    path: ${tmp_dir}/usage.db
 EOF
 
 GATEWAY_STATIC_TOKEN=gateway-token PRIMARY_UPSTREAM_TOKEN=primary-token BACKUP_UPSTREAM_TOKEN=backup-token "$tmp_dir/gateway" --config "$tmp_dir/config.yaml" >"$tmp_dir/gateway.log" 2>&1 &
@@ -314,6 +318,27 @@ assert_status 400 "$(request POST /v1/chat/completions "$unknown" gateway-token 
 empty_embedding='{"model":"embedding","input":""}'
 assert_status 400 "$(request POST /v1/embeddings "$empty_embedding" gateway-token "$tmp_dir/empty-embedding.json")" "$tmp_dir/empty-embedding.json"
 pass_case "embeddings and validation"
+
+run_case "sqlite usage persistence"
+sqlite_persist_chat='{"model":"chat","messages":[{"role":"user","content":"hello"}]}'
+assert_status 200 "$(request POST /v1/chat/completions "$sqlite_persist_chat" gateway-token "$tmp_dir/sqlite-chat.json")" "$tmp_dir/sqlite-chat.json"
+python3 - "$tmp_dir/usage.db" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+count = db.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
+assert count >= 1, f"expected >=1 event, got {count}"
+chat = db.execute(
+    "SELECT endpoint, alias, status, success, input_tokens, output_tokens "
+    "FROM usage_events WHERE alias = 'chat' ORDER BY started_at DESC LIMIT 1"
+).fetchone()
+assert chat is not None and chat[0] == "chat.completions" and chat[2] == 200 and chat[3] == 1, chat
+embedding = db.execute(
+    "SELECT endpoint, alias FROM usage_events WHERE alias = 'embedding' ORDER BY started_at DESC LIMIT 1"
+).fetchone()
+assert embedding is not None and embedding[0] == "embeddings", embedding
+db.close()
+PY
+pass_case "sqlite usage persistence"
 
 curl --fail --silent "http://127.0.0.1:${health_port}/metrics" >"$tmp_dir/metrics-after-requests.txt"
 grep -q 'ai_gateway_llm_request_duration_seconds' "$tmp_dir/metrics-after-requests.txt"

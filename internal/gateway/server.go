@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
@@ -58,6 +59,7 @@ type Server struct {
 	quotaStore  ratelimit.QuotaStore
 	now         func() time.Time
 	apiKeyLimit map[string]config.KeyLimits
+	closer      io.Closer // optional sink/handle released on graceful shutdown
 }
 
 func New(deps Deps) (*Server, error) {
@@ -129,7 +131,18 @@ func New(deps Deps) (*Server, error) {
 		quotaStore:  quotaStore,
 		now:         deps.Now,
 		apiKeyLimit: deps.APIKeyLimits,
+		closer:      sinkCloser(usageSink),
 	}, nil
+}
+
+// sinkCloser returns an io.Closer iff sink implements it (e.g. SQLSink closes
+// its database handle). NoopSink and AuditSink fall through and return nil;
+// their lifecycle is process-bound and needs no explicit close.
+func sinkCloser(sink usage.Sink) io.Closer {
+	if c, ok := sink.(io.Closer); ok {
+		return c
+	}
+	return nil
 }
 
 // pickLimiter resolves the Limiter in priority order: explicit Deps injection,
@@ -203,8 +216,15 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		defer cancel()
 		apiErr := server.HTTP.Shutdown(shutdownCtx)
 		healthErr := health.Shutdown(shutdownCtx)
+		var sinkErr error
+		if server.closer != nil {
+			sinkErr = server.closer.Close()
+		}
 		if apiErr != nil {
 			return apiErr
+		}
+		if sinkErr != nil {
+			return sinkErr
 		}
 		return healthErr
 	}

@@ -51,3 +51,21 @@ retry:
 failover:
   enabled: true
   max_providers: 0
+
+# Pluggable storage drivers. Same shape for rate_limit / quota / usage; the
+# driver name is matched against the package's driver registry, and options
+# are forwarded to the factory. Examples (uncomment to enable):
+#
+# rate_limit:
+#   driver: memory            # default; "memory" / "redis" / ...
+#   options: {}
+#
+# quota:
+#   driver: memory            # default
+#   options: {}
+#
+# usage:
+#   driver: sqlite            # default is stderr audit ("audit" sink); sqlite persists to disk
+#   options:
+#     path: ./usage.db
+#     max_connections: 1      # SQLite single-writer by default
