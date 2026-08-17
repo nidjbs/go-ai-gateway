@@ -13,21 +13,22 @@ import (
 )
 
 type Config struct {
-	Listen            string              `yaml:"listen"`
-	Healthz           string              `yaml:"healthz"`
-	ReadyzWaitTime    time.Duration       `yaml:"readyz_wait_time"`
-	Auth              AuthConfig          `yaml:"auth"`
-	Providers         map[string]Provider `yaml:"providers"`
-	Aliases           map[string]Alias    `yaml:"aliases"`
-	Retry             RetryConfig         `yaml:"retry"`
-	Failover          FailoverConfig      `yaml:"failover"`
+	Listen            string               `yaml:"listen"`
+	Healthz           string               `yaml:"healthz"`
+	ReadyzWaitTime    time.Duration        `yaml:"readyz_wait_time"`
+	Auth              AuthConfig           `yaml:"auth"`
+	Providers         map[string]Provider  `yaml:"providers"`
+	Aliases           map[string]Alias     `yaml:"aliases"`
+	Retry             RetryConfig          `yaml:"retry"`
+	Failover          FailoverConfig       `yaml:"failover"`
 	CircuitBreaker    CircuitBreakerConfig `yaml:"circuit_breaker"`
-	Tracing           TracingConfig       `yaml:"tracing"`
-	Server            ServerConfig        `yaml:"server"`
-	Teams             []TeamConfig        `yaml:"teams"`
-	RateLimit         StorageDriver       `yaml:"rate_limit,omitempty"`
-	Quota             StorageDriver       `yaml:"quota,omitempty"`
-	Usage             StorageDriver       `yaml:"usage,omitempty"`
+	Tracing           TracingConfig        `yaml:"tracing"`
+	Server            ServerConfig         `yaml:"server"`
+	Teams             []TeamConfig         `yaml:"teams"`
+	RateLimit         StorageDriver        `yaml:"rate_limit,omitempty"`
+	Quota             StorageDriver        `yaml:"quota,omitempty"`
+	Usage             StorageDriver        `yaml:"usage,omitempty"`
+	Guardrails        GuardrailsConfig     `yaml:"guardrails,omitempty"`
 	readyzWaitTimeSet bool
 }
 
@@ -88,11 +89,11 @@ type APIKeyConfig struct {
 }
 
 type KeyLimits struct {
-	RPS               float64           `yaml:"rps"`
-	Burst             int               `yaml:"burst"`
-	PredayTokens      int64             `yaml:"preday_tokens"`
-	MonthlyTokens     int64             `yaml:"monthly_tokens"`
-	AliasPredayTokens map[string]int64  `yaml:"alias_preday_tokens"`
+	RPS               float64          `yaml:"rps"`
+	Burst             int              `yaml:"burst"`
+	PredayTokens      int64            `yaml:"preday_tokens"`
+	MonthlyTokens     int64            `yaml:"monthly_tokens"`
+	AliasPredayTokens map[string]int64 `yaml:"alias_preday_tokens"`
 }
 
 type RetryConfig struct {
@@ -153,6 +154,43 @@ type TracingConfig struct {
 type ServerConfig struct {
 	MaxConcurrentRequests int `yaml:"max_concurrent_requests"`
 	MaxConcurrentPerKey   int `yaml:"max_concurrent_per_key"`
+}
+
+// GuardrailsConfig 控制提示词注入防护的行为。
+//
+// Mode 可选值：
+//   - "off"   : 完全关闭（默认，不影响现有行为）
+//   - "flag"  : 检测并记录，但不阻止请求（零误杀）
+//   - "block" : 检测并阻止高置信度注入请求
+//
+// Threshold 是触发 block/flag 的分数阈值（0.0 ~ 1.0）。
+// 每条匹配的正则规则贡献 0.25 分，因此 0.75 需要至少 3 条规则同时命中。
+type GuardrailsConfig struct {
+	Enabled   bool                    `yaml:"enabled"`
+	Mode      string                  `yaml:"mode"`
+	Threshold float64                 `yaml:"threshold"`
+	Tracker   GuardrailsTrackerConfig `yaml:"tracker"`
+}
+
+// GuardrailsTrackerConfig 控制 per-key 注入频率追踪。
+type GuardrailsTrackerConfig struct {
+	MaxAttempts int `yaml:"max_attempts"` // 窗口内最大触发次数
+	WindowSec   int `yaml:"window_sec"`   // 计数窗口（秒）
+	PenaltySec  int `yaml:"penalty_sec"`  // 惩罚时长（秒）
+}
+
+// DefaultGuardrailsConfig 返回默认配置（关闭状态，不影响现有行为）。
+func DefaultGuardrailsConfig() GuardrailsConfig {
+	return GuardrailsConfig{
+		Enabled:   false, // 默认关闭，需要显式开启
+		Mode:      "flag",
+		Threshold: 0.75,
+		Tracker: GuardrailsTrackerConfig{
+			MaxAttempts: 3,
+			WindowSec:   60,
+			PenaltySec:  30,
+		},
+	}
 }
 
 func (c *RetryConfig) UnmarshalYAML(value *yaml.Node) error {

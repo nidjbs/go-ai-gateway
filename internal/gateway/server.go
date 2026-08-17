@@ -19,6 +19,7 @@ import (
 	"example.com/light-llm-gateway/internal/circuitbreaker"
 	"example.com/light-llm-gateway/internal/concurrency"
 	"example.com/light-llm-gateway/internal/config"
+	"example.com/light-llm-gateway/internal/guardrails"
 	"example.com/light-llm-gateway/internal/metrics"
 	"example.com/light-llm-gateway/internal/provider"
 	"example.com/light-llm-gateway/internal/ratelimit"
@@ -56,19 +57,20 @@ func (r *readiness) readyz(w http.ResponseWriter, _ *http.Request) {
 }
 
 type Server struct {
-	HTTP        *http.Server
-	Ops         http.Handler
-	ready       *readiness
-	config      *config.Config
-	logger      *slog.Logger
-	limiter     ratelimit.Limiter
-	quotaStore  ratelimit.QuotaStore
-	concurrency *concurrency.Limiter
-	keyLock     sync.Mutex
-	keyLimits   map[string]*concurrency.Limiter
-	now         func() time.Time
-	apiKeyLimit map[string]config.KeyLimits
-	closer      io.Closer // optional sink/handle released on graceful shutdown
+	HTTP                *http.Server
+	Ops                 http.Handler
+	ready               *readiness
+	config              *config.Config
+	logger              *slog.Logger
+	limiter             ratelimit.Limiter
+	quotaStore          ratelimit.QuotaStore
+	concurrency         *concurrency.Limiter
+	keyLock             sync.Mutex
+	keyLimits           map[string]*concurrency.Limiter
+	now                 func() time.Time
+	apiKeyLimit         map[string]config.KeyLimits
+	closer              io.Closer // optional sink/handle released on graceful shutdown
+	guardrailMiddleware func(next http.Handler) http.Handler
 }
 
 // keyLimiter returns the per-key concurrency limiter for keyID, allocating
@@ -139,10 +141,10 @@ func New(deps Deps) (*Server, error) {
 	if deps.Breaker == nil {
 		if deps.Config.CircuitBreaker.Enabled {
 			deps.Breaker = circuitbreaker.New(circuitbreaker.Config{
-				FailureThreshold:          deps.Config.CircuitBreaker.FailureThreshold,
-				OpenDuration:              deps.Config.CircuitBreaker.OpenDuration,
-				HalfOpenMaxRequests:       deps.Config.CircuitBreaker.HalfOpenMaxRequests,
-				HalfOpenSuccessThreshold:  deps.Config.CircuitBreaker.HalfOpenSuccessThreshold,
+				FailureThreshold:         deps.Config.CircuitBreaker.FailureThreshold,
+				OpenDuration:             deps.Config.CircuitBreaker.OpenDuration,
+				HalfOpenMaxRequests:      deps.Config.CircuitBreaker.HalfOpenMaxRequests,
+				HalfOpenSuccessThreshold: deps.Config.CircuitBreaker.HalfOpenSuccessThreshold,
 			})
 		} else {
 			deps.Breaker = circuitbreaker.Noop{}
@@ -150,7 +152,33 @@ func New(deps Deps) (*Server, error) {
 	}
 
 	ready := &readiness{startedAt: time.Now(), waitTime: deps.Config.ReadyzWaitTime}
-	server := &Server{config: deps.Config, logger: deps.Logger, concurrency: concurrency.New(deps.Config.Server.MaxConcurrentRequests), keyLimits: make(map[string]*concurrency.Limiter), now: deps.Now, apiKeyLimit: deps.APIKeyLimits, closer: sinkCloser(usageSink)}
+
+	// 初始化 guardrails 中间件（默认关闭，需要显式配置开启）
+	guardrailCfg := deps.Config.Guardrails
+	if guardrailCfg.Mode == "" {
+		guardrailCfg.Mode = "off"
+	}
+	guardrailMW := guardrails.NewMiddleware(guardrails.Config{
+		Enabled:   guardrailCfg.Enabled,
+		Mode:      guardrailCfg.Mode,
+		Threshold: guardrailCfg.Threshold,
+		Tracker: guardrails.TrackerConfig{
+			MaxAttempts: guardrailCfg.Tracker.MaxAttempts,
+			Window:      time.Duration(guardrailCfg.Tracker.WindowSec) * time.Second,
+			Penalty:     time.Duration(guardrailCfg.Tracker.PenaltySec) * time.Second,
+		},
+	}, deps.Logger)
+
+	server := &Server{
+		config:              deps.Config,
+		logger:              deps.Logger,
+		concurrency:         concurrency.New(deps.Config.Server.MaxConcurrentRequests),
+		keyLimits:           make(map[string]*concurrency.Limiter),
+		now:                 deps.Now,
+		apiKeyLimit:         deps.APIKeyLimits,
+		closer:              sinkCloser(usageSink),
+		guardrailMiddleware: guardrailMW.Handle,
+	}
 	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, breaker: deps.Breaker, keyConcurrency: server.keyLimiter, now: deps.Now, apiKeyLimits: deps.APIKeyLimits}
 	ops := chi.NewRouter()
 	ops.Get("/healthz", ready.healthz)
@@ -172,6 +200,7 @@ func New(deps Deps) (*Server, error) {
 	router.Group(func(r chi.Router) {
 		r.Use(server.concurrencyMiddleware)
 		r.Use(handlers.authenticate)
+		r.Use(server.guardrailMiddleware)
 		r.Get("/v1/models", handlers.models)
 		r.Post("/v1/chat/completions", handlers.chat)
 		r.Post("/v1/embeddings", handlers.embeddings)
