@@ -1,6 +1,7 @@
 package guardrails
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -76,15 +77,15 @@ func (m *Middleware) Handle(next http.Handler) http.Handler {
 			return
 		}
 
-		// 1. 读取请求体
-		body, err := readBody(r)
+		// 1. 读取请求体（并恢复，供后续 handler 使用）
+		body, err := readAndRestoreBody(r)
 		if err != nil {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// 2. 解析 messages
-		messages, ok := MessagesFromOpenAI(body)
+		// 2. 解析 messages（从完整请求体中提取）
+		messages, ok := MessagesFromChatRequest(body)
 		if !ok || len(messages) == 0 {
 			next.ServeHTTP(w, r)
 			return
@@ -177,12 +178,18 @@ func SetCanaryToContext(ctx context.Context, canary CanaryToken) context.Context
 
 // ── 内部辅助函数 ──
 
-func readBody(r *http.Request) ([]byte, error) {
+func readAndRestoreBody(r *http.Request) ([]byte, error) {
 	if r.Body == nil {
 		return nil, nil
 	}
-	defer r.Body.Close()
-	return io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB limit
+	data, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB limit
+	r.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	// 恢复 body，供后续 handler 读取
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	return data, nil
 }
 
 func formatRetryAfter(d time.Duration) string {

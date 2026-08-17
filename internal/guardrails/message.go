@@ -12,8 +12,19 @@ type Message struct {
 	Content string // 纯文本内容
 }
 
-// MessagesFromOpenAI 从 OpenAI 格式的消息 JSON 解析出 Message 列表。
-// 这是适配器函数，将 provider 特定格式转换为 guardrails 内部格式。
+// MessagesFromChatRequest 从完整的 Chat Completion 请求 JSON 中解析出 messages。
+// 这是中间件使用的入口，因为请求体包含 model、messages、metadata 等字段。
+func MessagesFromChatRequest(raw []byte) ([]Message, bool) {
+	var req struct {
+		Messages json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, false
+	}
+	return MessagesFromOpenAI(req.Messages)
+}
+
+// MessagesFromOpenAI 从 OpenAI 格式的消息数组 JSON 解析出 Message 列表。
 // 如果解析失败，返回 false。
 func MessagesFromOpenAI(raw []byte) ([]Message, bool) {
 	var msgs []struct {
