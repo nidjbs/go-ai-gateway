@@ -72,7 +72,7 @@ func (a *anthropicAdapter) OpenStream(ctx context.Context, request Request, cand
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		return nil, decodeHTTPError(response.StatusCode, data)
 	}
-	return &anthropicStream{scanner: bufio.NewScanner(response.Body), response: response, cancel: cancel}, nil
+	return &anthropicStream{scanner: newSSEScanner(response.Body), response: response, cancel: cancel}, nil
 }
 
 func (a *anthropicAdapter) open(ctx context.Context, body []byte, candidate routing.Candidate, stream bool) (*http.Response, context.CancelFunc, error) {
@@ -86,7 +86,7 @@ func (a *anthropicAdapter) open(ctx context.Context, body []byte, candidate rout
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	response, err := a.client.HTTPClient.Do(req)
+	response, err := a.client.HTTPClient(a.Type()).Do(req)
 	if err != nil {
 		cancel()
 		return nil, nil, err

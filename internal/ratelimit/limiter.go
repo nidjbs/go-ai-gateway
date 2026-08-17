@@ -23,36 +23,76 @@ type Limiter interface {
 	Allow(keyID string, limits config.KeyLimits, now time.Time) Decision
 }
 
-// QuotaStatus describes the daily token usage for a single api key.
+// QuotaWindow identifies the time window over which a quota is tracked.
+type QuotaWindow int
+
+const (
+	// WindowDaily resets at the next UTC midnight.
+	WindowDaily QuotaWindow = iota
+	// WindowMonthly resets at the first instant of the next UTC month.
+	WindowMonthly
+)
+
+// QuotaScope identifies which bucket of a QuotaStore a call targets.
+//
+// Alias is empty for key-aggregate quotas (daily/monthly totals across all
+// aliases the key has hit). When Alias is non-empty the bucket counts only
+// tokens used against that alias.
+type QuotaScope struct {
+	KeyID  string
+	Alias  string
+	Window QuotaWindow
+}
+
+// QuotaStatus describes the token usage for a single (KeyID, Alias, Window)
+// bucket.
 type QuotaStatus struct {
+	Window    QuotaWindow
 	Limit     int64
 	Used      int64
 	Remaining int64
 	ResetAt   time.Time
 }
 
-// QuotaStore tracks per-key token usage for the current UTC day.
+// QuotaStore tracks per-key and per-(key, alias) token usage across multiple
+// time windows.
 //
 // Peek returns the current status without consuming tokens. Charge adds
 // delta tokens and returns the resulting status.
 //
 // Implementations must be safe for concurrent use.
 type QuotaStore interface {
-	Peek(keyID string, limit int64, now time.Time) QuotaStatus
-	Charge(keyID string, limit int64, delta int64, now time.Time) QuotaStatus
+	Peek(scope QuotaScope, limit int64, now time.Time) QuotaStatus
+	Charge(scope QuotaScope, limit int64, delta int64, now time.Time) QuotaStatus
 }
 
-// UnlimitedQuotaStatus is returned when no per-day token limit is configured.
-func UnlimitedQuotaStatus(now time.Time) QuotaStatus {
+// UnlimitedQuotaStatus is returned when no quota limit is configured for the
+// given window.
+func UnlimitedQuotaStatus(window QuotaWindow, now time.Time) QuotaStatus {
 	return QuotaStatus{
+		Window:    window,
 		Limit:     0,
 		Used:      0,
 		Remaining: 0,
-		ResetAt:   nextUTCMidnight(now),
+		ResetAt:   nextReset(window, now),
+	}
+}
+
+func nextReset(window QuotaWindow, now time.Time) time.Time {
+	switch window {
+	case WindowMonthly:
+		return nextUTCMonthStart(now)
+	default:
+		return nextUTCMidnight(now)
 	}
 }
 
 func nextUTCMidnight(now time.Time) time.Time {
 	t := now.UTC()
 	return time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
+func nextUTCMonthStart(now time.Time) time.Time {
+	t := now.UTC()
+	return time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, time.UTC)
 }

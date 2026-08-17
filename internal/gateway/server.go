@@ -6,13 +6,18 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"example.com/light-llm-gateway/internal/apierr"
 	"example.com/light-llm-gateway/internal/auth"
+	"example.com/light-llm-gateway/internal/circuitbreaker"
+	"example.com/light-llm-gateway/internal/concurrency"
 	"example.com/light-llm-gateway/internal/config"
 	"example.com/light-llm-gateway/internal/metrics"
 	"example.com/light-llm-gateway/internal/provider"
@@ -29,6 +34,7 @@ type Deps struct {
 	Metrics       *metrics.Recorder
 	Limiter       ratelimit.Limiter
 	QuotaStore    ratelimit.QuotaStore
+	Breaker       circuitbreaker.Breaker
 	Now           func() time.Time
 	APIKeyLimits  map[string]config.KeyLimits
 }
@@ -57,9 +63,29 @@ type Server struct {
 	logger      *slog.Logger
 	limiter     ratelimit.Limiter
 	quotaStore  ratelimit.QuotaStore
+	concurrency *concurrency.Limiter
+	keyLock     sync.Mutex
+	keyLimits   map[string]*concurrency.Limiter
 	now         func() time.Time
 	apiKeyLimit map[string]config.KeyLimits
 	closer      io.Closer // optional sink/handle released on graceful shutdown
+}
+
+// keyLimiter returns the per-key concurrency limiter for keyID, allocating
+// one on first use. Returns a nil limiter when the configured per-key cap is
+// zero (= unlimited).
+func (s *Server) keyLimiter(keyID string) *concurrency.Limiter {
+	if s.config.Server.MaxConcurrentPerKey <= 0 {
+		return nil
+	}
+	s.keyLock.Lock()
+	defer s.keyLock.Unlock()
+	l, ok := s.keyLimits[keyID]
+	if !ok {
+		l = concurrency.New(s.config.Server.MaxConcurrentPerKey)
+		s.keyLimits[keyID] = l
+	}
+	return l
 }
 
 func New(deps Deps) (*Server, error) {
@@ -84,6 +110,19 @@ func New(deps Deps) (*Server, error) {
 	if deps.Provider == nil {
 		deps.Provider = provider.NewClient()
 	}
+	if deps.Config.Tracing.Enabled {
+		// Wrap the per-provider transports so the OTel SDK can emit client
+		// spans for each upstream call independently — pools are isolated by
+		// provider type so the tracing transport is applied per-provider, not
+		// globally.
+		for _, ptype := range deps.Provider.RegisteredTypes() {
+			existing := deps.Provider.HTTPClient(ptype)
+			deps.Provider.SetHTTPClient(ptype, &http.Client{
+				Transport: otelhttp.NewTransport(existing.Transport),
+				Timeout:   existing.Timeout,
+			})
+		}
+	}
 	if deps.Metrics == nil {
 		var mErr error
 		deps.Metrics, mErr = metrics.New()
@@ -97,9 +136,22 @@ func New(deps Deps) (*Server, error) {
 	if deps.APIKeyLimits == nil {
 		deps.APIKeyLimits = map[string]config.KeyLimits{}
 	}
+	if deps.Breaker == nil {
+		if deps.Config.CircuitBreaker.Enabled {
+			deps.Breaker = circuitbreaker.New(circuitbreaker.Config{
+				FailureThreshold:          deps.Config.CircuitBreaker.FailureThreshold,
+				OpenDuration:              deps.Config.CircuitBreaker.OpenDuration,
+				HalfOpenMaxRequests:       deps.Config.CircuitBreaker.HalfOpenMaxRequests,
+				HalfOpenSuccessThreshold:  deps.Config.CircuitBreaker.HalfOpenSuccessThreshold,
+			})
+		} else {
+			deps.Breaker = circuitbreaker.Noop{}
+		}
+	}
 
 	ready := &readiness{startedAt: time.Now(), waitTime: deps.Config.ReadyzWaitTime}
-	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, now: deps.Now, apiKeyLimits: deps.APIKeyLimits}
+	server := &Server{config: deps.Config, logger: deps.Logger, concurrency: concurrency.New(deps.Config.Server.MaxConcurrentRequests), keyLimits: make(map[string]*concurrency.Limiter), now: deps.Now, apiKeyLimit: deps.APIKeyLimits, closer: sinkCloser(usageSink)}
+	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, breaker: deps.Breaker, keyConcurrency: server.keyLimiter, now: deps.Now, apiKeyLimits: deps.APIKeyLimits}
 	ops := chi.NewRouter()
 	ops.Get("/healthz", ready.healthz)
 	ops.Get("/livez", ready.healthz)
@@ -108,6 +160,9 @@ func New(deps Deps) (*Server, error) {
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, clientInfoMiddleware)
+	if deps.Config.Tracing.Enabled {
+		router.Use(otelhttp.NewMiddleware("ai-gateway"))
+	}
 	router.Get("/healthz", ready.healthz)
 	router.Get("/livez", ready.healthz)
 	if deps.Config.Healthz == deps.Config.Listen {
@@ -115,24 +170,34 @@ func New(deps Deps) (*Server, error) {
 		router.Handle("/metrics", deps.Metrics.Handler())
 	}
 	router.Group(func(r chi.Router) {
+		r.Use(server.concurrencyMiddleware)
 		r.Use(handlers.authenticate)
 		r.Get("/v1/models", handlers.models)
 		r.Post("/v1/chat/completions", handlers.chat)
 		r.Post("/v1/embeddings", handlers.embeddings)
 	})
 
-	return &Server{
-		HTTP:        &http.Server{Addr: deps.Config.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second},
-		Ops:         ops,
-		ready:       ready,
-		config:      deps.Config,
-		logger:      deps.Logger,
-		limiter:     limiter,
-		quotaStore:  quotaStore,
-		now:         deps.Now,
-		apiKeyLimit: deps.APIKeyLimits,
-		closer:      sinkCloser(usageSink),
-	}, nil
+	server.HTTP = &http.Server{Addr: deps.Config.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second}
+	server.Ops = ops
+	server.ready = ready
+	server.limiter = limiter
+	server.quotaStore = quotaStore
+	return server, nil
+}
+
+// concurrencyMiddleware rejects requests when the gateway-level in-flight cap
+// is reached. Health probes are exempt so a saturated gateway still drains
+// cleanly behind a load balancer.
+func (s *Server) concurrencyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.concurrency.TryAcquire() {
+			w.Header().Set("Retry-After", "1")
+			apierr.Write(w, http.StatusServiceUnavailable, "server_overloaded", "server_error", "Server is overloaded, please retry")
+			return
+		}
+		defer s.concurrency.Release()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // sinkCloser returns an io.Closer iff sink implements it (e.g. SQLSink closes

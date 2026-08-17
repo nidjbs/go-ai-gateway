@@ -172,6 +172,10 @@ func strconvFloat(v float64) string {
 }
 
 // NewMemoryQuotaStore returns an in-process QuotaStore backed by a map.
+//
+// Buckets are keyed by (KeyID, Alias, Window). Empty Alias counts usage
+// across all aliases for that key (the key-level aggregate); non-empty Alias
+// counts usage against that specific alias.
 func NewMemoryQuotaStore() QuotaStore {
 	return &memoryQuotaStore{values: make(map[string]quotaValue)}
 }
@@ -182,49 +186,102 @@ type memoryQuotaStore struct {
 }
 
 type quotaValue struct {
-	dayStart time.Time
-	used     int64
+	windowStart time.Time
+	used        int64
 }
 
-func (s *memoryQuotaStore) Peek(keyID string, limit int64, now time.Time) QuotaStatus {
+func (s *memoryQuotaStore) Peek(scope QuotaScope, limit int64, now time.Time) QuotaStatus {
 	if limit <= 0 {
-		return UnlimitedQuotaStatus(now)
+		return UnlimitedQuotaStatus(scope.Window, now)
 	}
-	day := utcDayStart(now)
+	if scope.KeyID == "" {
+		return UnlimitedQuotaStatus(scope.Window, now)
+	}
+	bucketStart := windowStart(scope.Window, now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	value, ok := s.values[keyID]
-	if !ok || !value.dayStart.Equal(day) {
-		return QuotaStatus{Limit: limit, Used: 0, Remaining: limit, ResetAt: nextUTCMidnight(now)}
+	value, ok := s.values[bucketKey(scope)]
+	if !ok || !value.windowStart.Equal(bucketStart) {
+		return QuotaStatus{Window: scope.Window, Limit: limit, Used: 0, Remaining: limit, ResetAt: nextReset(scope.Window, now)}
 	}
 	remaining := limit - value.used
 	if remaining < 0 {
 		remaining = 0
 	}
-	return QuotaStatus{Limit: limit, Used: value.used, Remaining: remaining, ResetAt: nextUTCMidnight(now)}
+	return QuotaStatus{Window: scope.Window, Limit: limit, Used: value.used, Remaining: remaining, ResetAt: nextReset(scope.Window, now)}
 }
 
-func (s *memoryQuotaStore) Charge(keyID string, limit int64, delta int64, now time.Time) QuotaStatus {
-	if limit <= 0 || delta <= 0 || keyID == "" {
-		return s.Peek(keyID, limit, now)
+func (s *memoryQuotaStore) Charge(scope QuotaScope, limit int64, delta int64, now time.Time) QuotaStatus {
+	if limit <= 0 || delta <= 0 || scope.KeyID == "" {
+		return s.Peek(scope, limit, now)
 	}
-	day := utcDayStart(now)
+	bucketStart := windowStart(scope.Window, now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	value, ok := s.values[keyID]
-	if !ok || !value.dayStart.Equal(day) {
-		value = quotaValue{dayStart: day}
+	key := bucketKey(scope)
+	value, ok := s.values[key]
+	if !ok || !value.windowStart.Equal(bucketStart) {
+		value = quotaValue{windowStart: bucketStart}
 	}
 	value.used += delta
-	s.values[keyID] = value
-	remaining := limit - value.used
+	s.values[key] = value
+	status := quotaStatusFor(scope, limit, value.used, now)
+	// Charging an alias-scoped bucket also charges the key-aggregate bucket,
+	// so Peek(KeyID, "") reflects the true per-key spend. Without this
+	// the two counters would diverge and a heavy alias user could exceed
+	// the configured key-level daily quota.
+	if scope.Alias != "" {
+		aggregate := QuotaScope{KeyID: scope.KeyID, Window: scope.Window}
+		aggKey := bucketKey(aggregate)
+		aggValue, aggOK := s.values[aggKey]
+		if !aggOK || !aggValue.windowStart.Equal(bucketStart) {
+			aggValue = quotaValue{windowStart: bucketStart}
+		}
+		aggValue.used += delta
+		s.values[aggKey] = aggValue
+	}
+	return status
+}
+
+func quotaStatusFor(scope QuotaScope, limit int64, used int64, now time.Time) QuotaStatus {
+	remaining := limit - used
 	if remaining < 0 {
 		remaining = 0
 	}
-	return QuotaStatus{Limit: limit, Used: value.used, Remaining: remaining, ResetAt: nextUTCMidnight(now)}
+	return QuotaStatus{Window: scope.Window, Limit: limit, Used: used, Remaining: remaining, ResetAt: nextReset(scope.Window, now)}
 }
 
-func utcDayStart(now time.Time) time.Time {
+func bucketKey(scope QuotaScope) string {
+	// Bucket keys are internal; the format is stable because the in-memory
+	// store only lives in this process and never persists.
+	return strconvItoa(int(scope.Window)) + "|" + scope.KeyID + "|" + scope.Alias
+}
+
+func strconvItoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	buf := make([]byte, 0, 8)
+	for n > 0 {
+		buf = append([]byte{byte('0' + n%10)}, buf...)
+		n /= 10
+	}
+	if neg {
+		buf = append([]byte{'-'}, buf...)
+	}
+	return string(buf)
+}
+
+func windowStart(window QuotaWindow, now time.Time) time.Time {
 	t := now.UTC()
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	switch window {
+	case WindowMonthly:
+		return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+	default:
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	}
 }

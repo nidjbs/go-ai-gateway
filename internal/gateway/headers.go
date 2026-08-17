@@ -27,14 +27,38 @@ func writeRateLimitHeaders(w http.ResponseWriter, limits config.KeyLimits, decis
 	}
 }
 
+// writeQuotaHeaders emits X-Quota-* response headers for the supplied status.
+// Header names carry the window so clients can tell daily from monthly from
+// per-alias counters apart.
 func writeQuotaHeaders(w http.ResponseWriter, status ratelimit.QuotaStatus) {
 	if status.Limit <= 0 {
 		return
 	}
-	w.Header().Set("X-Quota-Limit-Tokens", strconv.FormatInt(status.Limit, 10))
-	w.Header().Set("X-Quota-Used-Tokens", strconv.FormatInt(status.Used, 10))
-	w.Header().Set("X-Quota-Remaining-Tokens", strconv.FormatInt(status.Remaining, 10))
-	if !status.ResetAt.IsZero() {
-		w.Header().Set("X-Quota-Reset-At", status.ResetAt.UTC().Format(time.RFC3339))
+	switch status.Window {
+	case ratelimit.WindowMonthly:
+		w.Header().Set("X-Quota-Monthly-Limit-Tokens", strconv.FormatInt(status.Limit, 10))
+		w.Header().Set("X-Quota-Monthly-Used-Tokens", strconv.FormatInt(status.Used, 10))
+		w.Header().Set("X-Quota-Monthly-Remaining-Tokens", strconv.FormatInt(status.Remaining, 10))
+		if !status.ResetAt.IsZero() {
+			w.Header().Set("X-Quota-Monthly-Reset-At", status.ResetAt.UTC().Format(time.RFC3339))
+		}
+	default:
+		// Daily quota — both key-aggregate and per-alias share the prefix;
+		// the X-Quota-Alias header (when set) disambiguates.
+		w.Header().Set("X-Quota-Limit-Tokens", strconv.FormatInt(status.Limit, 10))
+		w.Header().Set("X-Quota-Used-Tokens", strconv.FormatInt(status.Used, 10))
+		w.Header().Set("X-Quota-Remaining-Tokens", strconv.FormatInt(status.Remaining, 10))
+		if !status.ResetAt.IsZero() {
+			w.Header().Set("X-Quota-Reset-At", status.ResetAt.UTC().Format(time.RFC3339))
+		}
 	}
+}
+
+// writeAliasQuotaTag records which alias the daily quota headers refer to.
+// Only emitted when the handler is enforcing a per-alias quota.
+func writeAliasQuotaTag(w http.ResponseWriter, alias string) {
+	if alias == "" {
+		return
+	}
+	w.Header().Set("X-Quota-Alias", alias)
 }

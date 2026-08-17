@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"example.com/light-llm-gateway/internal/config"
 	"example.com/light-llm-gateway/internal/gateway"
+	"example.com/light-llm-gateway/internal/tracing"
 )
 
 func main() {
@@ -23,6 +25,21 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := tracing.Init(ctx, cfg.Tracing)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if shutdownTracing != nil {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdownTracing(shutdownCtx); err != nil {
+				logger.Warn("tracing shutdown failed", "error", err)
+			}
+		}()
+	}
+
 	if err := gateway.Run(ctx, cfg, logger); err != nil {
 		log.Fatal(err)
 	}

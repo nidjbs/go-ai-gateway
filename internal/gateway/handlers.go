@@ -15,6 +15,8 @@ import (
 
 	"example.com/light-llm-gateway/internal/apierr"
 	"example.com/light-llm-gateway/internal/auth"
+	"example.com/light-llm-gateway/internal/circuitbreaker"
+	"example.com/light-llm-gateway/internal/concurrency"
 	"example.com/light-llm-gateway/internal/config"
 	"example.com/light-llm-gateway/internal/metrics"
 	"example.com/light-llm-gateway/internal/provider"
@@ -36,6 +38,8 @@ type handler struct {
 	metrics       *metrics.Recorder
 	limiter       ratelimit.Limiter
 	quotaStore    ratelimit.QuotaStore
+	breaker       circuitbreaker.Breaker
+	keyConcurrency func(keyID string) *concurrency.Limiter
 	now           func() time.Time
 	apiKeyLimits  map[string]config.KeyLimits
 }
@@ -56,6 +60,19 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 		}
 		ctx := auth.ContextWithPrincipal(r.Context(), principal)
 		if principal.APIKeyID != "" {
+			if h.keyConcurrency != nil {
+				if kl := h.keyConcurrency(principal.APIKeyID); kl != nil && !kl.TryAcquire() {
+					h.recordUsage(r.Context(), started, requestEndpoint(r), "", routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID}, 0, 0, time.Time{}, false, http.StatusServiceUnavailable, "key_overloaded", "", retry.Attempts{})
+					w.Header().Set("Retry-After", "1")
+					apierr.Write(w, http.StatusServiceUnavailable, "key_overloaded", "server_error", "API key concurrency limit exceeded")
+					return
+				}
+				defer func() {
+					if kl := h.keyConcurrency(principal.APIKeyID); kl != nil {
+						kl.Release()
+					}
+				}()
+			}
 			limits := h.apiKeyLimits[principal.APIKeyID]
 			if h.limiter != nil {
 				decision := h.limiter.Allow(principal.APIKeyID, limits, h.now())
@@ -67,11 +84,20 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 				}
 			}
 			if h.quotaStore != nil && limits.PredayTokens > 0 {
-				status := h.quotaStore.Peek(principal.APIKeyID, limits.PredayTokens, h.now())
+				status := h.quotaStore.Peek(ratelimit.QuotaScope{KeyID: principal.APIKeyID, Window: ratelimit.WindowDaily}, limits.PredayTokens, h.now())
 				writeQuotaHeaders(w, status)
 				if status.Remaining <= 0 {
 					h.recordUsage(ctx, started, requestEndpoint(r), "", routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID}, 0, 0, time.Time{}, false, http.StatusTooManyRequests, "quota_exceeded", "", retry.Attempts{})
-					apierr.Write(w, http.StatusTooManyRequests, "rate_limit_exceeded", "rate_limit_error", "API key daily quota exceeded")
+					apierr.Write(w, http.StatusTooManyRequests, "quota_exceeded", "rate_limit_error", "API key daily quota exceeded")
+					return
+				}
+			}
+			if h.quotaStore != nil && limits.MonthlyTokens > 0 {
+				status := h.quotaStore.Peek(ratelimit.QuotaScope{KeyID: principal.APIKeyID, Window: ratelimit.WindowMonthly}, limits.MonthlyTokens, h.now())
+				writeQuotaHeaders(w, status)
+				if status.Remaining <= 0 {
+					h.recordUsage(ctx, started, requestEndpoint(r), "", routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID}, 0, 0, time.Time{}, false, http.StatusTooManyRequests, "quota_exceeded_monthly", "", retry.Attempts{})
+					apierr.Write(w, http.StatusTooManyRequests, "quota_exceeded_monthly", "rate_limit_error", "API key monthly quota exceeded")
 					return
 				}
 			}
@@ -108,13 +134,18 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
+			return
+		}
+	}
 	if request.Stream {
 		h.chatStream(w, r, body, request.Model, candidates)
 		return
 	}
 	started := h.now()
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
-	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
+	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
 		return h.provider.Do(ctx, adapterRequest, c)
 	})
 	if err != nil {
@@ -122,15 +153,67 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
-		if limits, ok := h.apiKeyLimits[principal.APIKeyID]; ok && limits.PredayTokens > 0 && result.InputTokens+result.OutputTokens > 0 {
-			status := h.quotaStore.Charge(principal.APIKeyID, limits.PredayTokens, int64(result.InputTokens+result.OutputTokens), h.now())
-			writeQuotaHeaders(w, status)
-		}
+		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.InputTokens+result.OutputTokens))
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.recordUsage(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, false, http.StatusOK, "", "", attempts)
 	h.recordMetrics(r.Context(), started, "chat.completions", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, http.StatusOK, "")
 	h.logger.Info("request complete", "request_id", requestID(r), "endpoint", "chat.completions", "provider", candidate.Name, "attempts", attempts.Total, "status", http.StatusOK, "upstream_duration_ms", time.Since(started).Milliseconds())
+}
+
+// chargeQuota records usage against all configured quota dimensions for keyID
+// and the requested alias. Daily and monthly quotas are key-level aggregates;
+// the alias-level quota, when configured, tracks per-model spend.
+func (h handler) chargeQuota(w http.ResponseWriter, keyID, alias string, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	limits, ok := h.apiKeyLimits[keyID]
+	if !ok {
+		return
+	}
+	if h.quotaStore == nil {
+		return
+	}
+	if limits.PredayTokens > 0 {
+		status := h.quotaStore.Charge(ratelimit.QuotaScope{KeyID: keyID, Window: ratelimit.WindowDaily}, limits.PredayTokens, delta, h.now())
+		writeQuotaHeaders(w, status)
+	}
+	if limits.MonthlyTokens > 0 {
+		status := h.quotaStore.Charge(ratelimit.QuotaScope{KeyID: keyID, Window: ratelimit.WindowMonthly}, limits.MonthlyTokens, delta, h.now())
+		writeQuotaHeaders(w, status)
+	}
+	if aliasLimit, ok := limits.AliasPredayTokens[alias]; ok && aliasLimit > 0 {
+		status := h.quotaStore.Charge(ratelimit.QuotaScope{KeyID: keyID, Alias: alias, Window: ratelimit.WindowDaily}, aliasLimit, delta, h.now())
+		writeAliasQuotaTag(w, alias)
+		writeQuotaHeaders(w, status)
+	}
+}
+
+// checkAliasQuota enforces the per-alias daily quota, if configured, after the
+// request body has been parsed. It returns true when the request may proceed
+// (no quota configured, or quota remaining); false after writing a 429.
+func (h handler) checkAliasQuota(w http.ResponseWriter, r *http.Request, started time.Time, principal auth.Principal, alias string) bool {
+	if principal.APIKeyID == "" || h.quotaStore == nil {
+		return true
+	}
+	limits, ok := h.apiKeyLimits[principal.APIKeyID]
+	if !ok {
+		return true
+	}
+	aliasLimit, ok := limits.AliasPredayTokens[alias]
+	if !ok || aliasLimit <= 0 {
+		return true
+	}
+	status := h.quotaStore.Peek(ratelimit.QuotaScope{KeyID: principal.APIKeyID, Alias: alias, Window: ratelimit.WindowDaily}, aliasLimit, h.now())
+	writeAliasQuotaTag(w, alias)
+	writeQuotaHeaders(w, status)
+	if status.Remaining <= 0 {
+		h.recordUsage(r.Context(), started, requestEndpoint(r), alias, routing.Candidate{Name: alias, Model: alias}, 0, 0, time.Time{}, false, http.StatusTooManyRequests, "quota_exceeded_alias", "", retry.Attempts{})
+		apierr.Write(w, http.StatusTooManyRequests, "quota_exceeded_alias", "rate_limit_error", "Alias daily quota exceeded")
+		return false
+	}
+	return true
 }
 
 func (h handler) parseChat(w http.ResponseWriter, r *http.Request) (json.RawMessage, chatRequest, []routing.Candidate, bool) {
@@ -176,7 +259,7 @@ func (h handler) parseChat(w http.ResponseWriter, r *http.Request) (json.RawMess
 func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.RawMessage, alias string, candidates []routing.Candidate) {
 	started := h.now()
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
-	stream, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
+	stream, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
 		return h.provider.OpenStream(ctx, adapterRequest, c)
 	})
 	if err != nil {
@@ -195,9 +278,13 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	flusher.Flush()
 	seen := false
 	var firstToken time.Time
-	for {
-		event, err := stream.Next()
-		if err != nil {
+	// pumpStream runs a reader goroutine that pushes events over a bounded
+	// channel. When the client is slow, the channel fills and the reader
+	// blocks inside stream.Next() — applying real TCP-level backpressure
+	// to the upstream socket rather than buffering in user space.
+	for result := range pumpStream(r.Context(), stream) {
+		if result.err != nil {
+			err := result.err
 			if err != io.EOF && seen && !errors.Is(err, context.Canceled) {
 				_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
 				flusher.Flush()
@@ -214,9 +301,13 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 			h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, 0, 0, firstToken, status, errorType)
 			return
 		}
+		event := result.event
 		if event.Done {
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
 			flusher.Flush()
+			if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+				h.chargeQuota(w, principal.APIKeyID, alias, int64(event.InputTokens+event.OutputTokens))
+			}
 			h.recordUsage(r.Context(), started, "chat.completions", alias, candidate, event.InputTokens, event.OutputTokens, firstToken, true, http.StatusOK, "", "completed", attempts)
 			h.recordMetrics(r.Context(), started, "chat.completions", alias, candidate, event.InputTokens, event.OutputTokens, firstToken, http.StatusOK, "")
 			return
@@ -260,8 +351,13 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", "no configured provider supports embeddings")
 		return
 	}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
+			return
+		}
+	}
 	started := h.now()
-	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
+	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
 		return h.provider.Do(ctx, adapterRequest, c)
 	})
 	if err != nil {
@@ -269,10 +365,7 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
-		if limits, ok := h.apiKeyLimits[principal.APIKeyID]; ok && limits.PredayTokens > 0 && result.InputTokens+result.OutputTokens > 0 {
-			status := h.quotaStore.Charge(principal.APIKeyID, limits.PredayTokens, int64(result.InputTokens+result.OutputTokens), h.now())
-			writeQuotaHeaders(w, status)
-		}
+		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.InputTokens+result.OutputTokens))
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.recordUsage(r.Context(), started, "embeddings", request.Model, candidate, result.InputTokens, result.OutputTokens, time.Time{}, false, http.StatusOK, "", "", attempts)
@@ -285,10 +378,17 @@ func (h handler) writeProviderError(w http.ResponseWriter, r *http.Request, star
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", requestErr.Error())
 		return
 	}
-	h.recordUsage(r.Context(), started, endpoint, alias, candidate, 0, 0, time.Time{}, streaming, http.StatusBadGateway, "upstream_error", "", retry.Attempts{})
-	h.recordMetrics(r.Context(), started, endpoint, alias, candidate, 0, 0, time.Time{}, http.StatusBadGateway, "upstream_error")
+	errorType := "upstream_error"
+	errorCode := "upstream_error"
+	status := http.StatusBadGateway
+	if errors.Is(err, circuitbreaker.ErrOpen) {
+		errorType = "upstream_unavailable"
+		errorCode = "upstream_unavailable"
+	}
+	h.recordUsage(r.Context(), started, endpoint, alias, candidate, 0, 0, time.Time{}, streaming, status, errorType, "", retry.Attempts{})
+	h.recordMetrics(r.Context(), started, endpoint, alias, candidate, 0, 0, time.Time{}, status, errorType)
 	h.logger.Warn("upstream request failed", "request_id", requestID(r), "endpoint", endpoint, "error", err)
-	apierr.Write(w, http.StatusBadGateway, "upstream_error", "api_error", upstreamErrorMessage)
+	apierr.Write(w, status, errorCode, "api_error", upstreamErrorMessage)
 }
 
 func readBody(w http.ResponseWriter, r *http.Request) (json.RawMessage, error) {

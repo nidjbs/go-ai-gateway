@@ -21,6 +21,9 @@ type Config struct {
 	Aliases           map[string]Alias    `yaml:"aliases"`
 	Retry             RetryConfig         `yaml:"retry"`
 	Failover          FailoverConfig      `yaml:"failover"`
+	CircuitBreaker    CircuitBreakerConfig `yaml:"circuit_breaker"`
+	Tracing           TracingConfig       `yaml:"tracing"`
+	Server            ServerConfig        `yaml:"server"`
 	Teams             []TeamConfig        `yaml:"teams"`
 	RateLimit         StorageDriver       `yaml:"rate_limit,omitempty"`
 	Quota             StorageDriver       `yaml:"quota,omitempty"`
@@ -85,9 +88,11 @@ type APIKeyConfig struct {
 }
 
 type KeyLimits struct {
-	RPS          float64 `yaml:"rps"`
-	Burst        int     `yaml:"burst"`
-	PredayTokens int64   `yaml:"preday_tokens"`
+	RPS               float64           `yaml:"rps"`
+	Burst             int               `yaml:"burst"`
+	PredayTokens      int64             `yaml:"preday_tokens"`
+	MonthlyTokens     int64             `yaml:"monthly_tokens"`
+	AliasPredayTokens map[string]int64  `yaml:"alias_preday_tokens"`
 }
 
 type RetryConfig struct {
@@ -107,6 +112,47 @@ type FailoverConfig struct {
 	Enabled      bool `yaml:"enabled"`
 	MaxProviders uint `yaml:"max_providers"`
 	enabledSet   bool
+}
+
+// CircuitBreakerConfig controls the per-(provider, base_url) breaker used to
+// short-circuit calls to a failing upstream.
+//
+// Zero values disable the breaker entirely. When Enabled is true, sensible
+// defaults are applied to any field left at its zero value.
+type CircuitBreakerConfig struct {
+	Enabled                  bool          `yaml:"enabled"`
+	FailureThreshold         int           `yaml:"failure_threshold"`
+	OpenDuration             time.Duration `yaml:"open_duration"`
+	HalfOpenMaxRequests      int           `yaml:"half_open_max_requests"`
+	HalfOpenSuccessThreshold int           `yaml:"half_open_success_threshold"`
+}
+
+// TracingConfig configures the OpenTelemetry tracing pipeline.
+//
+// When Enabled is false the gateway leaves the global TracerProvider as the
+// OTel default (non-recording) and skips the OTLP exporter entirely, so the
+// runtime overhead is nil.
+type TracingConfig struct {
+	Enabled     bool    `yaml:"enabled"`
+	Endpoint    string  `yaml:"endpoint"`
+	Insecure    bool    `yaml:"insecure"`
+	SampleRatio float64 `yaml:"sample_ratio"`
+	ServiceName string  `yaml:"service_name"`
+}
+
+// ServerConfig caps in-flight concurrency.
+//
+// MaxConcurrentRequests bounds total in-flight HTTP requests served by the
+// gateway; requests beyond the cap receive 503 server_overloaded.
+//
+// MaxConcurrentPerKey bounds in-flight requests per API key. A separate
+// cap means a single noisy tenant cannot starve other tenants up to the
+// global cap.
+//
+// Both fields are zero (= unlimited) by default.
+type ServerConfig struct {
+	MaxConcurrentRequests int `yaml:"max_concurrent_requests"`
+	MaxConcurrentPerKey   int `yaml:"max_concurrent_per_key"`
 }
 
 func (c *RetryConfig) UnmarshalYAML(value *yaml.Node) error {
@@ -200,6 +246,26 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Retry.RetryableStatuses == nil {
 		c.Retry.RetryableStatuses = []int{408, 429, 500, 502, 503, 504}
+	}
+	if c.CircuitBreaker.Enabled {
+		if c.CircuitBreaker.FailureThreshold <= 0 {
+			c.CircuitBreaker.FailureThreshold = 5
+		}
+		if c.CircuitBreaker.OpenDuration <= 0 {
+			c.CircuitBreaker.OpenDuration = 30 * time.Second
+		}
+		if c.CircuitBreaker.HalfOpenMaxRequests <= 0 {
+			c.CircuitBreaker.HalfOpenMaxRequests = 1
+		}
+		if c.CircuitBreaker.HalfOpenSuccessThreshold <= 0 {
+			c.CircuitBreaker.HalfOpenSuccessThreshold = 1
+		}
+	}
+	if c.Server.MaxConcurrentRequests < 0 {
+		c.Server.MaxConcurrentRequests = 0
+	}
+	if c.Server.MaxConcurrentPerKey < 0 {
+		c.Server.MaxConcurrentPerKey = 0
 	}
 }
 
@@ -349,6 +415,14 @@ func (c *Config) validateTeams() error {
 			}
 			if key.Limits.PredayTokens < 0 {
 				return fmt.Errorf("teams[%d].api_keys[%d]: limits.preday_tokens must be non-negative", i, j)
+			}
+			if key.Limits.MonthlyTokens < 0 {
+				return fmt.Errorf("teams[%d].api_keys[%d]: limits.monthly_tokens must be non-negative", i, j)
+			}
+			for alias, q := range key.Limits.AliasPredayTokens {
+				if q < 0 {
+					return fmt.Errorf("teams[%d].api_keys[%d]: limits.alias_preday_tokens[%q] must be non-negative", i, j, alias)
+				}
 			}
 		}
 	}

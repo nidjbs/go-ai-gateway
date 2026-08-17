@@ -41,7 +41,7 @@ func (a *openAIAdapter) Do(ctx context.Context, request Request, candidate routi
 	defer cancel()
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+candidate.APIKey)
-	response, err := a.client.HTTPClient.Do(req)
+	response, err := a.client.HTTPClient(a.Type()).Do(req)
 	if err != nil {
 		return Result{}, err
 	}
@@ -79,7 +79,7 @@ func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candida
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+candidate.APIKey)
-	response, err := a.client.HTTPClient.Do(req)
+	response, err := a.client.HTTPClient(a.Type()).Do(req)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -90,7 +90,7 @@ func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candida
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		return nil, decodeHTTPError(response.StatusCode, data)
 	}
-	return &openAIStream{scanner: bufio.NewScanner(response.Body), response: response, cancel: cancel}, nil
+	return &openAIStream{scanner: newSSEScanner(response.Body), response: response, cancel: cancel}, nil
 }
 
 type openAIStream struct {

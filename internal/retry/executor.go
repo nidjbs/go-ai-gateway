@@ -9,6 +9,12 @@ import (
 	"net"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
+	"example.com/light-llm-gateway/internal/circuitbreaker"
 	"example.com/light-llm-gateway/internal/config"
 	"example.com/light-llm-gateway/internal/provider"
 	"example.com/light-llm-gateway/internal/routing"
@@ -20,11 +26,19 @@ type Attempts struct {
 	Failovers int
 }
 
-func Execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error)) (T, routing.Candidate, Attempts, error) {
-	return execute(ctx, retryCfg, failoverCfg, candidates, attempt, sleep, rand.Float64)
+// Execute performs a request against the candidate list with per-provider
+// retries and provider-level failover. The optional breaker short-circuits
+// candidates whose recent failure history has tripped the breaker.
+//
+// breaker may be nil; a nil breaker is treated as circuitbreaker.Noop().
+func Execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, breaker circuitbreaker.Breaker, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error)) (T, routing.Candidate, Attempts, error) {
+	if breaker == nil {
+		breaker = circuitbreaker.Noop{}
+	}
+	return execute(ctx, retryCfg, failoverCfg, breaker, candidates, attempt, sleep, rand.Float64)
 }
 
-func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error), sleepFn func(context.Context, time.Duration) error, random func() float64) (T, routing.Candidate, Attempts, error) {
+func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, breaker circuitbreaker.Breaker, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error), sleepFn func(context.Context, time.Duration) error, random func() float64) (T, routing.Candidate, Attempts, error) {
 	var zero T
 	var lastCandidate routing.Candidate
 	var lastErr error
@@ -37,12 +51,23 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 	if maxAttempts == 0 || !retryCfg.IsEnabled() {
 		maxAttempts = 1
 	}
+	now := time.Now()
 	for i := 0; i < limit; i++ {
 		if i > 0 {
 			attempts.Failovers++
 		}
 		candidate := candidates[i]
 		lastCandidate = candidate
+		breakerKey := candidate.Name + "|" + candidate.BaseURL
+
+		// Skip candidates whose breaker is open before any attempt is made;
+		// this is the cheap fast path that keeps latency low when an
+		// upstream is known-bad.
+		if err := breaker.Allow(breakerKey, now); err != nil {
+			lastErr = err
+			continue
+		}
+
 		started := time.Now()
 		for n := uint(0); n < maxAttempts; n++ {
 			if n > 0 {
@@ -54,10 +79,30 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 			if retryCfg.PerAttemptTimeout > 0 {
 				attemptCtx, cancel = context.WithTimeout(ctx, retryCfg.PerAttemptTimeout)
 			}
+			attemptCtx, attemptSpan := otel.Tracer("gateway.retry").Start(attemptCtx, "upstream.attempt",
+				trace.WithAttributes(
+					attribute.String("provider", candidate.Name),
+					attribute.String("model", candidate.Model),
+					attribute.String("base_url", candidate.BaseURL),
+					attribute.Int("attempt_index", int(n)+1),
+				),
+			)
 			value, err := attempt(attemptCtx, candidate)
+			if err != nil {
+				attemptSpan.RecordError(err)
+				attemptSpan.SetStatus(codes.Error, err.Error())
+			}
+			attemptSpan.End()
+			breaker.Record(breakerKey, now, err)
 			if err != nil {
 				cancel()
 				lastErr = err
+				// If the breaker just tripped on this failure, abandon the
+				// remaining attempts for this candidate and move on. The
+				// outer failover loop will pick up the next provider.
+				if isOpenErr := breaker.Allow(breakerKey, now); isOpenErr != nil {
+					break
+				}
 				if !retryable(err, retryCfg) || n+1 == maxAttempts || (retryCfg.MaxElapsedTime > 0 && time.Since(started) >= retryCfg.MaxElapsedTime) {
 					break
 				}

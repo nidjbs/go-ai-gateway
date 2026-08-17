@@ -19,7 +19,11 @@ teams:
         limits:
           rps: 10
           burst: 20
-          preday_tokens: 100000
+          preday_tokens: 100000          # daily token quota (UTC reset)
+          monthly_tokens: 2000000        # monthly token quota (UTC reset)
+          alias_preday_tokens:           # per-model daily quotas
+            chat: 50000
+            embedding: 100000
 
 providers:
   local:
@@ -51,6 +55,33 @@ retry:
 failover:
   enabled: true
   max_providers: 0
+
+# Per-(provider, base_url) circuit breaker. When enabled, consecutive upstream
+# failures trip the breaker; further requests skip the upstream until the
+# open duration elapses, after which a small probe batch is permitted.
+circuit_breaker:
+  enabled: true
+  failure_threshold: 5         # consecutive failures to open
+  open_duration: 30s            # how long the breaker stays open
+  half_open_max_requests: 1     # probe requests allowed in half-open
+  half_open_success_threshold: 1  # consecutive probe successes to close
+
+# In-flight concurrency caps. Both default to 0 (= unlimited). When set, the
+# gateway returns 503 + server_overloaded / key_overloaded when the cap is
+# reached.
+server:
+  max_concurrent_requests: 0   # total in-flight requests across all keys
+  max_concurrent_per_key: 0    # in-flight requests per API key
+
+# OpenTelemetry tracing. When enabled, the gateway emits server spans for
+# each inbound request, client spans for each upstream call (with traceparent
+# injection), and per-attempt child spans inside retry.Execute.
+tracing:
+  enabled: false               # default off; turn on with a real collector endpoint
+  endpoint: localhost:4318     # OTLP HTTP receiver
+  insecure: true               # set false when the collector presents TLS
+  sample_ratio: 1.0            # 1.0 = always sample; 0.05 = 5%
+  service_name: ai-gateway
 
 # Pluggable storage drivers. Same shape for rate_limit / quota / usage; the
 # driver name is matched against the package's driver registry, and options

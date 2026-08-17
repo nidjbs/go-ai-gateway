@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"example.com/light-llm-gateway/internal/circuitbreaker"
 	"example.com/light-llm-gateway/internal/config"
 	"example.com/light-llm-gateway/internal/provider"
 	"example.com/light-llm-gateway/internal/routing"
@@ -34,7 +35,7 @@ func TestExecuteRespectsRetryAndFailover(t *testing.T) {
 			calls := make([]int, len(candidates))
 			cfg := retryConfig(t, tc.retry)
 			failover := failoverConfig(t, tc.failover)
-			_, _, attempts, err := execute(context.Background(), cfg, failover, candidates, func(_ context.Context, candidate routing.Candidate) (string, error) {
+			_, _, attempts, err := execute(context.Background(), cfg, failover, circuitbreaker.Noop{}, candidates, func(_ context.Context, candidate routing.Candidate) (string, error) {
 				index := 0
 				if candidate.Name == "backup" {
 					index = 1
@@ -59,7 +60,7 @@ func TestExecuteRespectsRetryAndFailover(t *testing.T) {
 
 func TestExecuteZeroAttemptsStillCallsOnce(t *testing.T) {
 	calls := 0
-	_, _, _, err := execute(context.Background(), config.RetryConfig{RetryableStatuses: []int{503}}, config.FailoverConfig{}, []routing.Candidate{{Name: "primary"}}, func(context.Context, routing.Candidate) (string, error) {
+	_, _, _, err := execute(context.Background(), config.RetryConfig{RetryableStatuses: []int{503}}, config.FailoverConfig{}, circuitbreaker.Noop{}, []routing.Candidate{{Name: "primary"}}, func(context.Context, routing.Candidate) (string, error) {
 		calls++
 		return "", errors.New("failed")
 	}, func(context.Context, time.Duration) error { return nil }, func() float64 { return 0.5 })
@@ -91,7 +92,7 @@ func TestExecuteStreamSurvivesAttemptContextCancel(t *testing.T) {
 	candidates := []routing.Candidate{{Name: "primary", BaseURL: upstream.URL, Timeout: 2 * time.Second}}
 	body := json.RawMessage(`{"model":"test","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 
-	stream, _, _, err := Execute[provider.Stream](context.Background(), cfg, config.FailoverConfig{}, candidates, func(ctx context.Context, _ routing.Candidate) (provider.Stream, error) {
+	stream, _, _, err := Execute[provider.Stream](context.Background(), cfg, config.FailoverConfig{}, circuitbreaker.Noop{}, candidates, func(ctx context.Context, _ routing.Candidate) (provider.Stream, error) {
 		return provider.NewClient().OpenStream(ctx, provider.Request{Operation: provider.ChatCompletions, Body: body}, candidates[0])
 	})
 	if err != nil {
@@ -139,7 +140,7 @@ func TestBackoffDurationAppliesJitter(t *testing.T) {
 }
 
 func TestExecuteStopsWhenSleepCanceled(t *testing.T) {
-	_, _, attempts, err := execute(context.Background(), retryConfig(t, true), failoverConfig(t, true), []routing.Candidate{{Name: "primary"}, {Name: "backup"}}, func(context.Context, routing.Candidate) (string, error) {
+	_, _, attempts, err := execute(context.Background(), retryConfig(t, true), failoverConfig(t, true), circuitbreaker.Noop{}, []routing.Candidate{{Name: "primary"}, {Name: "backup"}}, func(context.Context, routing.Candidate) (string, error) {
 		return "", &provider.HTTPError{StatusCode: 503}
 	}, func(context.Context, time.Duration) error { return context.Canceled }, func() float64 { return 0.5 })
 	if !errors.Is(err, context.Canceled) || attempts.Total != 1 {

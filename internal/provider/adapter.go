@@ -1,10 +1,12 @@
 package provider
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -62,18 +64,13 @@ func (e *RequestError) Error() string {
 	return e.Message
 }
 
-type Client struct {
-	HTTPClient *http.Client
-	adapters   map[string]Adapter
-}
-
 func NewClient() *Client {
-	client := &Client{HTTPClient: http.DefaultClient}
-	client.adapters = map[string]Adapter{
-		"openai":    &openAIAdapter{client: client},
-		"anthropic": &anthropicAdapter{client: client},
+	c := NewClientWithOpts(defaultClientOpts())
+	c.adapters = map[string]Adapter{
+		"openai":    &openAIAdapter{client: c},
+		"anthropic": &anthropicAdapter{client: c},
 	}
-	return client
+	return c
 }
 
 func (c *Client) Supports(candidate routing.Candidate, operation Operation) bool {
@@ -170,4 +167,18 @@ func decodeHTTPError(status int, data []byte) error {
 		message = strings.TrimSpace(string(data))
 	}
 	return &HTTPError{StatusCode: status, Message: message}
+}
+
+// sseScannerMaxLine caps the maximum size of a single SSE event line. SSE
+// lines can carry large JSON payloads (function-call arguments, large tool
+// outputs); the bufio.Scanner default of 64 KiB is too small in practice.
+const sseScannerMaxLine = 4 << 20 // 4 MiB
+
+// newSSEScanner returns a bufio.Scanner configured for SSE line scanning
+// with an enlarged line-size cap. Both adapters feed this helper so the
+// bound stays in one place.
+func newSSEScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), sseScannerMaxLine)
+	return scanner
 }
