@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -25,6 +26,13 @@ import (
 	"example.com/light-llm-gateway/internal/ratelimit"
 	"example.com/light-llm-gateway/internal/usage"
 )
+
+// maxPerKeyLimiters caps the per-key concurrency limiter map. Without a bound
+// a long-running gateway would accumulate one entry per distinct API key it
+// ever sees. 10k entries is comfortably above any realistic tenant count and
+// keeps the per-key channel buffers (~maxConcurrentPerKey slots) from
+// ballooning memory under credential-spray attacks.
+const maxPerKeyLimiters = 10_000
 
 type Deps struct {
 	Config        *config.Config
@@ -76,6 +84,12 @@ type Server struct {
 // keyLimiter returns the per-key concurrency limiter for keyID, allocating
 // one on first use. Returns a nil limiter when the configured per-key cap is
 // zero (= unlimited).
+//
+// The map is bounded: when it exceeds maxPerKeyLimiters, an arbitrary old
+// entry is evicted to make room. Eviction is intentionally crude — picking a
+// least-recently-used entry would add a second structure — because in the
+// steady state the working set is a small fraction of the cap, so the cost
+// of an occasional collision is bounded.
 func (s *Server) keyLimiter(keyID string) *concurrency.Limiter {
 	if s.config.Server.MaxConcurrentPerKey <= 0 {
 		return nil
@@ -86,6 +100,15 @@ func (s *Server) keyLimiter(keyID string) *concurrency.Limiter {
 	if !ok {
 		l = concurrency.New(s.config.Server.MaxConcurrentPerKey)
 		s.keyLimits[keyID] = l
+		if len(s.keyLimits) > maxPerKeyLimiters {
+			for victim := range s.keyLimits {
+				if victim == keyID {
+					continue
+				}
+				delete(s.keyLimits, victim)
+				break
+			}
+		}
 	}
 	return l
 }
@@ -153,21 +176,26 @@ func New(deps Deps) (*Server, error) {
 
 	ready := &readiness{startedAt: time.Now(), waitTime: deps.Config.ReadyzWaitTime}
 
-	// 初始化 guardrails 中间件（默认关闭，需要显式配置开启）
+	// Initialize guardrails middleware (off by default; explicit opt-in).
 	guardrailCfg := deps.Config.Guardrails
 	if guardrailCfg.Mode == "" {
 		guardrailCfg.Mode = "off"
+	}
+	trackerPolicy := guardrails.TrackerConfig{
+		MaxAttempts: guardrailCfg.Tracker.MaxAttempts,
+		Window:      time.Duration(guardrailCfg.Tracker.WindowSec) * time.Second,
+		Penalty:     time.Duration(guardrailCfg.Tracker.PenaltySec) * time.Second,
+	}
+	tracker, err := pickGuardrailTracker(guardrailCfg.Tracker.Driver, trackerPolicy)
+	if err != nil {
+		return nil, fmt.Errorf("guardrails tracker: %w", err)
 	}
 	guardrailMW := guardrails.NewMiddleware(guardrails.Config{
 		Enabled:   guardrailCfg.Enabled,
 		Mode:      guardrailCfg.Mode,
 		Threshold: guardrailCfg.Threshold,
-		Tracker: guardrails.TrackerConfig{
-			MaxAttempts: guardrailCfg.Tracker.MaxAttempts,
-			Window:      time.Duration(guardrailCfg.Tracker.WindowSec) * time.Second,
-			Penalty:     time.Duration(guardrailCfg.Tracker.PenaltySec) * time.Second,
-		},
-	}, deps.Logger)
+		Tracker:   trackerPolicy,
+	}, tracker, deps.Logger)
 
 	server := &Server{
 		config:              deps.Config,
@@ -275,6 +303,29 @@ func pickUsageSink(deps Deps) (usage.Sink, error) {
 	return usage.NewAuditSink(deps.Logger), nil
 }
 
+// pickGuardrailTracker builds the per-key injection-frequency tracker. The
+// empty Driver falls back to the in-process map (single-replica only);
+// setting Driver="redis" shares state across replicas via the
+// guardrails.TrackerRegistry.
+func pickGuardrailTracker(driver config.StorageDriver, policy guardrails.TrackerConfig) (guardrails.Tracker, error) {
+	name := driver.Driver
+	if name == "" {
+		name = "memory"
+	}
+	// Stash the policy inside the options map under a private key so every
+	// factory can pull it back out without taking a second argument.
+	merged := map[string]any{}
+	for k, v := range driver.Options {
+		merged[k] = v
+	}
+	merged["_policy"] = policy
+	tracker, err := guardrails.TrackerRegistry.Build(name, merged)
+	if err != nil {
+		return nil, fmt.Errorf("guardrails tracker: %w", err)
+	}
+	return tracker, nil
+}
+
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	authenticator, err := auth.New(cfg.Auth, cfg.Teams)
 	if err != nil {
@@ -308,18 +359,18 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		server.ready.draining.Store(true)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		apiErr := server.HTTP.Shutdown(shutdownCtx)
-		healthErr := health.Shutdown(shutdownCtx)
-		var sinkErr error
+		var shutdownErrs []error
+		if err := server.HTTP.Shutdown(shutdownCtx); err != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("api server shutdown: %w", err))
+		}
+		if err := health.Shutdown(shutdownCtx); err != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("health server shutdown: %w", err))
+		}
 		if server.closer != nil {
-			sinkErr = server.closer.Close()
+			if err := server.closer.Close(); err != nil {
+				shutdownErrs = append(shutdownErrs, fmt.Errorf("usage sink close: %w", err))
+			}
 		}
-		if apiErr != nil {
-			return apiErr
-		}
-		if sinkErr != nil {
-			return sinkErr
-		}
-		return healthErr
+		return errors.Join(shutdownErrs...)
 	}
 }
