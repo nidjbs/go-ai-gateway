@@ -11,6 +11,27 @@ import (
 	"example.com/light-llm-gateway/internal/config"
 )
 
+func TestGatewayDefaultsToMemoryBackendsWithoutRedis(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"chat-1","object":"chat.completion","model":"provider-model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(upstream.URL)
+	if server.limiter == nil {
+		t.Fatal("default limiter is nil")
+	}
+	if server.quotaStore == nil {
+		t.Fatal("default quota store is nil")
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat","messages":[{"role":"user","content":"hi"}]}`))
+	response := httptest.NewRecorder()
+	server.HTTP.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
 func TestChatForwardsProviderModelAndReturnsAlias(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request map[string]any

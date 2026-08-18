@@ -1,8 +1,6 @@
 package ratelimit
 
 import (
-	"errors"
-
 	"example.com/light-llm-gateway/internal/registry"
 )
 
@@ -18,10 +16,10 @@ var (
 
 func init() {
 	LimiterRegistry.Register("memory", func(_ map[string]any) (Limiter, error) {
-		return nil, errors.New("memory driver is disabled in distributed mode; use redis instead")
+		return NewMemoryLimiter(), nil
 	})
 	QuotaRegistry.Register("memory", func(_ map[string]any) (QuotaStore, error) {
-		return nil, errors.New("memory driver is disabled in distributed mode; use redis instead")
+		return NewMemoryQuotaStore(), nil
 	})
 	LimiterRegistry.Register("redis", newRedisLimiter)
 	QuotaRegistry.Register("redis", newRedisQuotaStore)
