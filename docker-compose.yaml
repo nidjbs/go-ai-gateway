@@ -1,3 +1,8 @@
+# Two gateway replicas + a single Redis for shared state + a mock upstream.
+# The two gateway containers are intentionally identical except for their
+# host port (8080 and 8082) so we can prove that a single `rps: 5` limit is
+# enforced across replicas via the shared Redis bucket.
+
 services:
   mock:
     build:
@@ -5,7 +10,16 @@ services:
       target: mock
     command: ["--listen", "0.0.0.0:19090", "--role", "primary"]
 
-  gateway:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+
+  gateway-1:
     build:
       context: .
       target: gateway
@@ -20,4 +34,25 @@ services:
     depends_on:
       mock:
         condition: service_started
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+  gateway-2:
+    build:
+      context: .
+      target: gateway
+    command: ["--config", "/etc/light-llm-gateway/config.yaml"]
+    ports:
+      - "8082:8080"
+      - "8083:8081"
+    environment:
+      UPSTREAM_API_KEY: primary-token
+    volumes:
+      - ./configs/config.docker.yaml:/etc/light-llm-gateway/config.yaml:ro
+    depends_on:
+      mock:
+        condition: service_started
+      redis:
+        condition: service_healthy
     restart: on-failure

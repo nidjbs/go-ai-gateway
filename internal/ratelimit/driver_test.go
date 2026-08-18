@@ -28,7 +28,7 @@ func TestQuotaRegistryHasMemory(t *testing.T) {
 }
 
 func TestLimiterRegistryUnknownDriver(t *testing.T) {
-	if _, err := LimiterRegistry.Build("redis", nil); err == nil {
+	if _, err := LimiterRegistry.Build("nonexistent", nil); err == nil {
 		t.Fatal("expected error for unregistered driver")
 	}
 }

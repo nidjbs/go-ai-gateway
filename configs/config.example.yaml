@@ -100,3 +100,31 @@ tracing:
 #   options:
 #     path: ./usage.db
 #     max_connections: 1      # SQLite single-writer by default
+
+
+rate_limit:
+   driver: redis
+   options:
+     addr: 127.0.0.1:6379
+     password: ""             # set when ACL is enabled
+     db: 0
+     dial_timeout: 2s
+     read_timeout: 250ms
+
+quota:
+   driver: redis
+   options:
+     addr: 127.0.0.1:6379
+
+guardrails:
+   enabled: true
+   mode: block
+   threshold: 0.75
+   tracker:
+     max_attempts: 3
+     window_sec: 60
+     penalty_sec: 30
+     driver:
+       driver: redis
+       options:
+         addr: 127.0.0.1:6379

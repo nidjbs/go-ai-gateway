@@ -5,31 +5,58 @@ import (
 	"time"
 )
 
-// InjectionTracker 按 API key 追踪注入检测频率。
-// 核心思路：不阻止单次尝试（可能是误报），但对短时间内多次触发检测的 key 做惩罚限速。
-// 这大幅提高了自动化攻击的成本，同时不影响正常用户。
+// Tracker is the per-key injection-frequency counter the middleware consults
+// before letting a request through. Implementations must be safe for
+// concurrent use and tolerate transient backend failures without blocking
+// the request hot path indefinitely.
+type Tracker interface {
+	// Record increments the running counter for keyID and reports whether the
+	// key has crossed the configured threshold (i.e. entered the penalty
+	// window). It returns false on every increment before the threshold.
+	Record(keyID string, now time.Time) bool
+	// IsBlocked reports whether keyID is currently inside its penalty window.
+	IsBlocked(keyID string, now time.Time) bool
+	// PenaltyRemaining returns the time left on the active penalty for keyID,
+	// or 0 when the key is not blocked.
+	PenaltyRemaining(keyID string, now time.Time) time.Duration
+	// Reset clears all state for keyID. Used by tests and operational tooling.
+	Reset(keyID string)
+	// ActiveBlocks returns the number of keys currently in penalty; useful
+	// for monitoring.
+	ActiveBlocks(now time.Time) int
+}
+
+// InjectionTracker is the in-process Tracker implementation. It is the
+// default when no distributed driver is configured.
+//
+// Design rationale: don't block a single attempt on a possible false
+// positive, but make automated attacks expensive by penalising any key that
+// repeatedly trips detection inside a short window.
 type InjectionTracker struct {
 	mu       sync.Mutex
 	windows  map[string]*attackWindow
-	maxCount int           // 触发惩罚的阈值（默认 3 次）
-	window   time.Duration // 计数窗口（默认 1 分钟）
-	penalty  time.Duration // 惩罚时长（默认 30 秒）
+	maxCount int
+	window   time.Duration
+	penalty  time.Duration
 }
 
 type attackWindow struct {
-	count   int       // 当前窗口内的触发次数
-	resetAt time.Time // 窗口重置时间
-	blocked bool      // 是否处于惩罚期
+	count   int
+	resetAt time.Time
+	blocked bool
 }
 
-// TrackerConfig 是 InjectionTracker 的配置。
+// TrackerConfig configures the in-process tracker. Distributed drivers may
+// read the same fields; the gateway treats them as policy regardless of
+// where state lives.
 type TrackerConfig struct {
-	MaxAttempts int           // 窗口内最大触发次数（默认 3）
-	Window      time.Duration // 计数窗口（默认 1 分钟）
-	Penalty     time.Duration // 惩罚时长（默认 30 秒）
+	MaxAttempts int
+	Window      time.Duration
+	Penalty     time.Duration
 }
 
-// DefaultTrackerConfig 返回默认配置。
+// DefaultTrackerConfig returns sensible defaults: a key must hit the
+// detector three times inside one minute to earn a 30-second block.
 func DefaultTrackerConfig() TrackerConfig {
 	return TrackerConfig{
 		MaxAttempts: 3,
@@ -38,7 +65,7 @@ func DefaultTrackerConfig() TrackerConfig {
 	}
 }
 
-// NewInjectionTracker 创建一个新的 InjectionTracker。
+// NewInjectionTracker constructs the memory-backed tracker.
 func NewInjectionTracker(cfg TrackerConfig) *InjectionTracker {
 	return &InjectionTracker{
 		windows:  make(map[string]*attackWindow),
@@ -48,44 +75,36 @@ func NewInjectionTracker(cfg TrackerConfig) *InjectionTracker {
 	}
 }
 
-// Record 记录一次注入检测触发。
-// 返回 true 表示该 key 应被限速（已进入惩罚期）。
+// Compile-time guarantee that InjectionTracker satisfies Tracker.
+var _ Tracker = (*InjectionTracker)(nil)
+
 func (t *InjectionTracker) Record(keyID string, now time.Time) bool {
 	if keyID == "" {
 		return false
 	}
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	w, ok := t.windows[keyID]
 	if !ok || now.After(w.resetAt) {
-		// 新窗口或窗口已过期
-		t.windows[keyID] = &attackWindow{
-			count:   1,
-			resetAt: now.Add(t.window),
-			blocked: false,
-		}
+		t.windows[keyID] = &attackWindow{count: 1, resetAt: now.Add(t.window)}
 		return false
 	}
 
 	w.count++
 	if w.count >= t.maxCount {
-		// 达到阈值，进入惩罚期
 		w.blocked = true
-		w.resetAt = now.Add(t.penalty) // 惩罚期结束后重新计数
+		w.resetAt = now.Add(t.penalty)
 		w.count = 0
 		return true
 	}
 	return false
 }
 
-// IsBlocked 检查 key 是否处于惩罚期。
 func (t *InjectionTracker) IsBlocked(keyID string, now time.Time) bool {
 	if keyID == "" {
 		return false
 	}
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -94,19 +113,16 @@ func (t *InjectionTracker) IsBlocked(keyID string, now time.Time) bool {
 		return false
 	}
 	if now.After(w.resetAt) {
-		// 惩罚期已过，清理
 		delete(t.windows, keyID)
 		return false
 	}
 	return w.blocked
 }
 
-// PenaltyRemaining 返回 key 剩余的惩罚时间。
 func (t *InjectionTracker) PenaltyRemaining(keyID string, now time.Time) time.Duration {
 	if keyID == "" {
 		return 0
 	}
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -120,14 +136,12 @@ func (t *InjectionTracker) PenaltyRemaining(keyID string, now time.Time) time.Du
 	return 0
 }
 
-// Reset 清除 key 的所有追踪记录（用于手动解除惩罚）。
 func (t *InjectionTracker) Reset(keyID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.windows, keyID)
 }
 
-// ActiveBlocks 返回当前处于惩罚期的 key 数量（用于监控）。
 func (t *InjectionTracker) ActiveBlocks(now time.Time) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()

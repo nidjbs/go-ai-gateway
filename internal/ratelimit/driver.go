@@ -1,6 +1,10 @@
 package ratelimit
 
-import "example.com/light-llm-gateway/internal/registry"
+import (
+	"errors"
+
+	"example.com/light-llm-gateway/internal/registry"
+)
 
 // LimiterRegistry and QuotaRegistry hold the driver factories the gateway uses
 // to build Limiter and QuotaStore instances from configuration. The default
@@ -13,6 +17,12 @@ var (
 )
 
 func init() {
-	LimiterRegistry.Register("memory", func(_ map[string]any) (Limiter, error) { return NewMemoryLimiter(), nil })
-	QuotaRegistry.Register("memory", func(_ map[string]any) (QuotaStore, error) { return NewMemoryQuotaStore(), nil })
+	LimiterRegistry.Register("memory", func(_ map[string]any) (Limiter, error) {
+		return nil, errors.New("memory driver is disabled in distributed mode; use redis instead")
+	})
+	QuotaRegistry.Register("memory", func(_ map[string]any) (QuotaStore, error) {
+		return nil, errors.New("memory driver is disabled in distributed mode; use redis instead")
+	})
+	LimiterRegistry.Register("redis", newRedisLimiter)
+	QuotaRegistry.Register("redis", newRedisQuotaStore)
 }

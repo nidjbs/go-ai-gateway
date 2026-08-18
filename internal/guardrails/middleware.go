@@ -43,23 +43,28 @@ func DefaultConfig() Config {
 	}
 }
 
-// Middleware 是 guardrails HTTP 中间件。
+// Middleware is the guardrails HTTP middleware.
 type Middleware struct {
 	config  Config
 	scanner *Scanner
-	tracker *InjectionTracker
+	tracker Tracker
 	logger  *slog.Logger
 }
 
-// NewMiddleware 创建一个新的 guardrails 中间件。
-func NewMiddleware(cfg Config, logger *slog.Logger) *Middleware {
+// NewMiddleware builds the middleware around the supplied tracker. Callers
+// (typically the gateway server) resolve the tracker from TrackerRegistry
+// so a distributed backend can be plugged in without touching this package.
+func NewMiddleware(cfg Config, tracker Tracker, logger *slog.Logger) *Middleware {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if tracker == nil {
+		tracker = NewInjectionTracker(cfg.Tracker)
 	}
 	return &Middleware{
 		config:  cfg,
 		scanner: NewScanner(),
-		tracker: NewInjectionTracker(cfg.Tracker),
+		tracker: tracker,
 		logger:  logger,
 	}
 }
