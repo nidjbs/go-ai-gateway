@@ -26,12 +26,10 @@ type Tracker interface {
 	ActiveBlocks(now time.Time) int
 }
 
-// InjectionTracker is the in-process Tracker implementation. It is the
-// default when no distributed driver is configured.
+// InjectionTracker is the in-process Tracker implementation.
 //
-// Design rationale: don't block a single attempt on a possible false
-// positive, but make automated attacks expensive by penalising any key that
-// repeatedly trips detection inside a short window.
+// Repeated detections inside a short window escalate to a penalty, making
+// automated attacks expensive while tolerating isolated false positives.
 type InjectionTracker struct {
 	mu       sync.Mutex
 	windows  map[string]*attackWindow
@@ -55,8 +53,7 @@ type TrackerConfig struct {
 	Penalty     time.Duration
 }
 
-// DefaultTrackerConfig returns sensible defaults: a key must hit the
-// detector three times inside one minute to earn a 30-second block.
+// DefaultTrackerConfig returns sensible defaults: 3 hits in 1 minute triggers a 30-second block.
 func DefaultTrackerConfig() TrackerConfig {
 	return TrackerConfig{
 		MaxAttempts: 3,

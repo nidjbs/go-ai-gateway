@@ -27,11 +27,8 @@ import (
 	"example.com/light-llm-gateway/internal/usage"
 )
 
-// maxPerKeyLimiters caps the per-key concurrency limiter map. Without a bound
-// a long-running gateway would accumulate one entry per distinct API key it
-// ever sees. 10k entries is comfortably above any realistic tenant count and
-// keeps the per-key channel buffers (~maxConcurrentPerKey slots) from
-// ballooning memory under credential-spray attacks.
+// maxPerKeyLimiters caps the per-key limiter map to prevent unbounded growth
+// under credential-spray attacks.
 const maxPerKeyLimiters = 10_000
 
 type Deps struct {
@@ -82,14 +79,8 @@ type Server struct {
 }
 
 // keyLimiter returns the per-key concurrency limiter for keyID, allocating
-// one on first use. Returns a nil limiter when the configured per-key cap is
-// zero (= unlimited).
-//
-// The map is bounded: when it exceeds maxPerKeyLimiters, an arbitrary old
-// entry is evicted to make room. Eviction is intentionally crude — picking a
-// least-recently-used entry would add a second structure — because in the
-// steady state the working set is a small fraction of the cap, so the cost
-// of an occasional collision is bounded.
+// one on first use. Returns nil when the configured per-key cap is zero.
+// The map is bounded; excess entries are evicted crudely (arbitrary).
 func (s *Server) keyLimiter(keyID string) *concurrency.Limiter {
 	if s.config.Server.MaxConcurrentPerKey <= 0 {
 		return nil
@@ -136,10 +127,6 @@ func New(deps Deps) (*Server, error) {
 		deps.Provider = provider.NewClient()
 	}
 	if deps.Config.Tracing.Enabled {
-		// Wrap the per-provider transports so the OTel SDK can emit client
-		// spans for each upstream call independently — pools are isolated by
-		// provider type so the tracing transport is applied per-provider, not
-		// globally.
 		for _, ptype := range deps.Provider.RegisteredTypes() {
 			existing := deps.Provider.HTTPClient(ptype)
 			deps.Provider.SetHTTPClient(ptype, &http.Client{
@@ -176,7 +163,6 @@ func New(deps Deps) (*Server, error) {
 
 	ready := &readiness{startedAt: time.Now(), waitTime: deps.Config.ReadyzWaitTime}
 
-	// Initialize guardrails middleware (off by default; explicit opt-in).
 	guardrailCfg := deps.Config.Guardrails
 	if guardrailCfg.Mode == "" {
 		guardrailCfg.Mode = "off"
@@ -243,8 +229,7 @@ func New(deps Deps) (*Server, error) {
 }
 
 // concurrencyMiddleware rejects requests when the gateway-level in-flight cap
-// is reached. Health probes are exempt so a saturated gateway still drains
-// cleanly behind a load balancer.
+// is reached. Health probes are exempt so a saturated gateway drains cleanly.
 func (s *Server) concurrencyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.concurrency.TryAcquire() {
@@ -257,9 +242,7 @@ func (s *Server) concurrencyMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// sinkCloser returns an io.Closer iff sink implements it (e.g. SQLSink closes
-// its database handle). NoopSink and AuditSink fall through and return nil;
-// their lifecycle is process-bound and needs no explicit close.
+// sinkCloser returns an io.Closer iff sink implements it (e.g. SQLSink).
 func sinkCloser(sink usage.Sink) io.Closer {
 	if c, ok := sink.(io.Closer); ok {
 		return c
@@ -267,8 +250,7 @@ func sinkCloser(sink usage.Sink) io.Closer {
 	return nil
 }
 
-// pickLimiter resolves the Limiter in priority order: explicit Deps injection,
-// config-driven driver lookup, then the in-process memory fallback.
+// pickLimiter resolves the Limiter: Deps injection, then config driver, then memory.
 func pickLimiter(deps Deps) (ratelimit.Limiter, error) {
 	if deps.Limiter != nil {
 		return deps.Limiter, nil
@@ -290,9 +272,7 @@ func pickQuotaStore(deps Deps) (ratelimit.QuotaStore, error) {
 	return ratelimit.NewMemoryQuotaStore(), nil
 }
 
-// pickUsageSink resolves the usage sink. The production behavior is to write
-// audit records to slog; binaries that want a different sink can inject it
-// directly via Deps or register a custom driver in config.
+// pickUsageSink resolves the usage sink; defaults to slog audit sink.
 func pickUsageSink(deps Deps) (usage.Sink, error) {
 	if deps.UsageSink != nil {
 		return deps.UsageSink, nil
@@ -303,17 +283,13 @@ func pickUsageSink(deps Deps) (usage.Sink, error) {
 	return usage.NewAuditSink(deps.Logger), nil
 }
 
-// pickGuardrailTracker builds the per-key injection-frequency tracker. The
-// empty Driver falls back to the in-process map (single-replica only);
-// setting Driver="redis" shares state across replicas via the
-// guardrails.TrackerRegistry.
+// pickGuardrailTracker builds the per-key injection-frequency tracker.
+// Empty Driver falls back to in-process map; "redis" shares across replicas.
 func pickGuardrailTracker(driver config.StorageDriver, policy guardrails.TrackerConfig) (guardrails.Tracker, error) {
 	name := driver.Driver
 	if name == "" {
 		name = "memory"
 	}
-	// Stash the policy inside the options map under a private key so every
-	// factory can pull it back out without taking a second argument.
 	merged := map[string]any{}
 	for k, v := range driver.Options {
 		merged[k] = v

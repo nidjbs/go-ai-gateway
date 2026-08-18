@@ -8,21 +8,14 @@ import (
 	"time"
 )
 
-// AuditSink writes each Event as a single structured slog record. The default
-// level is Info; failed events (Success=false) are upgraded to Warn so that
-// log-based alerting can pick them up without scanning every record.
-//
-// This is the production default; binaries that want a different backend can
-// either replace Deps.UsageSink or register an alternative driver under
-// usage.Registry and select it from config.
+// AuditSink writes each Event as a structured slog record. Failed events are logged at Warn level.
 type AuditSink struct {
 	logger *slog.Logger
 	level  slog.Level
 	now    func() time.Time
 }
 
-// NewAuditSink returns a sink that writes to logger at the given level. Pass
-// slog.LevelInfo (the typical choice) so every event lands in the audit trail.
+// NewAuditSink returns a sink that writes to logger at Info level.
 func NewAuditSink(logger *slog.Logger) *AuditSink {
 	return &AuditSink{logger: logger, level: slog.LevelInfo, now: time.Now}
 }
@@ -71,8 +64,7 @@ func (a *AuditSink) Record(_ context.Context, e Event) error {
 	return nil
 }
 
-// NewEventID returns a 32-character hex event identifier. It uses crypto/rand
-// to avoid pulling in a uuid dependency for a single 16-byte identifier.
+// NewEventID returns a 32-character hex event identifier using crypto/rand.
 func NewEventID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

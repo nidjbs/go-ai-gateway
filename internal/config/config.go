@@ -32,9 +32,7 @@ type Config struct {
 	readyzWaitTimeSet bool
 }
 
-// StorageDriver is a generic named-driver selector. Driver names are matched
-// against the registries in ratelimit/usage; an empty Driver falls back to the
-// in-tree default (no config required for the existing behavior).
+// StorageDriver selects a named driver from the ratelimit/usage registries; an empty Driver falls back to the in-tree default.
 type StorageDriver struct {
 	Driver  string         `yaml:"driver"`
 	Options map[string]any `yaml:"options,omitempty"`
@@ -115,11 +113,7 @@ type FailoverConfig struct {
 	enabledSet   bool
 }
 
-// CircuitBreakerConfig controls the per-(provider, base_url) breaker used to
-// short-circuit calls to a failing upstream.
-//
-// Zero values disable the breaker entirely. When Enabled is true, sensible
-// defaults are applied to any field left at its zero value.
+// CircuitBreakerConfig controls the per-(provider, base_url) breaker. Zero values disable it; when Enabled, sensible defaults fill zero-value fields.
 type CircuitBreakerConfig struct {
 	Enabled                  bool          `yaml:"enabled"`
 	FailureThreshold         int           `yaml:"failure_threshold"`
@@ -128,11 +122,7 @@ type CircuitBreakerConfig struct {
 	HalfOpenSuccessThreshold int           `yaml:"half_open_success_threshold"`
 }
 
-// TracingConfig configures the OpenTelemetry tracing pipeline.
-//
-// When Enabled is false the gateway leaves the global TracerProvider as the
-// OTel default (non-recording) and skips the OTLP exporter entirely, so the
-// runtime overhead is nil.
+// TracingConfig configures the OpenTelemetry tracing pipeline. When Enabled is false the gateway skips the OTLP exporter entirely.
 type TracingConfig struct {
 	Enabled     bool    `yaml:"enabled"`
 	Endpoint    string  `yaml:"endpoint"`
@@ -141,35 +131,13 @@ type TracingConfig struct {
 	ServiceName string  `yaml:"service_name"`
 }
 
-// ServerConfig caps in-flight concurrency.
-//
-// MaxConcurrentRequests bounds total in-flight HTTP requests served by the
-// gateway; requests beyond the cap receive 503 server_overloaded.
-//
-// MaxConcurrentPerKey bounds in-flight requests per API key. A separate
-// cap means a single noisy tenant cannot starve other tenants up to the
-// global cap.
-//
-// Both fields are zero (= unlimited) by default.
+// ServerConfig caps in-flight concurrency. Both fields are zero (= unlimited) by default; over-cap requests get 503 server_overloaded.
 type ServerConfig struct {
 	MaxConcurrentRequests int `yaml:"max_concurrent_requests"`
 	MaxConcurrentPerKey   int `yaml:"max_concurrent_per_key"`
 }
 
-// GuardrailsConfig controls prompt-injection protection behavior.
-//
-// Mode accepts:
-//   - "off"   : fully disabled (default; preserves existing behaviour)
-//   - "flag"  : detect and log; never block (zero false positives)
-//   - "block" : detect and block high-confidence injection attempts
-//
-// Threshold is the score that triggers block/flag (0.0–1.0). Each matched
-// rule contributes 0.25, so 0.75 requires at least three rules firing
-// simultaneously.
-//
-// Tracker selects where per-key penalty state lives. The default is an
-// in-process map (single replica only); set Driver="redis" to share state
-// across replicas. Options are forwarded to the factory.
+// GuardrailsConfig controls prompt-injection protection. Mode is "off"|"flag"|"block"; Tracker.Driver selects per-key penalty state storage.
 type GuardrailsConfig struct {
 	Enabled   bool                    `yaml:"enabled"`
 	Mode      string                  `yaml:"mode"`
@@ -177,9 +145,7 @@ type GuardrailsConfig struct {
 	Tracker   GuardrailsTrackerConfig `yaml:"tracker"`
 }
 
-// GuardrailsTrackerConfig combines the policy (max attempts / window /
-// penalty) with the storage-driver selector so guardrails state can move
-// from in-process to Redis without changing the rest of the config.
+// GuardrailsTrackerConfig binds penalty policy with a storage-driver selector so state can move from in-process to Redis.
 type GuardrailsTrackerConfig struct {
 	MaxAttempts int           `yaml:"max_attempts"`
 	WindowSec   int           `yaml:"window_sec"`
@@ -187,8 +153,7 @@ type GuardrailsTrackerConfig struct {
 	Driver      StorageDriver `yaml:"driver,omitempty"`
 }
 
-// DefaultGuardrailsConfig returns defaults: guardrails are off, so the
-// feature is invisible until the operator opts in.
+// DefaultGuardrailsConfig returns off-by-default settings; the feature is invisible until the operator opts in.
 func DefaultGuardrailsConfig() GuardrailsConfig {
 	return GuardrailsConfig{
 		Enabled:   false,
@@ -198,8 +163,7 @@ func DefaultGuardrailsConfig() GuardrailsConfig {
 			MaxAttempts: 3,
 			WindowSec:   60,
 			PenaltySec:  30,
-			// Driver empty = in-process map. Set Driver.Driver="redis" with
-			// Driver.Options to share state across replicas.
+			// Driver "memory" = in-process map; set "redis" to share state across replicas.
 			Driver: StorageDriver{Driver: "memory"},
 		},
 	}

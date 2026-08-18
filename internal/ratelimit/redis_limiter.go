@@ -63,8 +63,6 @@ return { allowed, math.floor(tokens) }
 `
 
 // bucketIdleTTL is how long an untouched bucket sticks around in Redis.
-// 1 hour covers all realistic operator pauses; longer is fine too but
-// doesn't add value.
 const bucketIdleTTL = 3600
 
 type redisLimiter struct {
@@ -72,8 +70,7 @@ type redisLimiter struct {
 	script *redis.Script
 }
 
-// NewRedisLimiter wraps an already-configured *redis.Client. The factory in
-// redis_driver.go handles option parsing and connectivity check.
+// NewRedisLimiter wraps an already-configured *redis.Client.
 func NewRedisLimiter(client *redis.Client) Limiter {
 	return &redisLimiter{
 		client: client,

@@ -26,11 +26,7 @@ type Attempts struct {
 	Failovers int
 }
 
-// Execute performs a request against the candidate list with per-provider
-// retries and provider-level failover. The optional breaker short-circuits
-// candidates whose recent failure history has tripped the breaker.
-//
-// breaker may be nil; a nil breaker is treated as circuitbreaker.Noop().
+// Execute runs request against the candidate list with per-provider retries and provider-level failover. breaker may be nil (treated as Noop).
 func Execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, breaker circuitbreaker.Breaker, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error)) (T, routing.Candidate, Attempts, error) {
 	if breaker == nil {
 		breaker = circuitbreaker.Noop{}
@@ -60,9 +56,7 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 		lastCandidate = candidate
 		breakerKey := candidate.Name + "|" + candidate.BaseURL
 
-		// Skip candidates whose breaker is open before any attempt is made;
-		// this is the cheap fast path that keeps latency low when an
-		// upstream is known-bad.
+		// Fast path: skip candidates whose breaker is already open.
 		if err := breaker.Allow(breakerKey, now); err != nil {
 			lastErr = err
 			continue
@@ -97,9 +91,7 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 			if err != nil {
 				cancel()
 				lastErr = err
-				// If the breaker just tripped on this failure, abandon the
-				// remaining attempts for this candidate and move on. The
-				// outer failover loop will pick up the next provider.
+				// If the breaker just tripped, abandon remaining attempts for this candidate.
 				if isOpenErr := breaker.Allow(breakerKey, now); isOpenErr != nil {
 					break
 				}
@@ -111,12 +103,7 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 				}
 				continue
 			}
-			// On success, hand attempt-context ownership to the returned value.
-			// For streams, the underlying HTTP request and scanner rely on attemptCtx;
-			// cancelling it here would abort reads of subsequent chunks. The value's
-			// Close (or per-call context, for non-stream results) is responsible for
-			// releasing attemptCtx. If T does not retain cancel, the attempt's timer
-			// is reclaimed when attemptCtx expires via PerAttemptTimeout.
+			// On success, ownership of attemptCtx transfers to the returned value (streams rely on it; the value's Close reclaims it).
 			_ = cancel
 			return value, candidate, attempts, nil
 		}

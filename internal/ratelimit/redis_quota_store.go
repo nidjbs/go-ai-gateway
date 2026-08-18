@@ -46,8 +46,7 @@ type redisQuotaStore struct {
 	script *redis.Script
 }
 
-// NewRedisQuotaStore wraps an already-configured *redis.Client. The factory
-// in redis_driver.go handles option parsing and connectivity check.
+// NewRedisQuotaStore wraps an already-configured *redis.Client.
 func NewRedisQuotaStore(client *redis.Client) QuotaStore {
 	return &redisQuotaStore{
 		client: client,

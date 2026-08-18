@@ -169,14 +169,10 @@ func decodeHTTPError(status int, data []byte) error {
 	return &HTTPError{StatusCode: status, Message: message}
 }
 
-// sseScannerMaxLine caps the maximum size of a single SSE event line. SSE
-// lines can carry large JSON payloads (function-call arguments, large tool
-// outputs); the bufio.Scanner default of 64 KiB is too small in practice.
+// sseScannerMaxLine caps a single SSE line; the bufio.Scanner default of 64 KiB is too small for large JSON payloads.
 const sseScannerMaxLine = 4 << 20 // 4 MiB
 
-// newSSEScanner returns a bufio.Scanner configured for SSE line scanning
-// with an enlarged line-size cap. Both adapters feed this helper so the
-// bound stays in one place.
+// newSSEScanner returns a bufio.Scanner configured for SSE with an enlarged line-size cap.
 func newSSEScanner(r io.Reader) *bufio.Scanner {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), sseScannerMaxLine)

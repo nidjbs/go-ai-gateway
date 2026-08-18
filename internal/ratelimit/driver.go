@@ -4,11 +4,9 @@ import (
 	"example.com/light-llm-gateway/internal/registry"
 )
 
-// LimiterRegistry and QuotaRegistry hold the driver factories the gateway uses
-// to build Limiter and QuotaStore instances from configuration. The default
-// "memory" drivers are registered in init(); third-party packages can register
-// additional drivers (e.g. "redis") in their own init() and the binary picks
-// them up via the config driver name.
+// LimiterRegistry and QuotaRegistry hold driver factories. Default "memory"
+// and "redis" drivers are registered in init(); third-party packages can
+// register additional drivers via their own init().
 var (
 	LimiterRegistry = registry.NewRegistry[Limiter]()
 	QuotaRegistry   = registry.NewRegistry[QuotaStore]()

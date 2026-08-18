@@ -7,16 +7,8 @@ import (
 	"strings"
 )
 
-// SQLSink is a Sink backed by any *sql.DB. The driver package (sqlite_driver
-// or a third-party init() that registers "postgres"/"mysql"/...) supplies the
-// DDL string and INSERT statement, so schema is owned by the driver and not
-// hardcoded here. This keeps the backend swappable without touching core code.
-//
-// Record executes the INSERT inside the caller's context. The handler
-// already wraps the call with context.WithTimeout(..., time.Second) so a
-// stuck database cannot stall the request goroutine indefinitely; on failure
-// the sink returns an error and the handler logs a warning — the user request
-// itself is unaffected.
+// SQLSink is a Sink backed by any *sql.DB. The driver package supplies the DDL
+// and INSERT statement so the schema is owned by the driver, not this file.
 type SQLSink struct {
 	db        *sql.DB
 	insertSQL string
@@ -36,8 +28,7 @@ func NewSQLSink(db *sql.DB, ddl, insertSQL string) (*SQLSink, error) {
 	return &SQLSink{db: db, insertSQL: insertSQL}, nil
 }
 
-// Record maps Event onto the INSERT column list. Column order is fixed and
-// documented in DefaultInsertSQL — keep both in sync.
+// Record maps Event onto the INSERT column list. Column order matches DefaultColumns.
 func (s *SQLSink) Record(ctx context.Context, e Event) error {
 	_, err := s.db.ExecContext(ctx, s.insertSQL,
 		e.EventID,
@@ -74,8 +65,7 @@ func (s *SQLSink) Record(ctx context.Context, e Event) error {
 	return err
 }
 
-// Close releases the underlying *sql.DB. server.Run shutdown detects SQLSink
-// via io.Closer type assertion and calls this.
+// Close releases the underlying *sql.DB.
 func (s *SQLSink) Close() error {
 	if s.db == nil {
 		return nil
@@ -84,9 +74,7 @@ func (s *SQLSink) Close() error {
 }
 
 // DefaultInsertSQL builds the INSERT statement for the SQLSink column list.
-// The placeholders string must match the target dialect: "?" for SQLite/MySQL,
-// "$1, $2, ..." for Postgres (already-joined by the driver). The column list
-// is canonical and matches DefaultColumns.
+// placeholders must match the target dialect ("?" for SQLite/MySQL, "$N" for Postgres).
 func DefaultInsertSQL(table string, placeholders string) string {
 	cols := DefaultColumns()
 	ph := make([]string, len(cols))
@@ -101,9 +89,7 @@ func DefaultInsertSQL(table string, placeholders string) string {
 	)
 }
 
-// DefaultColumns returns the canonical column list, in the exact order Record
-// supplies values. Third-party drivers that want schema alignment should
-// reuse this list.
+// DefaultColumns returns the canonical column list, in the order Record supplies values.
 func DefaultColumns() []string {
 	return []string{
 		"event_id", "request_id", "api_key_id", "team_id",
@@ -117,8 +103,7 @@ func DefaultColumns() []string {
 	}
 }
 
-// DefaultTable is the table name used by the bundled SQLite driver and a
-// sensible default for third-party drivers.
+// DefaultTable is the table name used by the bundled SQLite driver.
 const DefaultTable = "usage_events"
 
 func nullString(v string) sql.NullString {

@@ -6,8 +6,7 @@ import (
 	"strings"
 )
 
-// ctxKey is an unexported type used as a context key inside the gateway so it
-// cannot collide with keys defined by other packages.
+// ctxKey is an unexported type used as a context key to avoid collision.
 type ctxKey struct{ name string }
 
 var (
@@ -15,10 +14,8 @@ var (
 	userAgentKey = ctxKey{"user_agent"}
 )
 
-// clientInfoMiddleware extracts the source IP (resolved through chi's
-// middleware.RealIP, which already ran earlier in the chain) and the
-// User-Agent header and stashes them on the request context. Handlers read
-// them via clientIP / userAgent without re-parsing headers on every call.
+// clientInfoMiddleware extracts the client IP (via chi RealIP) and User-Agent
+// onto the request context for later handlers to read.
 func clientInfoMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), clientIPKey, r.RemoteAddr)
@@ -41,9 +38,7 @@ func userAgent(ctx context.Context) string {
 	return ""
 }
 
-// requestEndpoint maps the request path to the stable endpoint name used in
-// audit events. Unknown paths fall through verbatim so a future endpoint still
-// gets recorded, just under its URL path.
+// requestEndpoint maps the request path to the stable endpoint name in audit events.
 func requestEndpoint(r *http.Request) string {
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/v1/chat/completions"):

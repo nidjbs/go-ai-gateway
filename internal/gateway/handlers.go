@@ -47,9 +47,6 @@ type handler struct {
 }
 
 // usageRecord is the structured payload every handler passes to recordUsage.
-// Carrying it as a value keeps call sites readable when many of these fields
-// are zero and avoids the long positional-parameter signature that grew with
-// the schema.
 type usageRecord struct {
 	started       time.Time
 	endpoint      string
@@ -65,8 +62,7 @@ type usageRecord struct {
 	attempts      retry.Attempts
 }
 
-// metricsRecord mirrors usageRecord but carries only the fields the metrics
-// recorder consumes — they share most data but not all.
+// metricsRecord mirrors usageRecord for the metrics recorder.
 type metricsRecord struct {
 	started    time.Time
 	endpoint   string
@@ -185,10 +181,7 @@ type chatRequest struct {
 	Stream   bool            `json:"stream"`
 }
 
-// recordBadRequest centralises the "write a 400, log a validation_error audit
-// event" pair that every request-validation failure triggers. Returning
-// nothing keeps the call sites readable; the caller has already returned
-// false / aborted by the time this is invoked.
+// recordBadRequest writes a 400 and a validation_error audit event.
 func (h handler) recordBadRequest(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate, message string) {
 	h.recordUsage(ctx, usageRecord{
 		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
@@ -241,9 +234,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	h.logger.Info("request complete", "request_id", requestID(r), "endpoint", "chat.completions", "provider", candidate.Name, "attempts", attempts.Total, "status", http.StatusOK, "upstream_duration_ms", time.Since(started).Milliseconds())
 }
 
-// chargeQuota records usage against all configured quota dimensions for keyID
-// and the requested alias. Daily and monthly quotas are key-level aggregates;
-// the alias-level quota, when configured, tracks per-model spend.
+// chargeQuota records usage against daily, monthly, and alias-level quotas.
 func (h handler) chargeQuota(w http.ResponseWriter, keyID, alias string, delta int64) {
 	if delta <= 0 {
 		return
@@ -270,9 +261,8 @@ func (h handler) chargeQuota(w http.ResponseWriter, keyID, alias string, delta i
 	}
 }
 
-// checkAliasQuota enforces the per-alias daily quota, if configured, after the
-// request body has been parsed. It returns true when the request may proceed
-// (no quota configured, or quota remaining); false after writing a 429.
+// checkAliasQuota enforces the per-alias daily quota. Returns true if the
+// request may proceed; false after writing a 429.
 func (h handler) checkAliasQuota(w http.ResponseWriter, r *http.Request, started time.Time, principal auth.Principal, alias string) bool {
 	if principal.APIKeyID == "" || h.quotaStore == nil {
 		return true
@@ -356,10 +346,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	flusher.Flush()
 	seen := false
 	var firstToken time.Time
-	// pumpStream runs a reader goroutine that pushes events over a bounded
-	// channel. When the client is slow, the channel fills and the reader
-	// blocks inside stream.Next() — applying real TCP-level backpressure
-	// to the upstream socket rather than buffering in user space.
+	// pumpStream pushes events over a bounded channel, applying backpressure on slow clients.
 	for result := range pumpStream(r.Context(), stream) {
 		if result.err != nil {
 			err := result.err
@@ -413,10 +400,8 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	}
 }
 
-// streamOutcomeFor classifies a stream error into the (errorType, streamOutcome,
-// status) tuple used by both the audit and metrics recorders. Client-initiated
-// cancellation surfaces as 499 client_aborted; everything else falls through
-// as upstream_error / 502.
+// streamOutcomeFor classifies a stream error into (errorType, streamOutcome, status).
+// Client cancellation is 499; everything else is upstream_error/502.
 func streamOutcomeFor(streamErr error, reqCtx context.Context) (errorType, streamOutcome string, status int) {
 	if errors.Is(streamErr, context.Canceled) || errors.Is(reqCtx.Err(), context.Canceled) {
 		return "client_aborted", "client_aborted", 499
@@ -481,10 +466,8 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// writeProviderError converts an upstream-side failure into the appropriate
-// client response and audit/metrics entry. Local validation failures from
-// upstream adapters are passed through as 400; everything else becomes a
-// sanitised 502 (or, if the breaker tripped, an "upstream_unavailable" 502).
+// writeProviderError converts an upstream failure into a client response and
+// audit/metrics entry. Provider RequestError → 400; otherwise sanitised 502.
 func (h handler) writeProviderError(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, candidate routing.Candidate, streaming bool, err error) {
 	var requestErr *provider.RequestError
 	if errors.As(err, &requestErr) {

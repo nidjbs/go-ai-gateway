@@ -172,10 +172,6 @@ func strconvFloat(v float64) string {
 }
 
 // NewMemoryQuotaStore returns an in-process QuotaStore backed by a map.
-//
-// Buckets are keyed by (KeyID, Alias, Window). Empty Alias counts usage
-// across all aliases for that key (the key-level aggregate); non-empty Alias
-// counts usage against that specific alias.
 func NewMemoryQuotaStore() QuotaStore {
 	return &memoryQuotaStore{values: make(map[string]quotaValue)}
 }
@@ -226,10 +222,7 @@ func (s *memoryQuotaStore) Charge(scope QuotaScope, limit int64, delta int64, no
 	value.used += delta
 	s.values[key] = value
 	status := quotaStatusFor(scope, limit, value.used, now)
-	// Charging an alias-scoped bucket also charges the key-aggregate bucket,
-	// so Peek(KeyID, "") reflects the true per-key spend. Without this
-	// the two counters would diverge and a heavy alias user could exceed
-	// the configured key-level daily quota.
+	// Alias charges also update the key-aggregate bucket to prevent quota drift.
 	if scope.Alias != "" {
 		aggregate := QuotaScope{KeyID: scope.KeyID, Window: scope.Window}
 		aggKey := bucketKey(aggregate)
@@ -252,8 +245,6 @@ func quotaStatusFor(scope QuotaScope, limit int64, used int64, now time.Time) Qu
 }
 
 func bucketKey(scope QuotaScope) string {
-	// Bucket keys are internal; the format is stable because the in-memory
-	// store only lives in this process and never persists.
 	return strconvItoa(int(scope.Window)) + "|" + scope.KeyID + "|" + scope.Alias
 }
 

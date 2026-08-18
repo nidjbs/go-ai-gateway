@@ -30,9 +30,8 @@ var sqliteIndexDefs = []struct{ name, column string }{
 
 const sqliteDDL = "" // populated by initSchema below; kept as a const ref point for tests.
 
-// init registers the SQLite driver with the usage registry. The factory
-// builds a *sql.DB via the bundled modernc.org/sqlite driver (no CGo), runs
-// the canonical schema, and returns a *SQLSink that implements io.Closer.
+// init registers the SQLite driver. The factory opens a *sql.DB via modernc.org/sqlite
+// (no CGo), runs the canonical schema, and returns a *SQLSink that implements io.Closer.
 func init() {
 	Registry.Register("sqlite", func(opts map[string]any) (Sink, error) {
 		path := stringOption(opts, "path", "usage.db")
@@ -101,8 +100,7 @@ func stringOption(opts map[string]any, key, def string) string {
 	return def
 }
 
-// intOption pulls an int from map[string]any (accepting int / int64 / float64
-// for YAML friendliness) with a default fallback.
+// intOption pulls an int from map[string]any (accepting int/int64/float64) with a default.
 func intOption(opts map[string]any, key string, def int) int {
 	if opts == nil {
 		return def

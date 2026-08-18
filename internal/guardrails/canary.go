@@ -7,21 +7,20 @@ import (
 )
 
 const (
-	// canaryPrefix 是所有 canary token 的前缀，用于在响应中快速定位。
-	// 使用 HTML 注释包裹后嵌入 system message 的隐藏字段，LLM 不会主动复述。
+	// canaryPrefix marks every canary token so it can be located quickly in responses.
 	canaryPrefix = "GW_CANARY_"
 	canaryTag    = "<!-- "
 	canarySuffix = " -->"
 )
 
-// CanaryToken 表示一个注入到请求中的追踪 token，用于检测系统提示泄露。
+// CanaryToken represents a tracking token injected into a request to detect system-prompt leakage.
 type CanaryToken struct {
-	Token     string // 完整 token，如 GW_CANARY_a1b2c3d4
-	Hidden    string // HTML 注释形式，如 <!-- GW_CANARY_a1b2c3d4 -->
-	FieldName string // 注入到的字段名，如 system_canary
+	Token     string // full token, e.g. GW_CANARY_a1b2c3d4
+	Hidden    string // HTML-comment form, e.g. <!-- GW_CANARY_a1b2c3d4 -->
+	FieldName string // injection field name, e.g. system_canary
 }
 
-// NewCanaryToken 生成一个新的 canary token。
+// NewCanaryToken generates a new canary token.
 func NewCanaryToken() CanaryToken {
 	b := make([]byte, 8)
 	rand.Read(b)
@@ -33,29 +32,25 @@ func NewCanaryToken() CanaryToken {
 	}
 }
 
-// CheckCanary 检查响应文本中是否包含 canary token（完整 token 或 HTML 注释形式均可）。
-// 如果包含，说明 system prompt 被 LLM 原样输出，发生了泄露。
+// CheckCanary checks whether the response contains the canary token. A hit
+// means the system prompt was echoed by the model and has leaked.
 func CheckCanary(response string, token CanaryToken) bool {
 	if token.Token == "" {
 		return false
 	}
-	// 快速路径：先检查前缀，避免全量 strings.Contains
 	if !strings.Contains(response, canaryPrefix) {
 		return false
 	}
-	// 精确匹配：完整 token 或 HTML 注释形式
 	return strings.Contains(response, token.Token) ||
 		strings.Contains(response, token.Hidden)
 }
 
-// InjectIntoMessages 将 canary token 注入到 messages 的隐藏字段中。
-// 如果存在 system message，在其 content 末尾追加 HTML 注释形式的 token；
-// 如果不存在，在消息列表末尾追加一条隐藏的 system message。
-// 返回注入后的 messages 和 canary token。
+// InjectIntoMessages embeds a canary token into the hidden system-message
+// field. If a system message exists, the token is appended; otherwise a
+// hidden system message is appended.
 func InjectIntoMessages(messages []Message) ([]Message, CanaryToken) {
 	canary := NewCanaryToken()
 
-	// 尝试在现有 system message 中注入
 	for i, msg := range messages {
 		if msg.Role == "system" {
 			content := msg.Content
@@ -66,7 +61,6 @@ func InjectIntoMessages(messages []Message) ([]Message, CanaryToken) {
 		}
 	}
 
-	// 没有 system message：追加一条隐藏的 system message
 	hidden := Message{
 		Role:    "system",
 		Content: "<!-- internal -->\n" + canary.Hidden,

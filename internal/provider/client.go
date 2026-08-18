@@ -6,17 +6,14 @@ import (
 	"time"
 )
 
-// Client manages per-provider HTTP clients so that each provider type gets
-// its own connection pool (Transport, idle-conn settings, TLS config, etc.)
-// without sharing state with other providers.
+// Client holds per-provider HTTP clients so each provider type gets its own connection pool.
 type Client struct {
 	httpClients map[string]*http.Client // key = provider type (e.g. "openai", "anthropic")
 	adapters    map[string]Adapter
 	defaultOpts ClientOpts
 }
 
-// ClientOpts controls the default Transport settings applied to every new
-// per-provider HTTP client created by buildHTTPClient.
+// ClientOpts controls default Transport settings for per-provider HTTP clients.
 type ClientOpts struct {
 	MaxIdleConns        int
 	MaxIdleConnsPerHost int
@@ -26,9 +23,7 @@ type ClientOpts struct {
 	Timeout             time.Duration
 }
 
-// defaultClientOpts returns the out-of-the-box settings matching
-// http.DefaultTransport so behaviour is unchanged for callers that do not
-// supply custom options.
+// defaultClientOpts matches http.DefaultTransport so callers that omit options get unchanged behavior.
 func defaultClientOpts() ClientOpts {
 	return ClientOpts{
 		MaxIdleConns:        100,
@@ -53,8 +48,7 @@ func newHTTPClient(opts ClientOpts) *http.Client {
 	}
 }
 
-// NewClientWithOpts is the same as NewClient but applies the supplied options
-// to every per-provider HTTP client.
+// NewClientWithOpts is like NewClient but applies the given options to every per-provider HTTP client.
 func NewClientWithOpts(opts ClientOpts) *Client {
 	c := &Client{
 		httpClients: make(map[string]*http.Client),
@@ -66,9 +60,7 @@ func NewClientWithOpts(opts ClientOpts) *Client {
 	return c
 }
 
-// HTTPClient returns the *http.Client for the given provider type.  If the
-// type is unknown the "openai" client is returned as a safe fallback because
-// most third-party providers expose an OpenAI-compatible REST API.
+// HTTPClient returns the *http.Client for the given provider type; unknown types fall back to "openai" then http.DefaultClient.
 func (c *Client) HTTPClient(providerType string) *http.Client {
 	if cl, ok := c.httpClients[providerType]; ok {
 		return cl
@@ -79,14 +71,12 @@ func (c *Client) HTTPClient(providerType string) *http.Client {
 	return http.DefaultClient
 }
 
-// SetHTTPClient replaces the *http.Client for a specific provider type.  This
-// is used by the gateway to wrap the Transport with oTel tracing after the
-// Client has been constructed, without affecting other providers.
+// SetHTTPClient replaces the *http.Client for a specific provider type (e.g. to wrap Transport with oTel tracing).
 func (c *Client) SetHTTPClient(providerType string, cl *http.Client) {
 	c.httpClients[providerType] = cl
 }
 
-// RegisteredTypes returns the set of provider types that have their own pool.
+// RegisteredTypes returns the sorted provider types that have their own pool.
 func (c *Client) RegisteredTypes() []string {
 	types := make([]string, 0, len(c.httpClients))
 	for t := range c.httpClients {

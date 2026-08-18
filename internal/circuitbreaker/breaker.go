@@ -1,19 +1,7 @@
-// Package circuitbreaker provides a per-key circuit breaker used by the
-// gateway to short-circuit calls to a failing provider+upstream pair.
+// Package circuitbreaker provides a per-key circuit breaker. The breaker is keyed
+// by an opaque string and is safe for concurrent use.
 //
-// The breaker is keyed by an opaque string (callers typically use
-// "provider_name|base_url" so that two upstreams fronted by the same provider
-// type are tracked independently). It is safe for concurrent use.
-//
-// State machine:
-//
-//	Closed   - requests pass through. Consecutive failures ≥ FailureThreshold
-//	           open the breaker.
-//	Open     - requests are rejected with ErrOpen. After OpenDuration elapses
-//	           the breaker transitions to Half-Open.
-//	Half-Open - up to HalfOpenMaxRequests probe requests pass through. The
-//	           first failure re-opens the breaker (resetting OpenDuration);
-//	           HalfOpenSuccessThreshold consecutive successes close it.
+// State machine: Closed (failures trip open) → Open (rejects) → Half-Open (probes) → Closed.
 package circuitbreaker
 
 import (
@@ -43,12 +31,9 @@ func (s State) String() string {
 }
 
 // ErrOpen is returned by Allow when the breaker is open and rejecting calls.
-// Callers should treat it as a retryable, non-counted failure: it is not the
-// fault of the upstream, just a policy decision.
 var ErrOpen = errors.New("circuit breaker is open")
 
-// Config controls breaker behavior. Zero values fall back to safe defaults
-// applied by NewConfig.
+// Config controls breaker behavior. Zero values fall back to safe defaults.
 type Config struct {
 	// FailureThreshold is the number of consecutive failures in Closed state
 	// that trip the breaker open. Must be ≥ 1.
@@ -74,16 +59,11 @@ func NewConfig() Config {
 	}
 }
 
-// Breaker is the public interface. Implementations must be safe for concurrent
-// use.
+// Breaker is the public interface; implementations must be safe for concurrent use.
 type Breaker interface {
-	// Allow reports whether a call to the given key is permitted now. When
-	// the breaker is open it returns ErrOpen along with the time remaining
-	// until the next Half-Open probe window opens.
+	// Allow reports whether a call is permitted; returns ErrOpen when open.
 	Allow(key string, now time.Time) error
-	// Record records the outcome of a call to key. err == nil indicates
-	// success. The breaker updates its internal state machine based on the
-	// current state and the outcome.
+	// Record reports the outcome of a call; the breaker updates its state machine.
 	Record(key string, now time.Time, err error)
 }
 
@@ -98,8 +78,7 @@ type entry struct {
 	halfOpenSucc int
 }
 
-// New returns an in-process Breaker keyed by string. State is held in memory
-// only; restarting the gateway resets every breaker.
+// New returns an in-process Breaker. State is held in memory only.
 func New(cfg Config) Breaker {
 	if cfg.FailureThreshold < 1 {
 		cfg.FailureThreshold = 5

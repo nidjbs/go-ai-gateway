@@ -34,10 +34,7 @@ const (
 )
 
 // QuotaScope identifies which bucket of a QuotaStore a call targets.
-//
-// Alias is empty for key-aggregate quotas (daily/monthly totals across all
-// aliases the key has hit). When Alias is non-empty the bucket counts only
-// tokens used against that alias.
+// Alias is empty for key-aggregate quotas; non-empty targets a specific alias.
 type QuotaScope struct {
 	KeyID  string
 	Alias  string
@@ -54,13 +51,8 @@ type QuotaStatus struct {
 	ResetAt   time.Time
 }
 
-// QuotaStore tracks per-key and per-(key, alias) token usage across multiple
-// time windows.
-//
-// Peek returns the current status without consuming tokens. Charge adds
-// delta tokens and returns the resulting status.
-//
-// Implementations must be safe for concurrent use.
+// QuotaStore tracks per-key and per-(key, alias) token usage.
+// Peek returns status without consuming tokens; Charge adds tokens.
 type QuotaStore interface {
 	Peek(scope QuotaScope, limit int64, now time.Time) QuotaStatus
 	Charge(scope QuotaScope, limit int64, delta int64, now time.Time) QuotaStatus

@@ -28,8 +28,6 @@ func writeRateLimitHeaders(w http.ResponseWriter, limits config.KeyLimits, decis
 }
 
 // writeQuotaHeaders emits X-Quota-* response headers for the supplied status.
-// Header names carry the window so clients can tell daily from monthly from
-// per-alias counters apart.
 func writeQuotaHeaders(w http.ResponseWriter, status ratelimit.QuotaStatus) {
 	if status.Limit <= 0 {
 		return
@@ -43,8 +41,7 @@ func writeQuotaHeaders(w http.ResponseWriter, status ratelimit.QuotaStatus) {
 			w.Header().Set("X-Quota-Monthly-Reset-At", status.ResetAt.UTC().Format(time.RFC3339))
 		}
 	default:
-		// Daily quota — both key-aggregate and per-alias share the prefix;
-		// the X-Quota-Alias header (when set) disambiguates.
+		// Daily quota; X-Quota-Alias header disambiguates per-alias from key-level.
 		w.Header().Set("X-Quota-Limit-Tokens", strconv.FormatInt(status.Limit, 10))
 		w.Header().Set("X-Quota-Used-Tokens", strconv.FormatInt(status.Used, 10))
 		w.Header().Set("X-Quota-Remaining-Tokens", strconv.FormatInt(status.Remaining, 10))

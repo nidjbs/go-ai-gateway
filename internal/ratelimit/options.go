@@ -2,9 +2,7 @@ package ratelimit
 
 import "time"
 
-// These helpers decode driver options with sensible defaults. Each
-// implementation understands only the fields it advertises; the helpers
-// just smooth out the YAML → Go type conversions.
+// Helpers decode driver options with sensible defaults.
 
 func stringOption(opts map[string]any, key, def string) string {
 	if opts == nil {
