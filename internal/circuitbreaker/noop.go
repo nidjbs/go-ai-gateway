@@ -6,5 +6,5 @@ import "time"
 // breaking is disabled in configuration.
 type Noop struct{}
 
-func (Noop) Allow(string, time.Time) error { return nil }
+func (Noop) Allow(string, time.Time) error   { return nil }
 func (Noop) Record(string, time.Time, error) {}

@@ -67,10 +67,10 @@ type Config struct {
 // NewConfig returns Config populated with sensible defaults.
 func NewConfig() Config {
 	return Config{
-		FailureThreshold:          5,
-		OpenDuration:              30 * time.Second,
-		HalfOpenMaxRequests:       1,
-		HalfOpenSuccessThreshold:  1,
+		FailureThreshold:         5,
+		OpenDuration:             30 * time.Second,
+		HalfOpenMaxRequests:      1,
+		HalfOpenSuccessThreshold: 1,
 	}
 }
 
@@ -91,11 +91,11 @@ type Breaker interface {
 type entry struct {
 	mu sync.Mutex
 
-	state         State
-	failures      int
-	openedAt      time.Time
-	halfOpenBusy  int
-	halfOpenSucc  int
+	state        State
+	failures     int
+	openedAt     time.Time
+	halfOpenBusy int
+	halfOpenSucc int
 }
 
 // New returns an in-process Breaker keyed by string. State is held in memory

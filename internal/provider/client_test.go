@@ -109,4 +109,3 @@ func TestSetHTTPClientReplacesPool(t *testing.T) {
 		t.Error("SetHTTPClient did not replace the openai pool")
 	}
 }
-

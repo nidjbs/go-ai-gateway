@@ -14,8 +14,8 @@ import (
 // Limiter caps the number of concurrent holders. A nil Limiter is valid and
 // behaves as unlimited (TryAcquire always returns true, Release is a no-op).
 type Limiter struct {
-	max   int
-	sem   chan struct{}
+	max int
+	sem chan struct{}
 }
 
 // New returns a Limiter that allows up to max concurrent holders. max=0
