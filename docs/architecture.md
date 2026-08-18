@@ -34,6 +34,6 @@ Lightweight, zero-external-dependency security layer:
 
 Operates in `flag` (log only) or `block` (reject) mode. Default: `off`.
 
-## Design Principles
+## Distributed State
 
-The runtime intentionally has no database, queue, or warehouse dependency. Authentication, usage reporting, and guardrails are interfaces so deployments can add those concerns without coupling them to proxy execution.
+Rate limits, token quotas, and guardrail tracking default to process-local memory. In a multi-replica deployment, configure the Redis drivers for the shared state you need; the Docker example provides the expected `rate_limit`, `quota`, and Redis address settings. Redis-backed hot paths fail open when the backend is temporarily unavailable, so availability is preserved at the cost of temporarily relaxed enforcement.
