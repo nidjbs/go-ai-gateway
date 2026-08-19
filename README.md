@@ -4,7 +4,7 @@ A lightweight, OpenAI-compatible AI gateway for routing model aliases across Ope
 
 ## Quick Start
 
-Requirements: Go 1.22+ and an upstream compatible with the configured provider.
+Requirements: Go 1.26+ and an upstream compatible with the configured provider.
 
 ```bash
 cp configs/config.example.yaml configs/config.yaml
