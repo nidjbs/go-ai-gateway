@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -127,5 +128,149 @@ func TestAnthropicStreamMapsTextAndUsage(t *testing.T) {
 	}
 	if !textSeen || done.InputTokens != 4 || done.OutputTokens != 3 {
 		t.Fatalf("text=%v done=%+v", textSeen, done)
+	}
+}
+
+func decodeAnthropicWire(t *testing.T, body []byte) anthropicWireRequest {
+	t.Helper()
+	var wire anthropicWireRequest
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
+func TestAnthropicStopSequenceString(t *testing.T) {
+	body, err := anthropicRequest(json.RawMessage(`{"model":"chat","stop":"END","messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := decodeAnthropicWire(t, body)
+	if len(wire.StopSequences) != 1 || wire.StopSequences[0] != "END" {
+		t.Fatalf("stop_sequences = %#v", wire.StopSequences)
+	}
+}
+
+func TestAnthropicStopSequenceArray(t *testing.T) {
+	body, err := anthropicRequest(json.RawMessage(`{"model":"chat","stop":["END","STOP","###"],"messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := decodeAnthropicWire(t, body)
+	if len(wire.StopSequences) != 3 || wire.StopSequences[1] != "STOP" {
+		t.Fatalf("stop_sequences = %#v", wire.StopSequences)
+	}
+}
+
+func TestAnthropicStopSequenceTooMany(t *testing.T) {
+	_, err := anthropicRequest(json.RawMessage(`{"model":"chat","stop":["a","b","c","d","e"],"messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err == nil || !strings.Contains(err.Error(), "stop") {
+		t.Fatalf("expected stop error, got %v", err)
+	}
+}
+
+func TestAnthropicStopSequenceEmpty(t *testing.T) {
+	_, err := anthropicRequest(json.RawMessage(`{"model":"chat","stop":"","messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err == nil || !strings.Contains(err.Error(), "stop") {
+		t.Fatalf("expected stop error, got %v", err)
+	}
+}
+
+func TestAnthropicTopKForwards(t *testing.T) {
+	body, err := anthropicRequest(json.RawMessage(`{"model":"chat","top_k":40,"messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := decodeAnthropicWire(t, body)
+	if wire.TopK == nil || *wire.TopK != 40 {
+		t.Fatalf("top_k = %v, want 40", wire.TopK)
+	}
+}
+
+func TestAnthropicSeedForwards(t *testing.T) {
+	body, err := anthropicRequest(json.RawMessage(`{"model":"chat","seed":12345,"messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := decodeAnthropicWire(t, body)
+	if wire.Seed == nil || *wire.Seed != 12345 {
+		t.Fatalf("seed = %v, want 12345", wire.Seed)
+	}
+}
+
+func TestAnthropicThinkingForwards(t *testing.T) {
+	thinking := json.RawMessage(`{"type":"enabled","budget_tokens":2048}`)
+	body, err := anthropicRequest(json.RawMessage(`{"model":"chat","thinking":`+string(thinking)+`,"messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := decodeAnthropicWire(t, body)
+	var decoded map[string]any
+	if err := json.Unmarshal(wire.Thinking, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["type"] != "enabled" || int(decoded["budget_tokens"].(float64)) != 2048 {
+		t.Fatalf("thinking = %#v", decoded)
+	}
+}
+
+func TestAnthropicParallelToolCallsTrueAccepted(t *testing.T) {
+	body, err := anthropicRequest(json.RawMessage(`{"model":"chat","parallel_tool_calls":true,"messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := decodeAnthropicWire(t, body)
+	if len(wire.Messages) == 0 {
+		t.Fatalf("messages missing: %#v", wire)
+	}
+}
+
+func TestAnthropicParallelToolCallsFalseRejected(t *testing.T) {
+	_, err := anthropicRequest(json.RawMessage(`{"model":"chat","parallel_tool_calls":false,"messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err == nil || !strings.Contains(err.Error(), "parallel_tool_calls") {
+		t.Fatalf("expected parallel_tool_calls error, got %v", err)
+	}
+}
+
+func TestAnthropicRejectsNewUnsupported(t *testing.T) {
+	cases := map[string]string{
+		"user":              `"user-123"`,
+		"presence_penalty":  `0.5`,
+		"frequency_penalty": `0.5`,
+		"logprobs":          `true`,
+		"top_logprobs":      `5`,
+		"service_tier":      `"auto"`,
+	}
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"model":"chat","%s":%s,"messages":[{"role":"user","content":"hi"}]}`, name, value)
+			_, err := anthropicRequest(json.RawMessage(body), "claude-test", false)
+			if err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("expected %s error, got %v", name, err)
+			}
+		})
+	}
+}
+
+func TestAnthropicAllNewParamsCombined(t *testing.T) {
+	body, err := anthropicRequest(json.RawMessage(`{"model":"chat","temperature":0.7,"top_p":0.9,"top_k":50,"seed":7,"stop":["END"],"messages":[{"role":"user","content":"hi"}]}`), "claude-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := decodeAnthropicWire(t, body)
+	if wire.Temperature == nil || *wire.Temperature != 0.7 {
+		t.Fatalf("temperature = %v", wire.Temperature)
+	}
+	if wire.TopP == nil || *wire.TopP != 0.9 {
+		t.Fatalf("top_p = %v", wire.TopP)
+	}
+	if wire.TopK == nil || *wire.TopK != 50 {
+		t.Fatalf("top_k = %v", wire.TopK)
+	}
+	if wire.Seed == nil || *wire.Seed != 7 {
+		t.Fatalf("seed = %v", wire.Seed)
+	}
+	if len(wire.StopSequences) != 1 || wire.StopSequences[0] != "END" {
+		t.Fatalf("stop_sequences = %#v", wire.StopSequences)
 	}
 }

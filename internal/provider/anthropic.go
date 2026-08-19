@@ -101,6 +101,9 @@ type openAIRequest struct {
 	MaxTokens         *int            `json:"max_tokens"`
 	Temperature       *float64        `json:"temperature"`
 	TopP              *float64        `json:"top_p"`
+	TopK              *int            `json:"top_k"`
+	Seed              *int            `json:"seed"`
+	Stop              json.RawMessage `json:"stop"`
 	Stream            bool            `json:"stream"`
 	Metadata          json.RawMessage `json:"metadata"`
 	ResponseFormat    json.RawMessage `json:"response_format"`
@@ -109,13 +112,14 @@ type openAIRequest struct {
 	TopLogprobs       json.RawMessage `json:"top_logprobs"`
 	PresencePenalty   json.RawMessage `json:"presence_penalty"`
 	FrequencyPenalty  json.RawMessage `json:"frequency_penalty"`
-	Seed              json.RawMessage `json:"seed"`
-	N                 *int            `json:"n"`
+	ServiceTier       json.RawMessage `json:"service_tier"`
 	User              json.RawMessage `json:"user"`
+	N                 *int            `json:"n"`
 	Modalities        json.RawMessage `json:"modalities"`
 	Audio             json.RawMessage `json:"audio"`
 	ReasoningEffort   json.RawMessage `json:"reasoning_effort"`
 	Reasoning         json.RawMessage `json:"reasoning"`
+	Thinking          json.RawMessage `json:"thinking"`
 }
 
 type openAIMessage struct {
@@ -145,16 +149,20 @@ type openAIToolCall struct {
 }
 
 type anthropicWireRequest struct {
-	Model       string             `json:"model"`
-	MaxTokens   int                `json:"max_tokens"`
-	System      string             `json:"system,omitempty"`
-	Messages    []anthropicMessage `json:"messages"`
-	Tools       []anthropicTool    `json:"tools,omitempty"`
-	ToolChoice  any                `json:"tool_choice,omitempty"`
-	Temperature *float64           `json:"temperature,omitempty"`
-	TopP        *float64           `json:"top_p,omitempty"`
-	Stream      bool               `json:"stream,omitempty"`
-	Metadata    json.RawMessage    `json:"metadata,omitempty"`
+	Model         string             `json:"model"`
+	MaxTokens     int                `json:"max_tokens"`
+	System        string             `json:"system,omitempty"`
+	Messages      []anthropicMessage `json:"messages"`
+	Tools         []anthropicTool    `json:"tools,omitempty"`
+	ToolChoice    any                `json:"tool_choice,omitempty"`
+	Temperature   *float64           `json:"temperature,omitempty"`
+	TopP          *float64           `json:"top_p,omitempty"`
+	TopK          *int               `json:"top_k,omitempty"`
+	Seed          *int               `json:"seed,omitempty"`
+	StopSequences []string           `json:"stop_sequences,omitempty"`
+	Stream        bool               `json:"stream,omitempty"`
+	Metadata      json.RawMessage    `json:"metadata,omitempty"`
+	Thinking      json.RawMessage    `json:"thinking,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -179,13 +187,18 @@ func anthropicRequest(raw json.RawMessage, model string, stream bool) ([]byte, e
 	if len(in.Messages) == 0 {
 		return nil, &RequestError{Message: "messages are required"}
 	}
-	out := anthropicWireRequest{Model: model, MaxTokens: 1024, Temperature: in.Temperature, TopP: in.TopP, Stream: stream, Metadata: in.Metadata}
+	out := anthropicWireRequest{Model: model, MaxTokens: 1024, Temperature: in.Temperature, TopP: in.TopP, TopK: in.TopK, Seed: in.Seed, Stream: stream, Metadata: in.Metadata, Thinking: in.Thinking}
 	if in.MaxTokens != nil {
 		if *in.MaxTokens <= 0 {
 			return nil, &RequestError{Message: "max_tokens must be greater than zero"}
 		}
 		out.MaxTokens = *in.MaxTokens
 	}
+	stop, err := parseStop(in.Stop)
+	if err != nil {
+		return nil, err
+	}
+	out.StopSequences = stop
 	for _, tool := range in.Tools {
 		if tool.Type != "function" || strings.TrimSpace(tool.Function.Name) == "" || len(tool.Function.Parameters) == 0 {
 			return nil, &RequestError{Message: "only function tools with name and parameters are supported for Anthropic providers"}
@@ -210,13 +223,22 @@ func anthropicRequest(raw json.RawMessage, model string, stream bool) ([]byte, e
 
 func rejectUnsupported(in openAIRequest) error {
 	for name, value := range map[string]json.RawMessage{
-		"response_format": in.ResponseFormat, "parallel_tool_calls": in.ParallelToolCalls, "logprobs": in.Logprobs,
-		"top_logprobs": in.TopLogprobs, "presence_penalty": in.PresencePenalty, "frequency_penalty": in.FrequencyPenalty,
-		"seed": in.Seed, "user": in.User, "modalities": in.Modalities, "audio": in.Audio,
+		"response_format": in.ResponseFormat, "logprobs": in.Logprobs,
+		"top_logprobs": in.TopLogprobs, "presence_penalty": in.PresencePenalty,
+		"frequency_penalty": in.FrequencyPenalty, "service_tier": in.ServiceTier,
+		"user": in.User, "modalities": in.Modalities, "audio": in.Audio,
 		"reasoning_effort": in.ReasoningEffort, "reasoning": in.Reasoning,
 	} {
 		if len(value) > 0 && string(value) != "null" {
 			return unsupportedField(name)
+		}
+	}
+	// Anthropic always permits parallel tool calls; we accept true/null/absent
+	// and reject an explicit false (which the provider cannot honor).
+	if len(in.ParallelToolCalls) > 0 && string(in.ParallelToolCalls) != "null" {
+		var b bool
+		if err := json.Unmarshal(in.ParallelToolCalls, &b); err != nil || !b {
+			return unsupportedField("parallel_tool_calls: false")
 		}
 	}
 	if in.N != nil && *in.N != 1 {
@@ -252,6 +274,32 @@ func anthropicToolChoice(raw json.RawMessage) (any, error) {
 		return nil, &RequestError{Message: "unsupported tool_choice"}
 	}
 	return map[string]string{"type": "tool", "name": choice.Function.Name}, nil
+}
+
+func parseStop(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		if strings.TrimSpace(single) == "" {
+			return nil, &RequestError{Message: "stop sequence must not be empty"}
+		}
+		return []string{single}, nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return nil, &RequestError{Message: "stop must be a string or array of strings"}
+	}
+	if len(many) > 4 {
+		return nil, &RequestError{Message: "stop sequences are limited to 4"}
+	}
+	for _, s := range many {
+		if strings.TrimSpace(s) == "" {
+			return nil, &RequestError{Message: "stop sequences must not be empty"}
+		}
+	}
+	return many, nil
 }
 
 func anthropicMessages(in []openAIMessage) ([]anthropicMessage, string, error) {
