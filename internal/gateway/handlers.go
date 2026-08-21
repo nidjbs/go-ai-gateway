@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/tidwall/sjson"
 
 	"example.com/light-llm-gateway/internal/apierr"
 	"example.com/light-llm-gateway/internal/auth"
@@ -52,8 +53,7 @@ type usageRecord struct {
 	endpoint      string
 	alias         string
 	candidate     routing.Candidate
-	input         int
-	output        int
+	usage         provider.Usage
 	ttft          time.Time
 	streaming     bool
 	status        int
@@ -68,8 +68,7 @@ type metricsRecord struct {
 	endpoint   string
 	alias      string
 	candidate  routing.Candidate
-	input      int
-	output     int
+	usage      provider.Usage
 	firstToken time.Time
 	status     int
 	errorType  string
@@ -219,17 +218,17 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
-		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.InputTokens+result.OutputTokens))
+		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.Usage.Total()))
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.recordUsage(r.Context(), usageRecord{
 		started: started, endpoint: "chat.completions", alias: request.Model, candidate: candidate,
-		input: result.InputTokens, output: result.OutputTokens,
+		usage:  result.Usage,
 		status: http.StatusOK, attempts: attempts,
 	})
 	h.recordMetrics(r.Context(), metricsRecord{
 		started: started, endpoint: "chat.completions", alias: request.Model, candidate: candidate,
-		input: result.InputTokens, output: result.OutputTokens, status: http.StatusOK,
+		usage: result.Usage, status: http.StatusOK,
 	})
 	h.logger.Info("request complete", "request_id", requestID(r), "endpoint", "chat.completions", "provider", candidate.Name, "attempts", attempts.Total, "status", http.StatusOK, "upstream_duration_ms", time.Since(started).Milliseconds())
 }
@@ -371,17 +370,17 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
-				h.chargeQuota(w, principal.APIKeyID, alias, int64(event.InputTokens+event.OutputTokens))
+				h.chargeQuota(w, principal.APIKeyID, alias, int64(event.Usage.Total()))
 			}
 			h.recordUsage(r.Context(), usageRecord{
 				started: started, endpoint: "chat.completions", alias: alias, candidate: candidate,
-				input: event.InputTokens, output: event.OutputTokens,
-				ttft: firstToken, streaming: true,
+				usage: event.Usage,
+				ttft:  firstToken, streaming: true,
 				status: http.StatusOK, streamOutcome: "completed", attempts: attempts,
 			})
 			h.recordMetrics(r.Context(), metricsRecord{
 				started: started, endpoint: "chat.completions", alias: alias, candidate: candidate,
-				input: event.InputTokens, output: event.OutputTokens,
+				usage:      event.Usage,
 				firstToken: firstToken, status: http.StatusOK,
 			})
 			return
@@ -401,18 +400,35 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 }
 
 // streamOutcomeFor classifies a stream error into (errorType, streamOutcome, status).
-// Client cancellation is 499; everything else is upstream_error/502.
+// Client cancellation is 499; ProviderError kinds are mapped to their canonical labels;
+// everything else is upstream_error/502. Upstream HTTP statuses are sanitised to 502.
 func streamOutcomeFor(streamErr error, reqCtx context.Context) (errorType, streamOutcome string, status int) {
 	if errors.Is(streamErr, context.Canceled) || errors.Is(reqCtx.Err(), context.Canceled) {
 		return "client_aborted", "client_aborted", 499
+	}
+	var pe *provider.ProviderError
+	if errors.As(streamErr, &pe) {
+		switch pe.Kind {
+		case provider.ErrorKindProtocol:
+			return "upstream_protocol_error", "upstream_protocol_error", http.StatusBadGateway
+		case provider.ErrorKindTimeout:
+			return "upstream_timeout", "upstream_timeout", http.StatusGatewayTimeout
+		case provider.ErrorKindCanceled:
+			return "client_aborted", "client_aborted", 499
+		case provider.ErrorKindNetwork:
+			return "upstream_network_error", "upstream_network_error", http.StatusBadGateway
+		case provider.ErrorKindUpstream:
+			return "upstream_error", "upstream_error", http.StatusBadGateway
+		}
 	}
 	return "upstream_error", "upstream_error", http.StatusBadGateway
 }
 
 func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
+	started := h.now()
 	body, err := readBody(w, r)
 	if err != nil {
-		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
+		h.writeInvalidRequest(w, r, started, "", routing.Candidate{}, err.Error())
 		return
 	}
 	var request struct {
@@ -420,22 +436,22 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		Input json.RawMessage `json:"input"`
 	}
 	if err := json.Unmarshal(body, &request); err != nil || strings.TrimSpace(request.Model) == "" || !validEmbeddingInput(request.Input) {
-		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", "model and a non-empty input are required")
+		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "model and a non-empty input are required")
 		return
 	}
 	candidates, err := routing.Resolve(h.config, request.Model)
 	if err != nil {
-		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
+		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
 		return
 	}
 	adapterRequest := provider.Request{Operation: provider.Embeddings, Body: body}
 	candidates, err = h.provider.Filter(candidates, adapterRequest)
 	if err != nil {
-		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
+		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
 		return
 	}
 	if len(candidates) == 0 {
-		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", "no configured provider supports embeddings")
+		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "no configured provider supports embeddings")
 		return
 	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
@@ -443,7 +459,6 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	started := h.now()
 	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
 		return h.provider.Do(ctx, adapterRequest, c)
 	})
@@ -452,35 +467,38 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
-		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.InputTokens+result.OutputTokens))
+		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.Usage.Total()))
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.recordUsage(r.Context(), usageRecord{
 		started: started, endpoint: "embeddings", alias: request.Model, candidate: candidate,
-		input: result.InputTokens, output: result.OutputTokens,
+		usage:  result.Usage,
 		status: http.StatusOK, attempts: attempts,
 	})
 	h.recordMetrics(r.Context(), metricsRecord{
 		started: started, endpoint: "embeddings", alias: request.Model, candidate: candidate,
-		input: result.InputTokens, output: result.OutputTokens, status: http.StatusOK,
+		usage: result.Usage, status: http.StatusOK,
 	})
 }
 
 // writeProviderError converts an upstream failure into a client response and
-// audit/metrics entry. Provider RequestError → 400; otherwise sanitised 502.
+// audit/metrics entry. Provider RequestError → 400; ProviderError.Kind drives
+// the error_type/stream_outcome mapping; everything else falls back to 502.
 func (h handler) writeProviderError(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, candidate routing.Candidate, streaming bool, err error) {
 	var requestErr *provider.RequestError
 	if errors.As(err, &requestErr) {
+		h.recordUsage(r.Context(), usageRecord{
+			started: started, endpoint: endpoint, alias: alias, candidate: candidate,
+			streaming: streaming, status: http.StatusBadRequest, errorType: "invalid_request",
+		})
+		h.recordMetrics(r.Context(), metricsRecord{
+			started: started, endpoint: endpoint, alias: alias, candidate: candidate,
+			status: http.StatusBadRequest, errorType: "invalid_request",
+		})
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", requestErr.Error())
 		return
 	}
-	errorType := "upstream_error"
-	errorCode := "upstream_error"
-	status := http.StatusBadGateway
-	if errors.Is(err, circuitbreaker.ErrOpen) {
-		errorType = "upstream_unavailable"
-		errorCode = "upstream_unavailable"
-	}
+	errorType, errorCode, status := classifyProviderError(err)
 	h.recordUsage(r.Context(), usageRecord{
 		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
 		streaming: streaming, status: status, errorType: errorType, attempts: retry.Attempts{},
@@ -489,8 +507,44 @@ func (h handler) writeProviderError(w http.ResponseWriter, r *http.Request, star
 		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
 		status: status, errorType: errorType,
 	})
-	h.logger.Warn("upstream request failed", "request_id", requestID(r), "endpoint", endpoint, "error", err)
+	h.logger.Warn("upstream request failed", "request_id", requestID(r), "endpoint", endpoint, "error", err, "error_type", errorType)
 	apierr.Write(w, status, errorCode, "api_error", upstreamErrorMessage)
+}
+
+// classifyProviderError maps any error returned from a retry attempt into the
+// (errorType, errorCode, httpStatus) tuple used by the gateway's audit/metrics
+// and client error envelopes. ProviderError is the preferred signal; legacy
+// HTTPError/RequestError are still recognised for backward compatibility.
+// Upstream HTTP statuses are always sanitised to 502 so that the gateway never
+// surfaces 4xx codes from the upstream to the client.
+func classifyProviderError(err error) (errorType, errorCode string, status int) {
+	var pe *provider.ProviderError
+	if errors.As(err, &pe) {
+		switch pe.Kind {
+		case provider.ErrorKindProtocol:
+			return "upstream_protocol_error", "upstream_protocol_error", http.StatusBadGateway
+		case provider.ErrorKindUpstream:
+			return "upstream_error", "upstream_error", http.StatusBadGateway
+		case provider.ErrorKindTimeout:
+			return "upstream_timeout", "upstream_timeout", http.StatusGatewayTimeout
+		case provider.ErrorKindCanceled:
+			return "client_aborted", "client_aborted", 499
+		case provider.ErrorKindNetwork:
+			return "upstream_network_error", "upstream_network_error", http.StatusBadGateway
+		case provider.ErrorKindInvalidRequest:
+			return "invalid_request", "invalid_request", http.StatusBadRequest
+		case provider.ErrorKindUnknown:
+			return "upstream_error", "upstream_error", http.StatusBadGateway
+		}
+	}
+	if errors.Is(err, circuitbreaker.ErrOpen) {
+		return "upstream_unavailable", "upstream_unavailable", http.StatusBadGateway
+	}
+	var httpErr *provider.HTTPError
+	if errors.As(err, &httpErr) {
+		return "upstream_error", "upstream_error", http.StatusBadGateway
+	}
+	return "upstream_error", "upstream_error", http.StatusBadGateway
 }
 
 func readBody(w http.ResponseWriter, r *http.Request) (json.RawMessage, error) {
@@ -519,14 +573,12 @@ func validEmbeddingInput(raw json.RawMessage) bool {
 	return true
 }
 
+// replaceModel rewrites the "model" field in the response body using sjson's
+// path-aware JSON mutation so the caller's requested alias is reflected back
+// regardless of how the upstream reshaped the payload. Invalid JSON falls back
+// to the original body.
 func replaceModel(body []byte, model string) []byte {
-	var value map[string]json.RawMessage
-	if json.Unmarshal(body, &value) != nil {
-		return body
-	}
-	encoded, _ := json.Marshal(model)
-	value["model"] = encoded
-	out, err := json.Marshal(value)
+	out, err := sjson.SetBytes(body, "model", model)
 	if err != nil {
 		return body
 	}
@@ -565,13 +617,15 @@ func (h handler) recordMetrics(ctx context.Context, rec metricsRecord) {
 			StartedAt:     rec.started,
 		},
 		metrics.Result{
-			StatusCode:    rec.status,
-			ErrorType:     rec.errorType,
-			ResponseModel: rec.candidate.Model,
-			InputTokens:   rec.input,
-			OutputTokens:  rec.output,
-			FirstTokenAt:  rec.firstToken,
-			CompletedAt:   h.now(),
+			StatusCode:          rec.status,
+			ErrorType:           rec.errorType,
+			ResponseModel:       rec.candidate.Model,
+			InputTokens:         rec.usage.InputTokens,
+			OutputTokens:        rec.usage.OutputTokens,
+			CacheReadTokens:     rec.usage.CacheReadTokens,
+			CacheCreationTokens: rec.usage.CacheCreationTokens,
+			FirstTokenAt:        rec.firstToken,
+			CompletedAt:         h.now(),
 		},
 	)
 }
@@ -579,33 +633,37 @@ func (h handler) recordMetrics(ctx context.Context, rec metricsRecord) {
 func (h handler) recordUsage(ctx context.Context, rec usageRecord) {
 	completed := h.now()
 	principal, _ := auth.PrincipalFromContext(ctx)
+	total := rec.usage.Total()
 	event := usage.Event{
-		EventID:        usage.NewEventID(),
-		RequestID:      middleware.GetReqID(ctx),
-		APIKeyID:       principal.APIKeyID,
-		TeamID:         principal.TeamID,
-		Endpoint:       rec.endpoint,
-		Alias:          rec.alias,
-		RequestedModel: rec.alias,
-		ResolvedModel:  rec.candidate.Model,
-		Provider:       rec.candidate.Name,
-		UpstreamModel:  rec.candidate.Model,
-		ErrorType:      rec.errorType,
-		StreamOutcome:  rec.streamOutcome,
-		StatusCode:     rec.status,
-		Success:        rec.status >= 200 && rec.status < 300,
-		Streaming:      rec.streaming,
-		AttemptCount:   rec.attempts.Total,
-		RetryCount:     rec.attempts.Retries,
-		FailoverCount:  rec.attempts.Failovers,
-		InputTokens:    rec.input,
-		OutputTokens:   rec.output,
-		TotalTokens:    rec.input + rec.output,
-		DurationMS:     completed.Sub(rec.started).Milliseconds(),
-		StartedAt:      rec.started,
-		CompletedAt:    completed,
-		ClientIP:       clientIP(ctx),
-		UserAgent:      userAgent(ctx),
+		EventID:             usage.NewEventID(),
+		RequestID:           middleware.GetReqID(ctx),
+		APIKeyID:            principal.APIKeyID,
+		TeamID:              principal.TeamID,
+		Endpoint:            rec.endpoint,
+		Alias:               rec.alias,
+		RequestedModel:      rec.alias,
+		ResolvedModel:       rec.candidate.Model,
+		Provider:            rec.candidate.Name,
+		UpstreamModel:       rec.candidate.Model,
+		ErrorType:           rec.errorType,
+		StreamOutcome:       rec.streamOutcome,
+		StatusCode:          rec.status,
+		Success:             rec.status >= 200 && rec.status < 300,
+		Streaming:           rec.streaming,
+		AttemptCount:        rec.attempts.Total,
+		RetryCount:          rec.attempts.Retries,
+		FailoverCount:       rec.attempts.Failovers,
+		InputTokens:         rec.usage.InputTokens,
+		OutputTokens:        rec.usage.OutputTokens,
+		TotalTokens:         total,
+		CacheReadTokens:     rec.usage.CacheReadTokens,
+		CacheCreationTokens: rec.usage.CacheCreationTokens,
+		ReasoningTokens:     rec.usage.ReasoningTokens,
+		DurationMS:          completed.Sub(rec.started).Milliseconds(),
+		StartedAt:           rec.started,
+		CompletedAt:         completed,
+		ClientIP:            clientIP(ctx),
+		UserAgent:           userAgent(ctx),
 	}
 	if !rec.ttft.IsZero() {
 		event.TimeToFirstTokenMS = rec.ttft.Sub(rec.started).Milliseconds()

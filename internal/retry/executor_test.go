@@ -139,6 +139,51 @@ func TestBackoffDurationAppliesJitter(t *testing.T) {
 	}
 }
 
+func TestRetryableProviderErrorKinds(t *testing.T) {
+	cfg := config.RetryConfig{RetryableStatuses: []int{503}}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"protocol never retryable", &provider.ProviderError{Kind: provider.ErrorKindProtocol}, false},
+		{"invalid_request never retryable", &provider.ProviderError{Kind: provider.ErrorKindInvalidRequest}, false},
+		{"canceled never retryable", &provider.ProviderError{Kind: provider.ErrorKindCanceled}, false},
+		{"network always retryable", &provider.ProviderError{Kind: provider.ErrorKindNetwork}, true},
+		{"timeout always retryable", &provider.ProviderError{Kind: provider.ErrorKindTimeout}, true},
+		{"upstream with retryable status", &provider.ProviderError{Kind: provider.ErrorKindUpstream, Status: 503}, true},
+		{"upstream with non-retryable status", &provider.ProviderError{Kind: provider.ErrorKindUpstream, Status: 400}, false},
+		{"unknown not retryable", &provider.ProviderError{Kind: provider.ErrorKindUnknown}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryable(tt.err, cfg); got != tt.want {
+				t.Errorf("retryable(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExecuteDoesNotRetryProtocolError ensures the retry executor short-circuits
+// on protocol errors — malformed/unparseable upstream responses should never be retried.
+func TestExecuteDoesNotRetryProtocolError(t *testing.T) {
+	calls := 0
+	cfg := retryConfig(t, true)
+	_, _, attempts, err := execute(context.Background(), cfg, failoverConfig(t, false), circuitbreaker.Noop{}, []routing.Candidate{{Name: "primary"}}, func(context.Context, routing.Candidate) (string, error) {
+		calls++
+		return "", &provider.ProviderError{Kind: provider.ErrorKindProtocol, Message: "malformed response"}
+	}, func(context.Context, time.Duration) error { return nil }, func() float64 { return 0.5 })
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (no retry on protocol error)", calls)
+	}
+	if attempts.Total != 1 {
+		t.Errorf("attempts = %d, want 1", attempts.Total)
+	}
+}
+
 func TestExecuteStopsWhenSleepCanceled(t *testing.T) {
 	_, _, attempts, err := execute(context.Background(), retryConfig(t, true), failoverConfig(t, true), circuitbreaker.Noop{}, []routing.Candidate{{Name: "primary"}, {Name: "backup"}}, func(context.Context, routing.Candidate) (string, error) {
 		return "", &provider.HTTPError{StatusCode: 503}

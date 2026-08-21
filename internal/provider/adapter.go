@@ -26,18 +26,33 @@ type Request struct {
 	Body      json.RawMessage
 }
 
+// Usage carries token accounting for a single upstream response or stream.
+// It supersedes the older InputTokens/OutputTokens fields on Result/StreamEvent.
+type Usage struct {
+	InputTokens         int
+	OutputTokens        int
+	CacheReadTokens     int
+	CacheCreationTokens int
+	ReasoningTokens     int
+}
+
+// Total returns the canonical token total used for quota charge and audit.
+// Cache tokens are excluded from the billable total since they represent
+// discounted/reused context, not fresh generation.
+func (u Usage) Total() int {
+	return u.InputTokens + u.OutputTokens
+}
+
 type Result struct {
-	Body         json.RawMessage
-	Model        string
-	InputTokens  int
-	OutputTokens int
+	Body  json.RawMessage
+	Model string
+	Usage Usage
 }
 
 type StreamEvent struct {
-	Data         json.RawMessage
-	Done         bool
-	InputTokens  int
-	OutputTokens int
+	Data  json.RawMessage
+	Done  bool
+	Usage Usage
 }
 
 type Stream interface {
@@ -78,6 +93,11 @@ func (c *Client) Supports(candidate routing.Candidate, operation Operation) bool
 	return ok && adapter.Supports(operation)
 }
 
+// Filter returns the subset of candidates whose adapter both supports the
+// operation and validates the request body. When no candidate survives, the
+// validation error from the FIRST failing candidate is returned, since
+// candidates are ordered by priority and the primary candidate's diagnosis is
+// the most actionable signal for the caller.
 func (c *Client) Filter(candidates []routing.Candidate, request Request) ([]routing.Candidate, error) {
 	out := make([]routing.Candidate, 0, len(candidates))
 	var validationErr error
@@ -87,7 +107,9 @@ func (c *Client) Filter(candidates []routing.Candidate, request Request) ([]rout
 			continue
 		}
 		if err := adapter.Validate(request); err != nil {
-			validationErr = err
+			if validationErr == nil {
+				validationErr = err
+			}
 			continue
 		}
 		out = append(out, candidate)

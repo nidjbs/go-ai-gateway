@@ -73,7 +73,6 @@ type Server struct {
 	keyLock             sync.Mutex
 	keyLimits           map[string]*concurrency.Limiter
 	now                 func() time.Time
-	apiKeyLimit         map[string]config.KeyLimits
 	closer              io.Closer // optional sink/handle released on graceful shutdown
 	guardrailMiddleware func(next http.Handler) http.Handler
 }
@@ -161,7 +160,7 @@ func New(deps Deps) (*Server, error) {
 		}
 	}
 
-	ready := &readiness{startedAt: time.Now(), waitTime: deps.Config.ReadyzWaitTime}
+	ready := &readiness{startedAt: deps.Now(), waitTime: deps.Config.ReadyzWaitTime}
 
 	guardrailCfg := deps.Config.Guardrails
 	if guardrailCfg.Mode == "" {
@@ -189,7 +188,6 @@ func New(deps Deps) (*Server, error) {
 		concurrency:         concurrency.New(deps.Config.Server.MaxConcurrentRequests),
 		keyLimits:           make(map[string]*concurrency.Limiter),
 		now:                 deps.Now,
-		apiKeyLimit:         deps.APIKeyLimits,
 		closer:              sinkCloser(usageSink),
 		guardrailMiddleware: guardrailMW.Handle,
 	}

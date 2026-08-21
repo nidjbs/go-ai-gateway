@@ -1,13 +1,13 @@
 package provider
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
+
+	"github.com/tidwall/sjson"
 
 	"example.com/light-llm-gateway/internal/routing"
 )
@@ -56,12 +56,21 @@ func (a *openAIAdapter) Do(ctx context.Context, request Request, candidate routi
 	var envelope struct {
 		Model string `json:"model"`
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
-	_ = json.Unmarshal(data, &envelope)
-	return Result{Body: data, Model: envelope.Model, InputTokens: envelope.Usage.PromptTokens, OutputTokens: envelope.Usage.CompletionTokens}, nil
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return Result{}, &ProviderError{Kind: ErrorKindProtocol, Message: "decode OpenAI response", Wrapped: err}
+	}
+	usage := Usage{InputTokens: envelope.Usage.PromptTokens, OutputTokens: envelope.Usage.CompletionTokens}
+	if envelope.Usage.PromptTokensDetails != nil {
+		usage.CacheReadTokens = envelope.Usage.PromptTokensDetails.CachedTokens
+	}
+	return Result{Body: data, Model: envelope.Model, Usage: usage}, nil
 }
 
 func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candidate routing.Candidate) (Stream, error) {
@@ -72,7 +81,8 @@ func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candida
 	// and retry/per-attempt cancellation must not abort reads of subsequent chunks.
 	// candidate.Timeout still bounds the request via newRequest below.
 	streamCtx := context.WithoutCancel(ctx)
-	req, cancel, err := a.client.newRequest(streamCtx, http.MethodPost, endpointURL(candidate.BaseURL, "chat/completions"), bodyWithModel(request.Body, candidate.Model), candidate.Timeout)
+	body := ensureIncludeUsage(request.Body)
+	req, cancel, err := a.client.newRequest(streamCtx, http.MethodPost, endpointURL(candidate.BaseURL, "chat/completions"), bodyWithModel(body, candidate.Model), candidate.Timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -90,36 +100,115 @@ func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candida
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		return nil, decodeHTTPError(response.StatusCode, data)
 	}
-	return &openAIStream{scanner: newSSEScanner(response.Body), response: response, cancel: cancel}, nil
+	return &openAIStream{parser: newSSEParser(response.Body), response: response, cancel: cancel}, nil
+}
+
+// ensureIncludeUsage returns body with stream_options.include_usage=true set.
+// The OpenAI streaming protocol only emits a usage chunk when this flag is on;
+// without it the gateway cannot report input/output tokens.
+func ensureIncludeUsage(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var value map[string]json.RawMessage
+	if err := json.Unmarshal(body, &value); err != nil {
+		return body
+	}
+	opts, ok := value["stream_options"]
+	if ok && len(opts) > 0 && !bytesEqual(opts, []byte("null")) {
+		var parsed struct {
+			IncludeUsage bool `json:"include_usage"`
+		}
+		if err := json.Unmarshal(opts, &parsed); err == nil && parsed.IncludeUsage {
+			return body
+		}
+	}
+	streamOpts := map[string]any{"include_usage": true}
+	encoded, err := json.Marshal(streamOpts)
+	if err != nil {
+		return body
+	}
+	value["stream_options"] = encoded
+	out, err := json.Marshal(value)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func bytesEqual(a, b []byte) bool {
+	return string(a) == string(b)
 }
 
 type openAIStream struct {
-	scanner   *bufio.Scanner
-	response  *http.Response
-	cancel    context.CancelFunc
-	completed bool
+	parser       *sseParser
+	response     *http.Response
+	cancel       context.CancelFunc
+	model        string
+	inputTokens  int
+	outputTokens int
+	cacheRead    int
+	completed    bool
 }
 
 func (s *openAIStream) Next() (StreamEvent, error) {
-	for s.scanner.Scan() {
-		line := s.scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+	for {
+		evt, err := s.parser.Next()
+		if err != nil {
+			if err == io.EOF {
+				if s.completed {
+					return StreamEvent{}, io.EOF
+				}
+				return StreamEvent{}, io.ErrUnexpectedEOF
+			}
+			return StreamEvent{}, err
+		}
+		if len(evt.Data) == 0 {
 			continue
 		}
-		payload := strings.TrimPrefix(line, "data: ")
-		if payload == "[DONE]" {
+		if string(evt.Data) == "[DONE]" {
 			s.completed = true
-			return StreamEvent{Done: true}, nil
+			return StreamEvent{Done: true, Usage: Usage{
+				InputTokens:     s.inputTokens,
+				OutputTokens:    s.outputTokens,
+				CacheReadTokens: s.cacheRead,
+			}}, nil
 		}
-		return StreamEvent{Data: json.RawMessage(payload)}, nil
+		var peek struct {
+			Model   string `json:"model"`
+			Choices []struct {
+				Delta json.RawMessage `json:"delta"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens        int `json:"prompt_tokens"`
+				CompletionTokens    int `json:"completion_tokens"`
+				PromptTokensDetails *struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(evt.Data, &peek); err != nil {
+			return StreamEvent{}, &ProviderError{Kind: ErrorKindProtocol, Message: "decode OpenAI stream event", Wrapped: err}
+		}
+		if s.model == "" && peek.Model != "" {
+			s.model = peek.Model
+		}
+		event := StreamEvent{Data: json.RawMessage(evt.Data)}
+		// Usage-only chunk: choices is empty but usage is present.
+		if peek.Usage != nil && len(peek.Choices) == 0 {
+			s.inputTokens = peek.Usage.PromptTokens
+			s.outputTokens = peek.Usage.CompletionTokens
+			if peek.Usage.PromptTokensDetails != nil {
+				s.cacheRead = peek.Usage.PromptTokensDetails.CachedTokens
+			}
+			event.Usage = Usage{
+				InputTokens:     s.inputTokens,
+				OutputTokens:    s.outputTokens,
+				CacheReadTokens: s.cacheRead,
+			}
+		}
+		return event, nil
 	}
-	if err := s.scanner.Err(); err != nil {
-		return StreamEvent{}, err
-	}
-	if s.completed {
-		return StreamEvent{}, io.EOF
-	}
-	return StreamEvent{}, io.ErrUnexpectedEOF
 }
 
 func (s *openAIStream) Close() error {
@@ -133,14 +222,14 @@ func (s *openAIStream) Close() error {
 	return s.response.Body.Close()
 }
 
+// bodyWithModel rewrites the "model" field in the request body using sjson's
+// path-aware JSON mutation, so the original field order and untouched keys are
+// preserved. Invalid JSON falls back to the original body.
 func bodyWithModel(body json.RawMessage, model string) json.RawMessage {
-	var value map[string]json.RawMessage
-	if json.Unmarshal(body, &value) != nil {
+	out, err := sjson.SetBytes(body, "model", model)
+	if err != nil {
 		return body
 	}
-	encoded, _ := json.Marshal(model)
-	value["model"] = encoded
-	out, _ := json.Marshal(value)
 	return out
 }
 

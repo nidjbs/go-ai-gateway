@@ -33,13 +33,15 @@ type Request struct {
 }
 
 type Result struct {
-	StatusCode    int
-	ErrorType     string
-	ResponseModel string
-	InputTokens   int
-	OutputTokens  int
-	FirstTokenAt  time.Time
-	CompletedAt   time.Time
+	StatusCode          int
+	ErrorType           string
+	ResponseModel       string
+	InputTokens         int
+	OutputTokens        int
+	CacheReadTokens     int
+	CacheCreationTokens int
+	FirstTokenAt        time.Time
+	CompletedAt         time.Time
 }
 
 type Recorder struct {
@@ -78,6 +80,12 @@ func (r *Recorder) Record(ctx context.Context, request Request, result Result) {
 	}
 	if result.OutputTokens > 0 {
 		r.tokenUsage.Record(ctx, int64(result.OutputTokens), apimetric.WithAttributes(append(attrs, attribute.String("token_type", "output"))...))
+	}
+	if result.CacheReadTokens > 0 {
+		r.tokenUsage.Record(ctx, int64(result.CacheReadTokens), apimetric.WithAttributes(append(attrs, attribute.String("token_type", "cache_read"))...))
+	}
+	if result.CacheCreationTokens > 0 {
+		r.tokenUsage.Record(ctx, int64(result.CacheCreationTokens), apimetric.WithAttributes(append(attrs, attribute.String("token_type", "cache_creation"))...))
 	}
 	if result.FirstTokenAt.IsZero() || result.FirstTokenAt.Before(request.StartedAt) || result.FirstTokenAt.After(result.CompletedAt) {
 		return

@@ -114,3 +114,38 @@ func TestNewEventIDUniqueness(t *testing.T) {
 		seen[id] = struct{}{}
 	}
 }
+
+// TestAuditSinkWritesCacheAndReasoningTokens verifies that cache and reasoning
+// token counts flow through to the slog record so they reach the audit pipeline.
+func TestAuditSinkWritesCacheAndReasoningTokens(t *testing.T) {
+	sink, buf := newCapturingSink(t)
+	event := Event{
+		EventID:             "ev-cache",
+		RequestID:           "r",
+		Endpoint:            "chat.completions",
+		StatusCode:          200,
+		Success:             true,
+		InputTokens:         100,
+		OutputTokens:        50,
+		TotalTokens:         150,
+		CacheReadTokens:     200,
+		CacheCreationTokens: 75,
+		ReasoningTokens:     20,
+	}
+	if err := sink.Record(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	got := decodeLine(t, buf)
+	for name, want := range map[string]float64{
+		"input_tokens":          100,
+		"output_tokens":         50,
+		"total_tokens":          150,
+		"cache_read_tokens":     200,
+		"cache_creation_tokens": 75,
+		"reasoning_tokens":      20,
+	} {
+		if v, ok := got[name].(float64); !ok || v != want {
+			t.Errorf("%s = %v; want %v", name, got[name], want)
+		}
+	}
+}

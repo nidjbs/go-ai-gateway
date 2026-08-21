@@ -57,6 +57,42 @@ func TestRecorderFailureOnlyRecordsDuration(t *testing.T) {
 	}
 }
 
+// TestRecorderRecordsCacheTokens verifies that cache_read/cache_creation token
+// counts flow into the token_usage histogram with the right token_type labels.
+func TestRecorderRecordsCacheTokens(t *testing.T) {
+	recorder, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().Add(-100 * time.Millisecond)
+	recorder.Record(context.Background(),
+		Request{Operation: "chat.completions", Provider: "primary", Model: "chat", UpstreamModel: "provider-chat", StartedAt: started},
+		Result{
+			StatusCode:          200,
+			ResponseModel:       "provider-chat",
+			InputTokens:         10,
+			OutputTokens:        5,
+			CacheReadTokens:     80,
+			CacheCreationTokens: 25,
+			FirstTokenAt:        started.Add(20 * time.Millisecond),
+			CompletedAt:         time.Now(),
+		},
+	)
+	response := httptest.NewRecorder()
+	recorder.Handler().ServeHTTP(response, httptest.NewRequest("GET", "/metrics", nil))
+	body := response.Body.String()
+	for _, want := range []string{
+		`token_type="input"`,
+		`token_type="output"`,
+		`token_type="cache_read"`,
+		`token_type="cache_creation"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing label %q:\n%s", want, body)
+		}
+	}
+}
+
 func TestRecorderAddsAPIKeyAndTeamLabels(t *testing.T) {
 	recorder, err := New()
 	if err != nil {

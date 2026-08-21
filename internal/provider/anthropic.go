@@ -1,7 +1,6 @@
 package provider
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -50,7 +49,12 @@ func (a *anthropicAdapter) Do(ctx context.Context, request Request, candidate ro
 	if response.StatusCode >= http.StatusBadRequest {
 		return Result{}, decodeHTTPError(response.StatusCode, data)
 	}
-	return anthropicResult(data)
+	result, err := anthropicResult(data)
+	if err != nil {
+		// Already a ProviderError from anthropicResult — pass through.
+		return Result{}, err
+	}
+	return result, nil
 }
 
 func (a *anthropicAdapter) OpenStream(ctx context.Context, request Request, candidate routing.Candidate) (Stream, error) {
@@ -72,7 +76,7 @@ func (a *anthropicAdapter) OpenStream(ctx context.Context, request Request, cand
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		return nil, decodeHTTPError(response.StatusCode, data)
 	}
-	return &anthropicStream{scanner: newSSEScanner(response.Body), response: response, cancel: cancel}, nil
+	return newAnthropicStream(response.Body, response, cancel, candidate.Model), nil
 }
 
 func (a *anthropicAdapter) open(ctx context.Context, body []byte, candidate routing.Candidate, stream bool) (*http.Response, context.CancelFunc, error) {
@@ -199,16 +203,27 @@ func anthropicRequest(raw json.RawMessage, model string, stream bool) ([]byte, e
 		return nil, err
 	}
 	out.StopSequences = stop
+	toolNames := make(map[string]struct{}, len(in.Tools))
 	for _, tool := range in.Tools {
-		if tool.Type != "function" || strings.TrimSpace(tool.Function.Name) == "" || len(tool.Function.Parameters) == 0 {
-			return nil, &RequestError{Message: "only function tools with name and parameters are supported for Anthropic providers"}
+		if tool.Type != "function" {
+			return nil, &RequestError{Message: fmt.Sprintf("tool type %q is not supported; only function tools are accepted", tool.Type)}
+		}
+		if strings.TrimSpace(tool.Function.Name) == "" {
+			return nil, &RequestError{Message: "function tools require a non-empty name"}
+		}
+		if len(tool.Function.Parameters) == 0 {
+			return nil, &RequestError{Message: fmt.Sprintf("tool %q is missing parameters schema", tool.Function.Name)}
 		}
 		if !json.Valid(tool.Function.Parameters) {
-			return nil, &RequestError{Message: "tool parameters must be valid JSON"}
+			return nil, &RequestError{Message: fmt.Sprintf("tool %q parameters must be valid JSON", tool.Function.Name)}
 		}
+		if _, dup := toolNames[tool.Function.Name]; dup {
+			return nil, &RequestError{Message: fmt.Sprintf("duplicate tool name %q", tool.Function.Name)}
+		}
+		toolNames[tool.Function.Name] = struct{}{}
 		out.Tools = append(out.Tools, anthropicTool{Name: tool.Function.Name, Description: tool.Function.Description, InputSchema: tool.Function.Parameters})
 	}
-	choice, err := anthropicToolChoice(in.ToolChoice)
+	choice, err := anthropicToolChoice(in.ToolChoice, toolNames)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +253,7 @@ func rejectUnsupported(in openAIRequest) error {
 	if len(in.ParallelToolCalls) > 0 && string(in.ParallelToolCalls) != "null" {
 		var b bool
 		if err := json.Unmarshal(in.ParallelToolCalls, &b); err != nil || !b {
-			return unsupportedField("parallel_tool_calls: false")
+			return &RequestError{Message: "parallel_tool_calls=false is not supported for Anthropic providers (parallel tool use is always enabled)"}
 		}
 	}
 	if in.N != nil && *in.N != 1 {
@@ -247,21 +262,29 @@ func rejectUnsupported(in openAIRequest) error {
 	return nil
 }
 
-func anthropicToolChoice(raw json.RawMessage) (any, error) {
+// anthropicToolChoice translates an OpenAI-style tool_choice into the
+// Anthropic wire format. toolNames is the set of function names declared in
+// the request; when the caller pins a specific tool, its name must be present.
+// Returning nil signals "no tool_choice constraint" (Anthropic will then
+// auto-select based on the prompt).
+func anthropicToolChoice(raw json.RawMessage, toolNames map[string]struct{}) (any, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
 	var stringChoice string
-	if json.Unmarshal(raw, &stringChoice) == nil {
+	if err := json.Unmarshal(raw, &stringChoice); err == nil {
 		switch stringChoice {
 		case "auto":
 			return map[string]string{"type": "auto"}, nil
 		case "none":
 			return map[string]string{"type": "none"}, nil
 		case "required":
+			if len(toolNames) == 0 {
+				return nil, &RequestError{Message: "tool_choice=\"required\" requires at least one tool to be defined"}
+			}
 			return map[string]string{"type": "any"}, nil
 		default:
-			return nil, &RequestError{Message: "unsupported tool_choice"}
+			return nil, &RequestError{Message: fmt.Sprintf("tool_choice %q is not supported for Anthropic providers (use \"auto\", \"none\", or \"required\")", stringChoice)}
 		}
 	}
 	var choice struct {
@@ -270,10 +293,22 @@ func anthropicToolChoice(raw json.RawMessage) (any, error) {
 			Name string `json:"name"`
 		} `json:"function"`
 	}
-	if err := json.Unmarshal(raw, &choice); err != nil || choice.Type != "function" || strings.TrimSpace(choice.Function.Name) == "" {
-		return nil, &RequestError{Message: "unsupported tool_choice"}
+	if err := json.Unmarshal(raw, &choice); err != nil {
+		return nil, &RequestError{Message: "tool_choice must be a string or {\"type\":\"function\",\"function\":{\"name\":\"...\"}}"}
 	}
-	return map[string]string{"type": "tool", "name": choice.Function.Name}, nil
+	if choice.Type != "function" {
+		return nil, &RequestError{Message: fmt.Sprintf("tool_choice type %q is not supported for Anthropic providers (use \"function\")", choice.Type)}
+	}
+	name := strings.TrimSpace(choice.Function.Name)
+	if name == "" {
+		return nil, &RequestError{Message: "tool_choice function name must not be empty"}
+	}
+	if len(toolNames) > 0 {
+		if _, ok := toolNames[name]; !ok {
+			return nil, &RequestError{Message: fmt.Sprintf("tool_choice references unknown tool %q", name)}
+		}
+	}
+	return map[string]string{"type": "tool", "name": name}, nil
 }
 
 func parseStop(raw json.RawMessage) ([]string, error) {
@@ -424,15 +459,17 @@ type anthropicWireResponse struct {
 		Input json.RawMessage `json:"input"`
 	} `json:"content"`
 	Usage struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 }
 
 func anthropicResult(data []byte) (Result, error) {
 	var in anthropicWireResponse
 	if err := json.Unmarshal(data, &in); err != nil {
-		return Result{}, fmt.Errorf("decode Anthropic response: %w", err)
+		return Result{}, &ProviderError{Kind: ErrorKindProtocol, Message: "decode Anthropic response", Wrapped: err}
 	}
 	message := map[string]any{"role": "assistant"}
 	var texts []string
@@ -469,7 +506,12 @@ func anthropicResult(data []byte) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Body: body, Model: in.Model, InputTokens: in.Usage.InputTokens, OutputTokens: in.Usage.OutputTokens}, nil
+	return Result{Body: body, Model: in.Model, Usage: Usage{
+		InputTokens:         in.Usage.InputTokens,
+		OutputTokens:        in.Usage.OutputTokens,
+		CacheReadTokens:     in.Usage.CacheReadInputTokens,
+		CacheCreationTokens: in.Usage.CacheCreationInputTokens,
+	}}, nil
 }
 
 func openAIFinishReason(reason string) string {
@@ -486,29 +528,70 @@ func openAIFinishReason(reason string) string {
 }
 
 type anthropicStream struct {
-	scanner      *bufio.Scanner
-	response     *http.Response
-	cancel       context.CancelFunc
+	parser   *sseParser
+	response *http.Response
+	cancel   context.CancelFunc
+	// initialModel is the candidate model name sent on the wire; used as a
+	// fallback if the upstream message_start event omits the model field.
+	initialModel string
+	// model tracks the model reported by the upstream; initialModel acts as
+	// the fallback when the upstream leaves it blank.
 	model        string
 	inputTokens  int
 	outputTokens int
-	completed    bool
+	cacheRead    int
+	cacheWrite   int
+	reasoning    string
+	// toolCalls accumulates per-index partial JSON across input_json_delta
+	// events until message_stop flushes the assembled payload to the caller.
+	toolCalls map[int]*anthropicToolAccum
+	completed bool
+}
+
+// anthropicToolAccum collects the partial JSON and metadata for one tool_use
+// content block during streaming.
+type anthropicToolAccum struct {
+	ID        string
+	Name      string
+	Arguments strings.Builder
+}
+
+func newAnthropicStream(r io.Reader, response *http.Response, cancel context.CancelFunc, initialModel string) *anthropicStream {
+	return &anthropicStream{
+		parser:       newSSEParser(r),
+		response:     response,
+		cancel:       cancel,
+		initialModel: initialModel,
+		model:        initialModel,
+		toolCalls:    map[int]*anthropicToolAccum{},
+	}
 }
 
 func (s *anthropicStream) Next() (StreamEvent, error) {
-	for s.scanner.Scan() {
-		line := s.scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+	for {
+		evt, err := s.parser.Next()
+		if err != nil {
+			if err == io.EOF {
+				if s.completed {
+					return StreamEvent{}, io.EOF
+				}
+				return StreamEvent{}, io.ErrUnexpectedEOF
+			}
+			return StreamEvent{}, err
+		}
+		if len(evt.Data) == 0 {
 			continue
 		}
-		data := []byte(strings.TrimPrefix(line, "data: "))
 		var event struct {
 			Type    string `json:"type"`
 			Message struct {
 				ID    string `json:"id"`
 				Model string `json:"model"`
 				Usage struct {
-					InputTokens int `json:"input_tokens"`
+					InputTokens          int `json:"input_tokens"`
+					CacheReadInputTokens int `json:"cache_read_input_tokens"`
+					CacheCreationTokens  int `json:"cache_creation_input_tokens"`
+					OutputTokens         int `json:"output_tokens"`
 				} `json:"usage"`
 			} `json:"message"`
 			Index        int `json:"index"`
@@ -522,28 +605,59 @@ func (s *anthropicStream) Next() (StreamEvent, error) {
 				Text        string `json:"text"`
 				PartialJSON string `json:"partial_json"`
 				StopReason  string `json:"stop_reason"`
+				Thinking    string `json:"thinking"`
 			} `json:"delta"`
 			Usage struct {
-				OutputTokens int `json:"output_tokens"`
+				OutputTokens         int `json:"output_tokens"`
+				CacheReadInputTokens int `json:"cache_read_input_tokens"`
+				CacheCreationTokens  int `json:"cache_creation_input_tokens"`
 			} `json:"usage"`
 			Error struct {
 				Message string `json:"message"`
 			} `json:"error"`
 		}
-		if err := json.Unmarshal(data, &event); err != nil {
-			return StreamEvent{}, fmt.Errorf("decode Anthropic stream event: %w", err)
+		if err := json.Unmarshal(evt.Data, &event); err != nil {
+			return StreamEvent{}, &ProviderError{Kind: ErrorKindProtocol, Message: "decode Anthropic stream event", Wrapped: err}
+		}
+		// Apply top-level usage delta (message_delta carries output_tokens +
+		// cache stats; message_start carries input_tokens + initial cache).
+		if event.Usage.OutputTokens > 0 {
+			s.outputTokens = event.Usage.OutputTokens
+		}
+		if event.Usage.CacheReadInputTokens > 0 {
+			s.cacheRead = event.Usage.CacheReadInputTokens
+		}
+		if event.Usage.CacheCreationTokens > 0 {
+			s.cacheWrite = event.Usage.CacheCreationTokens
 		}
 		switch event.Type {
-		case "ping", "content_block_stop":
+		case "ping":
+			// Heartbeat from upstream; no-op.
+			continue
+		case "content_block_stop":
 			continue
 		case "error":
-			return StreamEvent{}, &HTTPError{StatusCode: http.StatusBadGateway, Message: event.Error.Message}
+			return StreamEvent{}, &ProviderError{Kind: ErrorKindUpstream, Status: http.StatusBadGateway, Message: event.Error.Message}
 		case "message_start":
-			s.model = event.Message.Model
-			s.inputTokens = event.Message.Usage.InputTokens
+			if event.Message.Model != "" {
+				s.model = event.Message.Model
+			}
+			if event.Message.Usage.InputTokens > 0 {
+				s.inputTokens = event.Message.Usage.InputTokens
+			}
+			if event.Message.Usage.CacheReadInputTokens > 0 {
+				s.cacheRead = event.Message.Usage.CacheReadInputTokens
+			}
+			if event.Message.Usage.CacheCreationTokens > 0 {
+				s.cacheWrite = event.Message.Usage.CacheCreationTokens
+			}
 			return anthropicChunk(s.model, map[string]any{"role": "assistant"}, ""), nil
 		case "content_block_start":
 			if event.ContentBlock.Type == "tool_use" {
+				s.toolCalls[event.Index] = &anthropicToolAccum{
+					ID:   event.ContentBlock.ID,
+					Name: event.ContentBlock.Name,
+				}
 				return anthropicChunk(s.model, map[string]any{"tool_calls": []any{map[string]any{"index": event.Index, "id": event.ContentBlock.ID, "type": "function", "function": map[string]any{"name": event.ContentBlock.Name, "arguments": ""}}}}, ""), nil
 			}
 		case "content_block_delta":
@@ -551,23 +665,34 @@ func (s *anthropicStream) Next() (StreamEvent, error) {
 			case "text_delta":
 				return anthropicChunk(s.model, map[string]any{"content": event.Delta.Text}, ""), nil
 			case "input_json_delta":
+				if accum, ok := s.toolCalls[event.Index]; ok {
+					accum.Arguments.WriteString(event.Delta.PartialJSON)
+				}
 				return anthropicChunk(s.model, map[string]any{"tool_calls": []any{map[string]any{"index": event.Index, "function": map[string]any{"arguments": event.Delta.PartialJSON}}}}, ""), nil
+			case "thinking_delta":
+				if event.Delta.Thinking != "" {
+					if s.reasoning != "" {
+						s.reasoning += "\n"
+					}
+					s.reasoning += event.Delta.Thinking
+				}
+				return anthropicChunk(s.model, map[string]any{"reasoning": event.Delta.Thinking}, ""), nil
 			}
 		case "message_delta":
-			s.outputTokens = event.Usage.OutputTokens
-			return anthropicChunk(s.model, map[string]any{}, openAIFinishReason(event.Delta.StopReason)), nil
+			if event.Delta.StopReason != "" {
+				return anthropicChunk(s.model, map[string]any{}, openAIFinishReason(event.Delta.StopReason)), nil
+			}
+			return anthropicChunk(s.model, map[string]any{}, ""), nil
 		case "message_stop":
 			s.completed = true
-			return StreamEvent{Done: true, InputTokens: s.inputTokens, OutputTokens: s.outputTokens}, nil
+			return StreamEvent{Done: true, Usage: Usage{
+				InputTokens:         s.inputTokens,
+				OutputTokens:        s.outputTokens,
+				CacheReadTokens:     s.cacheRead,
+				CacheCreationTokens: s.cacheWrite,
+			}}, nil
 		}
 	}
-	if err := s.scanner.Err(); err != nil {
-		return StreamEvent{}, err
-	}
-	if s.completed {
-		return StreamEvent{}, io.EOF
-	}
-	return StreamEvent{}, io.ErrUnexpectedEOF
 }
 
 func anthropicChunk(model string, delta map[string]any, finishReason string) StreamEvent {

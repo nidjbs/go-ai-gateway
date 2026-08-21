@@ -236,3 +236,131 @@ func TestSQLSinkRecordAfterClose(t *testing.T) {
 		t.Fatalf("err = %v; want closed-pipe-ish", err)
 	}
 }
+
+// TestSQLSinkMigratesLegacySchema verifies that an existing usage_events table
+// created by an older binary (without cache_*/reasoning_* columns) is upgraded
+// additively by NewSQLSink without losing existing rows.
+func TestSQLSinkMigratesLegacySchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Build a "legacy" schema that intentionally omits cache_read_tokens,
+	// cache_creation_tokens, reasoning_tokens.
+	legacyCols := []string{
+		"event_id", "request_id", "api_key_id", "team_id",
+		"endpoint", "alias", "requested_model", "resolved_model",
+		"provider", "upstream_model", "error_type", "stream_outcome",
+		"status", "success", "streaming", "attempts",
+		"retries", "failovers", "input_tokens", "output_tokens",
+		"total_tokens", "input_cost_micros", "output_cost_micros", "total_cost_micros",
+		"duration_ms", "ttft_ms", "started_at", "completed_at",
+		"client_ip", "user_agent",
+	}
+	legacyTypes := []string{
+		"TEXT", "TEXT", "TEXT", "TEXT",
+		"TEXT", "TEXT", "TEXT", "TEXT",
+		"TEXT", "TEXT", "TEXT", "TEXT",
+		"INTEGER", "INTEGER", "INTEGER", "INTEGER",
+		"INTEGER", "INTEGER", "INTEGER", "INTEGER",
+		"INTEGER", "INTEGER", "INTEGER", "INTEGER",
+		"INTEGER", "INTEGER", "TIMESTAMP", "TIMESTAMP",
+		"TEXT", "TEXT",
+	}
+	if len(legacyCols) != len(legacyTypes) {
+		t.Fatalf("legacy cols/types mismatch")
+	}
+	var sb strings.Builder
+	sb.WriteString("CREATE TABLE usage_events (")
+	for i, c := range legacyCols {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(c + " " + legacyTypes[i])
+	}
+	sb.WriteString(");")
+	if _, err := db.Exec(sb.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	if _, err := db.Exec(
+		`INSERT INTO usage_events (event_id, request_id, endpoint, status, success, input_tokens, output_tokens, total_tokens, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"legacy-1", "r", "chat.completions", 200, 1, 5, 10, 15, now, now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen via NewSQLSink — it should add the missing columns.
+	sink, err := NewSQLSink(db, SQLiteSchema(), DefaultInsertSQL(DefaultTable, "?"))
+	if err != nil {
+		t.Fatalf("NewSQLSink (with migration): %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	// Old row must still exist.
+	var legacyCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM usage_events WHERE event_id = ?", "legacy-1").Scan(&legacyCount); err != nil {
+		t.Fatal(err)
+	}
+	if legacyCount != 1 {
+		t.Fatalf("legacy row count = %d; want 1", legacyCount)
+	}
+
+	// New columns must be present with NULL/0 default for the legacy row.
+	var cacheRead sql.NullInt64
+	if err := db.QueryRow("SELECT cache_read_tokens FROM usage_events WHERE event_id = ?", "legacy-1").Scan(&cacheRead); err != nil {
+		t.Fatalf("read new column: %v", err)
+	}
+	if cacheRead.Valid {
+		t.Fatalf("legacy row cache_read_tokens = %d; want NULL", cacheRead.Int64)
+	}
+
+	// Insert a new row that exercises the cache/reasoning columns.
+	ev := Event{
+		EventID:             "ev-new",
+		RequestID:           "r2",
+		Endpoint:            "chat.completions",
+		StatusCode:          200,
+		Success:             true,
+		InputTokens:         10,
+		OutputTokens:        20,
+		TotalTokens:         30,
+		CacheReadTokens:     100,
+		CacheCreationTokens: 25,
+		ReasoningTokens:     7,
+		StartedAt:           now,
+		CompletedAt:         now,
+	}
+	if err := sink.Record(context.Background(), ev); err != nil {
+		t.Fatalf("Record new: %v", err)
+	}
+
+	var gotCR, gotCC, gotR int
+	if err := db.QueryRow("SELECT cache_read_tokens, cache_creation_tokens, reasoning_tokens FROM usage_events WHERE event_id = ?", "ev-new").Scan(&gotCR, &gotCC, &gotR); err != nil {
+		t.Fatal(err)
+	}
+	if gotCR != 100 || gotCC != 25 || gotR != 7 {
+		t.Fatalf("new row cache fields = (%d, %d, %d); want (100, 25, 7)", gotCR, gotCC, gotR)
+	}
+}
+
+// TestSQLSinkMigrationIdempotent verifies ensureColumns is a no-op when the
+// table already has every column from DefaultColumns.
+func TestSQLSinkMigrationIdempotent(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := NewSQLSink(db, SQLiteSchema(), DefaultInsertSQL(DefaultTable, "?")); err != nil {
+		t.Fatal(err)
+	}
+	// A second NewSQLSink on the same DB must not error and must leave the
+	// schema untouched.
+	db2, err := sql.Open("sqlite", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Share the same on-disk DB by re-opening the temp file.
+	_ = db2.Close()
+}

@@ -7,19 +7,6 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registers "sqlite" with database/sql
 )
 
-// sqliteColumnTypes is the per-column SQL type declaration used by the
-// bundled SQLite schema. Order must match DefaultColumns.
-var sqliteColumnTypes = []string{
-	"TEXT", "TEXT", "TEXT", "TEXT",
-	"TEXT", "TEXT", "TEXT", "TEXT",
-	"TEXT", "TEXT", "TEXT", "TEXT",
-	"INTEGER", "INTEGER", "INTEGER", "INTEGER",
-	"INTEGER", "INTEGER", "INTEGER", "INTEGER",
-	"INTEGER", "INTEGER", "INTEGER", "INTEGER",
-	"INTEGER", "INTEGER", "TIMESTAMP", "TIMESTAMP",
-	"TEXT", "TEXT",
-}
-
 // sqliteIndexDefs is the (name, column) pair list for indexes created
 // alongside the bundled table.
 var sqliteIndexDefs = []struct{ name, column string }{
@@ -56,19 +43,17 @@ func init() {
 	})
 }
 
-// SQLiteSchema returns the bundled CREATE TABLE / INDEX block for the default
-// usage_events table. Exported so other drivers (and tests) can reuse the
-// column declarations. The DDL is built once and memoized.
+// SQLiteSchema returns the bundled CREATE TABLE / INDEX DDL.
 var sqliteSchemaDDL = buildSQLiteSchema()
 
 func buildSQLiteSchema() string {
 	cols := DefaultColumns()
-	if len(cols) != len(sqliteColumnTypes) {
-		panic("usage: DefaultColumns / sqliteColumnTypes length mismatch")
+	if len(cols) != len(DefaultColumnTypes) {
+		panic("usage: DefaultColumns / DefaultColumnTypes length mismatch")
 	}
 	lines := make([]string, len(cols))
 	for i, name := range cols {
-		lines[i] = name + " " + sqliteColumnTypes[i]
+		lines[i] = name + " " + DefaultColumnTypes[i]
 	}
 	ddl := "CREATE TABLE IF NOT EXISTS " + DefaultTable + " (\n  " +
 		joinLines(lines) + "\n);"
@@ -86,7 +71,7 @@ func joinLines(parts []string) string {
 	return out
 }
 
-// SQLiteSchema returns the bundled CREATE TABLE / INDEX DDL.
+// SQLiteSchema returns the bundled CREATE TABLE / INDEX block.
 func SQLiteSchema() string { return sqliteSchemaDDL }
 
 // stringOption pulls a string from map[string]any with a default fallback.

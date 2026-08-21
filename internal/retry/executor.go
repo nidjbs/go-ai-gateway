@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net"
+	"slices"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -104,7 +105,7 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 				continue
 			}
 			// On success, ownership of attemptCtx transfers to the returned value (streams rely on it; the value's Close reclaims it).
-			_ = cancel
+			cancel()
 			return value, candidate, attempts, nil
 		}
 		if !failoverCfg.IsEnabled() {
@@ -136,20 +137,31 @@ func backoffDuration(cfg config.RetryConfig, retryIndex uint, random func() floa
 }
 
 func retryable(err error, cfg config.RetryConfig) bool {
+	// ProviderError is the canonical signal: protocol/invalid_request/canceled
+	// are never retryable; network/timeout retry by default; upstream retry
+	// only when its status is in the configured retryable set.
+	var pe *provider.ProviderError
+	if errors.As(err, &pe) {
+		switch pe.Kind {
+		case provider.ErrorKindProtocol, provider.ErrorKindInvalidRequest, provider.ErrorKindCanceled:
+			return false
+		case provider.ErrorKindNetwork, provider.ErrorKindTimeout:
+			return true
+		case provider.ErrorKindUpstream:
+			return slices.Contains(cfg.RetryableStatuses, pe.Status)
+		case provider.ErrorKindUnknown:
+			// fall through to legacy detection below.
+		}
+	}
 	if errors.Is(err, context.Canceled) {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 	var httpErr *provider.HTTPError
 	if errors.As(err, &httpErr) {
-		for _, status := range cfg.RetryableStatuses {
-			if status == httpErr.StatusCode {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(cfg.RetryableStatuses, httpErr.StatusCode)
 	}
 	var networkErr net.Error
 	return errors.As(err, &networkErr)

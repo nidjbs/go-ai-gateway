@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,5 +108,46 @@ func TestSetHTTPClientReplacesPool(t *testing.T) {
 	got := c.HTTPClient("openai")
 	if got != custom {
 		t.Error("SetHTTPClient did not replace the openai pool")
+	}
+}
+
+// TestFilterKeepsFirstValidationError verifies that when no candidate
+// survives, the validation error returned is from the FIRST (highest-priority)
+// failing candidate, not the last one. The primary candidate's diagnosis is
+// the most actionable for the caller.
+func TestFilterKeepsFirstValidationError(t *testing.T) {
+	c := NewClient()
+	body := json.RawMessage(`{"model":"chat","messages":[{"role":"user","content":"hi"}],"parallel_tool_calls":false}`)
+	candidates := []routing.Candidate{
+		{Name: "primary", Type: "anthropic", Model: "claude"},
+		{Name: "secondary", Type: "anthropic", Model: "claude"},
+	}
+	out, err := c.Filter(candidates, Request{Operation: ChatCompletions, Body: body})
+	if err == nil {
+		t.Fatalf("expected validation error, got %d candidates", len(out))
+	}
+	if !strings.Contains(err.Error(), "parallel_tool_calls") {
+		t.Fatalf("expected parallel_tool_calls error, got %v", err)
+	}
+}
+
+// TestFilterDropsInvalidCandidatesKeepsValid verifies that candidates which
+// fail validation are silently dropped while candidates that pass are
+// returned — and no error is raised when at least one survives.
+func TestFilterDropsInvalidCandidatesKeepsValid(t *testing.T) {
+	c := NewClient()
+	// The presence of parallel_tool_calls=false is rejected by the Anthropic
+	// adapter but is irrelevant to the OpenAI adapter.
+	body := json.RawMessage(`{"model":"chat","messages":[{"role":"user","content":"hi"}],"parallel_tool_calls":false}`)
+	candidates := []routing.Candidate{
+		{Name: "primary", Type: "anthropic", Model: "claude"},
+		{Name: "fallback", Type: "openai", Model: "gpt-x"},
+	}
+	out, err := c.Filter(candidates, Request{Operation: ChatCompletions, Body: body})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != 1 || out[0].Name != "fallback" {
+		t.Fatalf("out = %+v, want single fallback candidate", out)
 	}
 }
