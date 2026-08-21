@@ -165,8 +165,6 @@ Generate a new key with either `go run ./cmd/keygen` or `./scripts/genkey.sh`.
 | `GET /v1/models` | Available aliases |
 | `POST /v1/chat/completions` | OpenAI-compatible chat completions, including streaming |
 | `POST /v1/responses` | OpenAI Responses API passthrough, including streaming (OpenAI-compatible providers) |
-| `POST /v1/responses` | OpenAI Responses API passthrough, including streaming (OpenAI-compatible providers) |
-| `POST /v1/responses` | OpenAI Responses API passthrough, including streaming (OpenAI-compatible providers) |
 | `POST /v1/embeddings` | OpenAI-compatible embeddings |
 
 `/healthz` and `/livez` return `200`. `/readyz` returns `503` during the configured startup window and `204` afterward: 5 seconds in `configs/config.docker.yaml` and 10 seconds in `configs/config.example.yaml`.
