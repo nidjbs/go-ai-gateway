@@ -43,6 +43,8 @@ func requestEndpoint(r *http.Request) string {
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/v1/chat/completions"):
 		return "chat.completions"
+	case strings.HasSuffix(r.URL.Path, "/v1/responses"):
+		return "responses"
 	case strings.HasSuffix(r.URL.Path, "/v1/embeddings"):
 		return "embeddings"
 	case strings.HasSuffix(r.URL.Path, "/v1/models"):

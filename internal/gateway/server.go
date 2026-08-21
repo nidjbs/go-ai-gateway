@@ -215,6 +215,7 @@ func New(deps Deps) (*Server, error) {
 		r.Use(server.guardrailMiddleware)
 		r.Get("/v1/models", handlers.models)
 		r.Post("/v1/chat/completions", handlers.chat)
+		r.Post("/v1/responses", handlers.responses)
 		r.Post("/v1/embeddings", handlers.embeddings)
 	})
 

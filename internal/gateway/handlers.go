@@ -233,7 +233,133 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	h.logger.Info("request complete", "request_id", requestID(r), "endpoint", "chat.completions", "provider", candidate.Name, "attempts", attempts.Total, "status", http.StatusOK, "upstream_duration_ms", time.Since(started).Milliseconds())
 }
 
-// chargeQuota records usage against daily, monthly, and alias-level quotas.
+type responsesRequest struct {
+	Model  string          `json:"model"`
+	Input  json.RawMessage `json:"input"`
+	Stream bool            `json:"stream"`
+}
+
+func (h handler) responses(w http.ResponseWriter, r *http.Request) {
+	body, request, candidates, ok := h.parseResponses(w, r)
+	if !ok {
+		return
+	}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
+		return
+	}
+	if request.Stream {
+		h.responsesStream(w, r, body, request.Model, candidates)
+		return
+	}
+	started := h.now()
+	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
+	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
+		return h.provider.Do(ctx, adapterRequest, c)
+	})
+	if err != nil {
+		h.writeProviderError(w, r, started, "responses", request.Model, candidate, false, err)
+		return
+	}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
+		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.Usage.Total()))
+	}
+	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
+	h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK, attempts: attempts})
+	h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK})
+}
+
+func (h handler) parseResponses(w http.ResponseWriter, r *http.Request) (json.RawMessage, responsesRequest, []routing.Candidate, bool) {
+	started := h.now()
+	var request responsesRequest
+	body, err := readBody(w, r)
+	if err != nil {
+		h.writeInvalidRequest(w, r, started, "", routing.Candidate{}, err.Error())
+		return nil, request, nil, false
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		h.writeInvalidRequest(w, r, started, "", routing.Candidate{}, err.Error())
+		return nil, request, nil, false
+	}
+	if strings.TrimSpace(request.Model) == "" || len(request.Input) == 0 || string(request.Input) == "null" {
+		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "model and input are required")
+		return nil, request, nil, false
+	}
+	candidates, err := routing.Resolve(h.config, request.Model)
+	if err != nil {
+		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
+		return nil, request, nil, false
+	}
+	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
+	candidates, err = h.provider.Filter(candidates, adapterRequest)
+	if err != nil {
+		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
+		return nil, request, nil, false
+	}
+	if len(candidates) == 0 {
+		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "no configured provider supports responses")
+		return nil, request, nil, false
+	}
+	return body, request, candidates, true
+}
+
+func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body json.RawMessage, alias string, candidates []routing.Candidate) {
+	started := h.now()
+	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
+	stream, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
+		return h.provider.OpenStream(ctx, adapterRequest, c)
+	})
+	if err != nil {
+		h.writeProviderError(w, r, started, "responses", alias, candidate, true, err)
+		return
+	}
+	defer stream.Close()
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		apierr.Write(w, http.StatusInternalServerError, "streaming_unsupported", "server_error", "response streaming unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	seen := false
+	var firstToken time.Time
+	for result := range pumpStream(r.Context(), stream) {
+		if result.err != nil {
+			err := result.err
+			if err != io.EOF && seen && !errors.Is(err, context.Canceled) {
+				_, _ = fmt.Fprintf(w, "event: error\\ndata: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\\n\\n", upstreamErrorMessage)
+				flusher.Flush()
+			}
+			errorType, streamOutcome, status := streamOutcomeFor(result.err, r.Context())
+			h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, ttft: firstToken, streaming: true, status: status, errorType: errorType, streamOutcome: streamOutcome, attempts: attempts})
+			h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, firstToken: firstToken, status: status, errorType: errorType})
+			return
+		}
+		event := result.event
+		if len(event.Data) > 0 {
+			if event.Event != "" {
+				_, _ = fmt.Fprintf(w, "event: %s\\n", event.Event)
+			}
+			_, _ = fmt.Fprintf(w, "data: %s\\n\\n", replaceModel(event.Data, alias))
+			flusher.Flush()
+			if !seen {
+				seen = true
+				firstToken = h.now()
+				h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, ttft: firstToken, streaming: true, status: http.StatusOK, streamOutcome: "first_token", attempts: attempts})
+			}
+		}
+		if event.Done {
+			if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+				h.chargeQuota(w, principal.APIKeyID, alias, int64(event.Usage.Total()))
+			}
+			h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, usage: event.Usage, ttft: firstToken, streaming: true, status: http.StatusOK, streamOutcome: "completed", attempts: attempts})
+			h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, usage: event.Usage, firstToken: firstToken, status: http.StatusOK})
+			return
+		}
+	}
+}
+
 func (h handler) chargeQuota(w http.ResponseWriter, keyID, alias string, delta int64) {
 	if delta <= 0 {
 		return

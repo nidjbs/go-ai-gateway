@@ -19,7 +19,7 @@ type openAIAdapter struct {
 func (a *openAIAdapter) Type() string { return "openai" }
 
 func (a *openAIAdapter) Supports(operation Operation) bool {
-	return operation == ChatCompletions || operation == Embeddings
+	return operation == ChatCompletions || operation == Responses || operation == Embeddings
 }
 
 func (a *openAIAdapter) Validate(Request) error { return nil }
@@ -29,6 +29,8 @@ func (a *openAIAdapter) Do(ctx context.Context, request Request, candidate routi
 	switch request.Operation {
 	case ChatCompletions:
 		endpoint = "chat/completions"
+	case Responses:
+		endpoint = "responses"
 	case Embeddings:
 		endpoint = "embeddings"
 	default:
@@ -54,35 +56,28 @@ func (a *openAIAdapter) Do(ctx context.Context, request Request, candidate routi
 		return Result{}, decodeHTTPError(response.StatusCode, data)
 	}
 	var envelope struct {
-		Model string `json:"model"`
-		Usage struct {
-			PromptTokens        int `json:"prompt_tokens"`
-			CompletionTokens    int `json:"completion_tokens"`
-			PromptTokensDetails *struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
+		Model string          `json:"model"`
+		Usage openAIUsageWire `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return Result{}, &ProviderError{Kind: ErrorKindProtocol, Message: "decode OpenAI response", Wrapped: err}
 	}
-	usage := Usage{InputTokens: envelope.Usage.PromptTokens, OutputTokens: envelope.Usage.CompletionTokens}
-	if envelope.Usage.PromptTokensDetails != nil {
-		usage.CacheReadTokens = envelope.Usage.PromptTokensDetails.CachedTokens
-	}
+	usage := parseOpenAIUsage(envelope.Usage)
 	return Result{Body: data, Model: envelope.Model, Usage: usage}, nil
 }
 
 func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candidate routing.Candidate) (Stream, error) {
-	if request.Operation != ChatCompletions {
+	if request.Operation != ChatCompletions && request.Operation != Responses {
 		return nil, unsupportedField(string(request.Operation))
 	}
-	// Detach from the caller's cancel: a stream outlives the attempt that produced it,
-	// and retry/per-attempt cancellation must not abort reads of subsequent chunks.
-	// candidate.Timeout still bounds the request via newRequest below.
 	streamCtx := context.WithoutCancel(ctx)
-	body := ensureIncludeUsage(request.Body)
-	req, cancel, err := a.client.newRequest(streamCtx, http.MethodPost, endpointURL(candidate.BaseURL, "chat/completions"), bodyWithModel(body, candidate.Model), candidate.Timeout)
+	body := request.Body
+	endpoint := "responses"
+	if request.Operation == ChatCompletions {
+		body = ensureIncludeUsage(body)
+		endpoint = "chat/completions"
+	}
+	req, cancel, err := a.client.newRequest(streamCtx, http.MethodPost, endpointURL(candidate.BaseURL, endpoint), bodyWithModel(body, candidate.Model), candidate.Timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +95,7 @@ func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candida
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		return nil, decodeHTTPError(response.StatusCode, data)
 	}
-	return &openAIStream{parser: newSSEParser(response.Body), response: response, cancel: cancel}, nil
+	return &openAIStream{responses: request.Operation == Responses, parser: newSSEParser(response.Body), response: response, cancel: cancel}, nil
 }
 
 // ensureIncludeUsage returns body with stream_options.include_usage=true set.
@@ -141,6 +136,7 @@ func bytesEqual(a, b []byte) bool {
 }
 
 type openAIStream struct {
+	responses    bool
 	parser       *sseParser
 	response     *http.Response
 	cancel       context.CancelFunc
@@ -152,6 +148,9 @@ type openAIStream struct {
 }
 
 func (s *openAIStream) Next() (StreamEvent, error) {
+	if s.responses {
+		return s.nextResponses()
+	}
 	for {
 		evt, err := s.parser.Next()
 		if err != nil {
@@ -208,6 +207,83 @@ func (s *openAIStream) Next() (StreamEvent, error) {
 			}
 		}
 		return event, nil
+	}
+}
+
+type openAIUsageWire struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	InputTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
+	OutputTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
+}
+
+func parseOpenAIUsage(w openAIUsageWire) Usage {
+	u := Usage{InputTokens: w.PromptTokens, OutputTokens: w.CompletionTokens}
+	if w.InputTokens != 0 || w.OutputTokens != 0 {
+		u.InputTokens, u.OutputTokens = w.InputTokens, w.OutputTokens
+	}
+	if w.InputTokensDetails != nil {
+		u.CacheReadTokens = w.InputTokensDetails.CachedTokens
+	}
+	if w.PromptTokensDetails != nil && u.CacheReadTokens == 0 {
+		u.CacheReadTokens = w.PromptTokensDetails.CachedTokens
+	}
+	if w.OutputTokensDetails != nil {
+		u.ReasoningTokens = w.OutputTokensDetails.ReasoningTokens
+	}
+	return u
+}
+
+func (s *openAIStream) nextResponses() (StreamEvent, error) {
+	for {
+		evt, err := s.parser.Next()
+		if err != nil {
+			if err == io.EOF {
+				if s.completed {
+					return StreamEvent{}, io.EOF
+				}
+				return StreamEvent{}, io.ErrUnexpectedEOF
+			}
+			return StreamEvent{}, err
+		}
+		if len(evt.Data) == 0 {
+			continue
+		}
+		var peek struct {
+			Type     string `json:"type"`
+			Response struct {
+				Model string          `json:"model"`
+				Usage openAIUsageWire `json:"usage"`
+			} `json:"response"`
+			Usage openAIUsageWire `json:"usage"`
+		}
+		if err := json.Unmarshal(evt.Data, &peek); err != nil {
+			return StreamEvent{}, &ProviderError{Kind: ErrorKindProtocol, Message: "decode OpenAI Responses stream event", Wrapped: err}
+		}
+		if peek.Response.Model != "" {
+			s.model = peek.Response.Model
+		}
+		if peek.Type == "response.completed" || peek.Type == "response.incomplete" {
+			s.completed = true
+			u := parseOpenAIUsage(peek.Response.Usage)
+			if u.InputTokens == 0 && u.OutputTokens == 0 {
+				u = parseOpenAIUsage(peek.Usage)
+			}
+			return StreamEvent{Event: evt.Type, Data: json.RawMessage(evt.Data), Done: true, Usage: u}, nil
+		}
+		if peek.Type == "response.error" {
+			return StreamEvent{}, &ProviderError{Kind: ErrorKindUpstream, Message: string(evt.Data)}
+		}
+		return StreamEvent{Event: evt.Type, Data: json.RawMessage(evt.Data)}, nil
 	}
 }
 

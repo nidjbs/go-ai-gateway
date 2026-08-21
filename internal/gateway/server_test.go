@@ -61,6 +61,38 @@ func TestChatForwardsProviderModelAndReturnsAlias(t *testing.T) {
 	}
 }
 
+func TestResponsesForwardsProviderModelAndReturnsAlias(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request["model"] != "provider-model" {
+			t.Fatalf("upstream model = %v", request["model"])
+		}
+		_, _ = w.Write([]byte(`{"id":"resp_1","model":"provider-model","output":[],"usage":{"input_tokens":1,"output_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(upstream.URL)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"chat","input":"hi"}`))
+	response := httptest.NewRecorder()
+	server.HTTP.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var body map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["model"] != "chat" {
+		t.Fatalf("response model = %v", body["model"])
+	}
+}
+
 func TestAnthropicUnsupportedRequestIsLocalBadRequest(t *testing.T) {
 	called := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))

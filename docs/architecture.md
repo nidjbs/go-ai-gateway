@@ -5,7 +5,7 @@ client -> concurrency -> auth -> guardrails -> alias resolver -> adapter filter 
                                         \-> usage sink (best effort after result)
 ```
 
-The public HTTP gateway is OpenAI-compatible. Routing translates a client-visible alias into an ordered provider list; adapter capability filtering removes providers that cannot satisfy the requested operation before retry/failover begins. `openai` providers retain raw JSON forwarding with only the resolved-model rewrite, while `anthropic` providers translate the supported Chat Completions subset to the Messages API and map responses back to OpenAI envelopes.
+The public HTTP gateway is OpenAI-compatible. Routing translates a client-visible alias into an ordered provider list; adapter capability filtering removes providers that cannot satisfy the requested operation before retry/failover begins. `openai` providers retain raw JSON forwarding with only the resolved-model rewrite for Chat Completions, Responses, and Embeddings; `anthropic` providers translate the supported Chat Completions subset to the Messages API and map responses back to OpenAI envelopes. Responses API passthrough is currently available only for `openai` providers.
 
 ## Middleware Pipeline
 

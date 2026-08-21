@@ -18,6 +18,7 @@ type Operation string
 
 const (
 	ChatCompletions Operation = "chat.completions"
+	Responses       Operation = "responses"
 	Embeddings      Operation = "embeddings"
 )
 
@@ -50,6 +51,7 @@ type Result struct {
 }
 
 type StreamEvent struct {
+	Event string
 	Data  json.RawMessage
 	Done  bool
 	Usage Usage
