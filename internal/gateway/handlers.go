@@ -14,17 +14,17 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/tidwall/sjson"
 
-	"example.com/light-llm-gateway/internal/apierr"
-	"example.com/light-llm-gateway/internal/auth"
-	"example.com/light-llm-gateway/internal/circuitbreaker"
-	"example.com/light-llm-gateway/internal/concurrency"
-	"example.com/light-llm-gateway/internal/config"
-	"example.com/light-llm-gateway/internal/metrics"
-	"example.com/light-llm-gateway/internal/provider"
-	"example.com/light-llm-gateway/internal/ratelimit"
-	"example.com/light-llm-gateway/internal/retry"
-	"example.com/light-llm-gateway/internal/routing"
-	"example.com/light-llm-gateway/internal/usage"
+	"github.com/nidjbs/go-ai-gateway/internal/apierr"
+	"github.com/nidjbs/go-ai-gateway/internal/auth"
+	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
+	"github.com/nidjbs/go-ai-gateway/internal/concurrency"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/metrics"
+	"github.com/nidjbs/go-ai-gateway/internal/provider"
+	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
+	"github.com/nidjbs/go-ai-gateway/internal/retry"
+	"github.com/nidjbs/go-ai-gateway/internal/routing"
+	"github.com/nidjbs/go-ai-gateway/internal/usage"
 )
 
 const (
@@ -169,7 +169,7 @@ func (h handler) models(w http.ResponseWriter, _ *http.Request) {
 		Data   []model `json:"data"`
 	}{Object: "list", Data: make([]model, 0, len(names))}
 	for _, name := range names {
-		out.Data = append(out.Data, model{ID: name, Object: "model", OwnedBy: "light-llm-gateway"})
+		out.Data = append(out.Data, model{ID: name, Object: "model", OwnedBy: "go-ai-gateway"})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -181,16 +181,15 @@ type chatRequest struct {
 }
 
 // recordBadRequest writes a 400 and a validation_error audit event.
-func (h handler) recordBadRequest(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate, message string) {
+func (h handler) recordBadRequest(ctx context.Context, started time.Time, endpoint, alias string, candidate routing.Candidate) {
 	h.recordUsage(ctx, usageRecord{
 		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
 		status: http.StatusBadRequest, errorType: "validation_error",
 	})
-	_ = message
 }
 
 func (h handler) writeInvalidRequest(w http.ResponseWriter, r *http.Request, started time.Time, alias string, candidate routing.Candidate, message string) {
-	h.recordBadRequest(r.Context(), started, requestEndpoint(r), alias, candidate, message)
+	h.recordBadRequest(r.Context(), started, requestEndpoint(r), alias, candidate)
 	apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", message)
 }
 
@@ -327,8 +326,8 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 	for result := range pumpStream(r.Context(), stream) {
 		if result.err != nil {
 			err := result.err
-			if err != io.EOF && seen && !errors.Is(err, context.Canceled) {
-				_, _ = fmt.Fprintf(w, "event: error\\ndata: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\\n\\n", upstreamErrorMessage)
+			if err != io.EOF && !errors.Is(err, context.Canceled) {
+				_, _ = fmt.Fprintf(w, "event: error\ndata: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
 				flusher.Flush()
 			}
 			errorType, streamOutcome, status := streamOutcomeFor(result.err, r.Context())
@@ -339,9 +338,9 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 		event := result.event
 		if len(event.Data) > 0 {
 			if event.Event != "" {
-				_, _ = fmt.Fprintf(w, "event: %s\\n", event.Event)
+				_, _ = fmt.Fprintf(w, "event: %s\n", event.Event)
 			}
-			_, _ = fmt.Fprintf(w, "data: %s\\n\\n", replaceModel(event.Data, alias))
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(event.Data, alias))
 			flusher.Flush()
 			if !seen {
 				seen = true
@@ -469,13 +468,12 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
-	seen := false
 	var firstToken time.Time
 	// pumpStream pushes events over a bounded channel, applying backpressure on slow clients.
 	for result := range pumpStream(r.Context(), stream) {
 		if result.err != nil {
 			err := result.err
-			if err != io.EOF && seen && !errors.Is(err, context.Canceled) {
+			if err != io.EOF && !errors.Is(err, context.Canceled) {
 				_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
 				flusher.Flush()
 			}
@@ -519,7 +517,6 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 				status: http.StatusOK, streamOutcome: "first_token", attempts: attempts,
 			})
 		}
-		seen = true
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(event.Data, alias))
 		flusher.Flush()
 	}
