@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"example.com/light-llm-gateway/internal/config"
-	"example.com/light-llm-gateway/internal/gateway"
-	"example.com/light-llm-gateway/internal/tracing"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/gateway"
+	"github.com/nidjbs/go-ai-gateway/internal/tracing"
 )
 
 func main() {

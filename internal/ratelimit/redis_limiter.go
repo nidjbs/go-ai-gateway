@@ -7,7 +7,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 // tokenBucketScript atomically refills a token bucket based on elapsed

@@ -15,10 +15,10 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"example.com/light-llm-gateway/internal/circuitbreaker"
-	"example.com/light-llm-gateway/internal/config"
-	"example.com/light-llm-gateway/internal/provider"
-	"example.com/light-llm-gateway/internal/routing"
+	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/provider"
+	"github.com/nidjbs/go-ai-gateway/internal/routing"
 )
 
 type Attempts struct {

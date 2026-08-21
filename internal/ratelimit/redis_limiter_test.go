@@ -6,7 +6,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 // newTestRedisLimiter boots an in-process Redis and returns a redisLimiter

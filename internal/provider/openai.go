@@ -9,7 +9,7 @@ import (
 
 	"github.com/tidwall/sjson"
 
-	"example.com/light-llm-gateway/internal/routing"
+	"github.com/nidjbs/go-ai-gateway/internal/routing"
 )
 
 type openAIAdapter struct {

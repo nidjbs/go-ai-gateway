@@ -15,8 +15,8 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
-	"example.com/light-llm-gateway/internal/auth"
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/auth"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 // TestDistributedRateLimitEnforcedAcrossReplicas is the headline test for the

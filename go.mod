@@ -1,4 +1,4 @@
-module example.com/light-llm-gateway
+module github.com/nidjbs/go-ai-gateway
 
 go 1.26.0
 

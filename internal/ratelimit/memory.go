@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 // NewMemoryLimiter returns an in-process token-bucket based Limiter.

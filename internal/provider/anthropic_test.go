@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/light-llm-gateway/internal/routing"
+	"github.com/nidjbs/go-ai-gateway/internal/routing"
 )
 
 func TestAnthropicRequestAndResponse(t *testing.T) {

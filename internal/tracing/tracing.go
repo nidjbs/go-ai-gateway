@@ -15,7 +15,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 // ShutdownFunc flushes the exporter on gateway termination; nil is a valid no-op.

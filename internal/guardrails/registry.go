@@ -3,7 +3,7 @@ package guardrails
 import (
 	"time"
 
-	"example.com/light-llm-gateway/internal/registry"
+	"github.com/nidjbs/go-ai-gateway/internal/registry"
 )
 
 // TrackerRegistry maps configured driver names to Tracker factories. The

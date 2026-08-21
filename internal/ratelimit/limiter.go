@@ -3,7 +3,7 @@ package ratelimit
 import (
 	"time"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 // Decision describes whether a single request is allowed by the rate limiter.

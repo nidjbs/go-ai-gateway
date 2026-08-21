@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"testing"
 
-	"example.com/light-llm-gateway/internal/circuitbreaker"
-	"example.com/light-llm-gateway/internal/provider"
+	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
+	"github.com/nidjbs/go-ai-gateway/internal/provider"
 )
 
 func TestClassifyProviderError(t *testing.T) {

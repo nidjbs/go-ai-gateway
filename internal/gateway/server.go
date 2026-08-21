@@ -15,16 +15,16 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
-	"example.com/light-llm-gateway/internal/apierr"
-	"example.com/light-llm-gateway/internal/auth"
-	"example.com/light-llm-gateway/internal/circuitbreaker"
-	"example.com/light-llm-gateway/internal/concurrency"
-	"example.com/light-llm-gateway/internal/config"
-	"example.com/light-llm-gateway/internal/guardrails"
-	"example.com/light-llm-gateway/internal/metrics"
-	"example.com/light-llm-gateway/internal/provider"
-	"example.com/light-llm-gateway/internal/ratelimit"
-	"example.com/light-llm-gateway/internal/usage"
+	"github.com/nidjbs/go-ai-gateway/internal/apierr"
+	"github.com/nidjbs/go-ai-gateway/internal/auth"
+	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
+	"github.com/nidjbs/go-ai-gateway/internal/concurrency"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/guardrails"
+	"github.com/nidjbs/go-ai-gateway/internal/metrics"
+	"github.com/nidjbs/go-ai-gateway/internal/provider"
+	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
+	"github.com/nidjbs/go-ai-gateway/internal/usage"
 )
 
 // maxPerKeyLimiters caps the per-key limiter map to prevent unbounded growth

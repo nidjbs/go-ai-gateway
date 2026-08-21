@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 var ErrUnauthorized = errors.New("unauthorized")

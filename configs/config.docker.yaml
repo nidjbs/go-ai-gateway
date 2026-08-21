@@ -1,0 +1,73 @@
+listen: 0.0.0.0:8080
+healthz: 0.0.0.0:8081
+readyz_wait_time: 5s
+
+auth:
+  mode: api-key
+
+teams:
+  - id: team-redis-smoke
+    name: Redis Smoke Test
+    api_keys:
+      - id: sk-smoke-test-key
+        key: sk-smoke-test-key
+        limits:
+          rps: 5
+          burst: 5
+          preday_tokens: 100000
+          monthly_tokens: 2000000
+
+providers:
+  local:
+    type: openai
+    base_url: http://mock:19090/v1
+    api_key_env: UPSTREAM_API_KEY
+    request_timeout: 30s
+
+aliases:
+  chat:
+    provider: local
+    model: primary-chat
+
+retry:
+  enabled: true
+  max_attempts_per_provider: 1
+  max_elapsed_time: 30s
+  per_attempt_timeout: 10s
+  initial_interval: 200ms
+  max_interval: 2s
+  multiplier: 2
+  jitter: 0.2
+  retryable_statuses: [408, 429, 500, 502, 503, 504]
+
+failover:
+  enabled: false
+  max_providers: 0
+
+circuit_breaker:
+  enabled: false
+
+server:
+  max_concurrent_requests: 0
+  max_concurrent_per_key: 0
+
+tracing:
+  enabled: false
+
+# ── Distributed storage (Redis) ──────────────────────────────────────────
+# Both gateway replicas point at the same Redis so rate-limit / quota state
+# is shared. Without this block the limiters would be per-replica and a
+# `rps: 5` setting would actually allow 10 req/s across two replicas.
+
+rate_limit:
+  driver: redis
+  options:
+    addr: redis:6379
+
+quota:
+  driver: redis
+  options:
+    addr: redis:6379
+
+guardrails:
+  enabled: false

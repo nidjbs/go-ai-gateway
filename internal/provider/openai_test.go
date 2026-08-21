@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/light-llm-gateway/internal/routing"
+	"github.com/nidjbs/go-ai-gateway/internal/routing"
 )
 
 // helper that writes an SSE chunk followed by a blank line.

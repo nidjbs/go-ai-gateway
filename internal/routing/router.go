@@ -5,7 +5,7 @@ import (
 	"sort"
 	"time"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 type Candidate struct {

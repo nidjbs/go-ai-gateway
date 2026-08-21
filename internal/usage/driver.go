@@ -1,6 +1,6 @@
 package usage
 
-import "example.com/light-llm-gateway/internal/registry"
+import "github.com/nidjbs/go-ai-gateway/internal/registry"
 
 // Registry maps configured sink driver names to Sink factories.
 // The "audit" driver is not registered here because it requires a *slog.Logger

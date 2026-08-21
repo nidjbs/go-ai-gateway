@@ -13,7 +13,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
-const instrumentationName = "example.com/light-llm-gateway/internal/metrics"
+const instrumentationName = "github.com/nidjbs/go-ai-gateway/internal/metrics"
 
 var (
 	llmRequestDurationBuckets    = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}

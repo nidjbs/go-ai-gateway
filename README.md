@@ -1,4 +1,4 @@
-# light-llm-gateway
+# go-ai-gateway
 
 A lightweight, OpenAI-compatible AI gateway for routing model aliases across OpenAI-compatible and Anthropic upstreams. It supports retries, failover, API-key tenancy, quotas, Redis-backed distributed limits, usage records, metrics, and optional prompt-injection guardrails.
 

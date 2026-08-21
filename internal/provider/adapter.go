@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"example.com/light-llm-gateway/internal/routing"
+	"github.com/nidjbs/go-ai-gateway/internal/routing"
 )
 
 type Operation string

@@ -1,7 +1,7 @@
 package ratelimit
 
 import (
-	"example.com/light-llm-gateway/internal/registry"
+	"github.com/nidjbs/go-ai-gateway/internal/registry"
 )
 
 // LimiterRegistry and QuotaRegistry hold driver factories. Default "memory"

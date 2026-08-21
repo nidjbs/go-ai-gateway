@@ -3,7 +3,7 @@ package routing
 import (
 	"testing"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 func TestResolveSortsProvidersByPriority(t *testing.T) {

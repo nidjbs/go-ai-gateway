@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	"example.com/light-llm-gateway/internal/routing"
+	"github.com/nidjbs/go-ai-gateway/internal/routing"
 )
 
 const anthropicVersion = "2023-06-01"

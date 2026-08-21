@@ -17,4 +17,4 @@ jobs:
       - run: go vet ./...
       - run: go build ./cmd/gateway
       - run: scripts/e2e.sh
-      - run: docker build -t light-llm-gateway:ci .
+      - run: docker build -t go-ai-gateway:ci .

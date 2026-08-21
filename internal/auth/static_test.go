@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 func TestStaticAuthenticatorAcceptsOnlyConfiguredBearerToken(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"example.com/light-llm-gateway/internal/routing"
+	"github.com/nidjbs/go-ai-gateway/internal/routing"
 )
 
 func TestOpenStreamKeepsContextUntilClose(t *testing.T) {

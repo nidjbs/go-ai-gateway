@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"time"
 
-	"example.com/light-llm-gateway/internal/config"
-	"example.com/light-llm-gateway/internal/ratelimit"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
 )
 
 func writeRateLimitHeaders(w http.ResponseWriter, limits config.KeyLimits, decision ratelimit.Decision) {

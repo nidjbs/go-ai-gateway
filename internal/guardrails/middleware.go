@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"time"
 
-	"example.com/light-llm-gateway/internal/apierr"
-	"example.com/light-llm-gateway/internal/auth"
+	"github.com/nidjbs/go-ai-gateway/internal/apierr"
+	"github.com/nidjbs/go-ai-gateway/internal/auth"
 )
 
 // ctxKey is the context-key type for guardrails scan results.

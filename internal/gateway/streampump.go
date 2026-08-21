@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"example.com/light-llm-gateway/internal/provider"
+	"github.com/nidjbs/go-ai-gateway/internal/provider"
 )
 
 // streamBufferSize bounds the in-flight queue between upstream reader and client

@@ -23,14 +23,14 @@ services:
     build:
       context: .
       target: gateway
-    command: ["--config", "/etc/light-llm-gateway/config.yaml"]
+    command: ["--config", "/etc/go-ai-gateway/config.yaml"]
     ports:
       - "8080:8080"
       - "8081:8081"
     environment:
       UPSTREAM_API_KEY: primary-token
     volumes:
-      - ./configs/config.docker.yaml:/etc/light-llm-gateway/config.yaml:ro
+      - ./configs/config.docker.yaml:/etc/go-ai-gateway/config.yaml:ro
     depends_on:
       mock:
         condition: service_started
@@ -42,14 +42,14 @@ services:
     build:
       context: .
       target: gateway
-    command: ["--config", "/etc/light-llm-gateway/config.yaml"]
+    command: ["--config", "/etc/go-ai-gateway/config.yaml"]
     ports:
       - "8082:8080"
       - "8083:8081"
     environment:
       UPSTREAM_API_KEY: primary-token
     volumes:
-      - ./configs/config.docker.yaml:/etc/light-llm-gateway/config.yaml:ro
+      - ./configs/config.docker.yaml:/etc/go-ai-gateway/config.yaml:ro
     depends_on:
       mock:
         condition: service_started

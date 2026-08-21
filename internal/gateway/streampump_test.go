@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"example.com/light-llm-gateway/internal/provider"
+	"github.com/nidjbs/go-ai-gateway/internal/provider"
 )
 
 // fakeStream is a minimal provider.Stream used to drive pumpStream in

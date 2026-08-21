@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"example.com/light-llm-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/config"
 )
 
 func TestMemoryLimiterRejectsWhenBurstIsExceeded(t *testing.T) {
