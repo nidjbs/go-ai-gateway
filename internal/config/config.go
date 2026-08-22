@@ -61,6 +61,12 @@ type Provider struct {
 	APIKey         string        `yaml:"-"`
 	BaseURL        string        `yaml:"base_url"`
 	RequestTimeout time.Duration `yaml:"request_timeout"`
+	// ForceUsage controls whether streaming chat requests get
+	// stream_options.include_usage=true injected so the upstream reports token
+	// usage (and quota/cost accounting has real data instead of estimates).
+	// nil (unset) keeps the safe default of injecting; true forces it; false
+	// suppresses it and trusts the upstream's default.
+	ForceUsage *bool `yaml:"force_usage"`
 }
 
 type Alias struct {

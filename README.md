@@ -183,7 +183,7 @@ Rotation is a config change + restart: add the new digest, restart, remove the o
 ## Production hardening
 
 - **Dependency-aware readiness & fail-fast startup** — a replica whose Redis is unreachable reports 503, and the process refuses to start with a misconfigured backend.
-- **Quota that cannot be bypassed** — per-key `max_requests_per_day` counters, estimated token charging when upstreams omit usage or a stream ends before a usage chunk (failure, timeout, client abort), and per-request ceilings via `max_tokens_per_request`.
+- **Quota that cannot be bypassed** — per-key `max_requests_per_day` counters, estimated token charging when upstreams omit usage or a stream ends before a usage chunk (failure, timeout, client abort), and per-request ceilings via Streaming chat requests automatically inject stream_options.include_usage=true (per-provider force_usage can force or suppress it) so token data comes from the upstream whenever possible, `max_tokens_per_request`.
 - **Stream timeouts** — `server.stream_idle_timeout` / `server.stream_max_duration` bound silent and endless streams, ending them with an SSE error frame.
 - **Idempotent retries** — with `server.idempotency_enabled: true`, clients sending an `Idempotency-Key` on non-streaming chat/responses get the cached response on retry instead of a second upstream execution and second charge.
 - **HTTP timeouts** — `server.read_timeout` / `server.idle_timeout` (defaults 30s/90s); `WriteTimeout` is intentionally unset so streams can run indefinitely.

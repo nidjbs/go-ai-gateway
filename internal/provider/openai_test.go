@@ -100,6 +100,39 @@ func TestOpenAIStreamInjectsIncludeUsageOnWire(t *testing.T) {
 	}
 }
 
+// TestForceUsageTriStateOnWire pins the force_usage contract: unset and
+// force_usage=true inject stream_options.include_usage, force_usage=false
+// leaves the body untouched.
+func TestForceUsageTriStateOnWire(t *testing.T) {
+	run := func(t *testing.T, force *bool, wantInjected bool) {
+		var captured struct {
+			StreamOptions json.RawMessage `json:"stream_options"`
+		}
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewDecoder(r.Body).Decode(&captured)
+			w.Header().Set("Content-Type", "text/event-stream")
+			writeSSE(w, w.(http.Flusher), map[string]string{"data": `[DONE]`})
+		}))
+		defer upstream.Close()
+		body := json.RawMessage(`{"model":"chat","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		stream, err := NewClient().OpenStream(context.Background(), Request{Operation: ChatCompletions, Body: body}, routing.Candidate{BaseURL: upstream.URL, ForceUsage: force})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stream.Close()
+		injected := len(captured.StreamOptions) > 0 && strings.Contains(string(captured.StreamOptions), `"include_usage":true`)
+		if injected != wantInjected {
+			t.Fatalf("force=%v injected=%v, want %v (stream_options=%s)", force, injected, wantInjected, captured.StreamOptions)
+		}
+	}
+
+	t.Run("unset injects by default", func(t *testing.T) { run(t, nil, true) })
+	t.Run("true forces injection", func(t *testing.T) { run(t, boolPtr(true), true) })
+	t.Run("false suppresses injection", func(t *testing.T) { run(t, boolPtr(false), false) })
+}
+
+func boolPtr(v bool) *bool { return &v }
+
 func TestOpenAIStreamParsesUsageOnlyChunk(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

@@ -74,7 +74,9 @@ func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candida
 	body := request.Body
 	endpoint := "responses"
 	if request.Operation == ChatCompletions {
-		body = ensureIncludeUsage(body)
+		if shouldIncludeUsage(candidate) {
+			body = ensureIncludeUsage(body)
+		}
 		endpoint = "chat/completions"
 	}
 	req, cancel, err := a.client.newRequest(streamCtx, http.MethodPost, endpointURL(candidate.BaseURL, endpoint), bodyWithModel(body, candidate.Model), candidate.Timeout)
@@ -96,6 +98,18 @@ func (a *openAIAdapter) OpenStream(ctx context.Context, request Request, candida
 		return nil, decodeHTTPError(response.StatusCode, data)
 	}
 	return &openAIStream{responses: request.Operation == Responses, parser: newSSEParser(response.Body), response: response, cancel: cancel}, nil
+}
+
+// shouldIncludeUsage reports whether to inject stream_options.include_usage
+// into a streaming chat request. force_usage=true forces the injection,
+// force_usage=false suppresses it (trusting the upstream's default), and an
+// unset value keeps the safe default of injecting so quota and cost
+// accounting always receive real token data instead of estimates.
+func shouldIncludeUsage(candidate routing.Candidate) bool {
+	if candidate.ForceUsage == nil {
+		return true
+	}
+	return *candidate.ForceUsage
 }
 
 // ensureIncludeUsage returns body with stream_options.include_usage=true set.

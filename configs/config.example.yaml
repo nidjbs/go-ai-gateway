@@ -38,6 +38,12 @@ providers:
     base_url: http://host.docker.internal:19090/v1
     api_key_env: UPSTREAM_API_KEY
     request_timeout: 30s
+    # force_usage controls stream_options.include_usage injection on streaming
+    # chat requests so the upstream reports token usage (quota/cost data):
+    #   unset  -> inject (default; safe for quota accounting)
+    #   true   -> always inject
+    #   false  -> never inject; trust the upstream's default
+    # force_usage: true
 
 aliases:
   chat:
