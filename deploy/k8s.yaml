@@ -1,0 +1,231 @@
+# Reference Kubernetes manifests for go-ai-gateway.
+#
+# Apply order: config/secret first, then redis, then the gateway workload.
+#   kubectl apply -f deploy/k8s.yaml
+#
+# This is a starting point, not a turnkey install: replace the Secret values,
+# adjust limits, and point probe/readiness settings at your setup.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-gateway
+---
+# Gateway configuration. Store non-secret settings here; the Secret below
+# holds upstream tokens. If you use auth.mode=api-key, keep keys out of this
+# ConfigMap by templating them from the Secret (or switch to key hashes).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: ai-gateway
+data:
+  config.yaml: |
+    listen: 0.0.0.0:8080
+    healthz: 0.0.0.0:8081
+    readyz_wait_time: 10s
+    # Protect operational endpoints (metrics, readyz) with a token when the
+    # ops port is reachable from outside the cluster:
+    # ops_token_env: OPS_TOKEN
+
+    auth:
+      mode: none            # switch to static or api-key before public exposure
+
+    providers:
+      primary:
+        type: openai
+        base_url: https://api.openai.com/v1
+        api_key_env: UPSTREAM_API_KEY
+        request_timeout: 30s
+
+    aliases:
+      chat:
+        provider: primary
+        model: gpt-4o-mini
+
+    retry:
+      enabled: true
+      max_attempts_per_provider: 2
+      max_elapsed_time: 30s
+
+    failover:
+      enabled: false
+
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 5
+      open_duration: 30s
+
+    server:
+      max_concurrent_requests: 0
+      max_concurrent_per_key: 0
+      read_timeout: 30s
+      idle_timeout: 90s
+
+    # rate_limit / quota: point at the redis Service in this namespace.
+    rate_limit:
+      driver: redis
+      options:
+        addr: redis:6379
+        password: ""
+    quota:
+      driver: redis
+      options:
+        addr: redis:6379
+        password: ""
+
+    guardrails:
+      enabled: false
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gateway-secrets
+  namespace: ai-gateway
+type: Opaque
+stringData:
+  UPSTREAM_API_KEY: replace-me
+  # OPS_TOKEN: replace-me   # only when ops_token_env is set above
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: ai-gateway
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: ai-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--save", "", "--appendonly", "no"]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+---
+# API service: the port clients call. Expose via an Ingress / LoadBalancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-api
+  namespace: ai-gateway
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: api
+      port: 8080
+      targetPort: 8080
+---
+# Operational service (healthz/readyz/metrics) for probes and scraping.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-ops
+  namespace: ai-gateway
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: ops
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: ai-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: ghcr.io/nidjbs/go-ai-gateway:latest
+          args: ["--config", "/etc/gateway/config.yaml"]
+          ports:
+            - name: api
+              containerPort: 8080
+            - name: ops
+              containerPort: 8081
+          envFrom:
+            - secretRef:
+                name: gateway-secrets
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gateway
+              readOnly: true
+          resources:
+            requests: {cpu: 250m, memory: 128Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          startupProbe:
+            httpGet: {path: /readyz, port: ops}
+            failureThreshold: 30
+            periodSeconds: 2
+      volumes:
+        - name: config
+          configMap:
+            name: gateway-config
+---
+# Scale on in-flight requests. Requires metrics-server in the cluster.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: ai-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+

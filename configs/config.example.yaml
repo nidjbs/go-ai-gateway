@@ -2,6 +2,10 @@ listen: 127.0.0.1:8080
 healthz: 127.0.0.1:8081
 readyz_wait_time: 10s
 
+# Optional: require a bearer token (from this env var) on operational
+# endpoints (/metrics, /readyz, /version). Leave unset for no auth.
+# ops_token_env: GATEWAY_OPS_TOKEN
+
 auth:
   mode: none
   token_env: GATEWAY_STATIC_TOKEN
@@ -24,6 +28,8 @@ teams:
           alias_preday_tokens:           # per-model daily quotas
             chat: 50000
             embedding: 100000
+          # max_requests_per_day: 1000      # hard per-key request counter (charged before execution)
+          # max_tokens_per_request: 4096    # clamp max_tokens / max_completion_tokens / max_output_tokens per request
 
 providers:
   local:
@@ -72,6 +78,12 @@ circuit_breaker:
 server:
   max_concurrent_requests: 0   # total in-flight requests across all keys
   max_concurrent_per_key: 0    # in-flight requests per API key
+  read_timeout: 30s            # http server read timeout (slow-body protection)
+  idle_timeout: 90s            # reap idle keep-alive connections
+  stream_idle_timeout: 0       # kill streams silent for this long (0 = off)
+  stream_max_duration: 0       # hard ceiling on total stream lifetime (0 = off)
+  idempotency_enabled: false   # replay non-streaming responses for Idempotency-Key retries
+  idempotency_ttl: 1h          # replay cache TTL
 
 # OpenTelemetry tracing. When enabled, the gateway emits server spans for
 # each inbound request, client spans for each upstream call (with traceparent
@@ -120,6 +132,10 @@ guardrails:
    enabled: true
    mode: block
    threshold: 0.75
+   # Substrings that bypass scanning when present in message content — an
+   # escape hatch for false-positive-prone payloads (benchmark suites, etc.).
+   # allowlist:
+   #   - BENCHMARK_PAYLOAD
    tracker:
      max_attempts: 3
      window_sec: 60

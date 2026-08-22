@@ -155,24 +155,50 @@ teams:
 
 Generate a new key with either `go run ./cmd/keygen` or `./scripts/genkey.sh`.
 
+For production, configure **hashes** instead of plaintext keys — the gateway
+authenticates against SHA-256 digests, so the plaintext never needs to live in
+config files or process memory:
+
+```bash
+go run ./cmd/keygen -sha256   # prints sha256:<hex> for the config file
+```
+
+Rotation is a config change + restart: add the new digest, restart, remove the old one.
+
 ## Operations
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /healthz`, `GET /livez` | Liveness |
-| `GET /readyz` | Readiness after the configured startup window |
+| `GET /readyz` | Dependency-aware readiness: 204 only after the startup window **and** when every configured backend (e.g. Redis) responds to its probe |
+| `GET /version` | Build metadata (version / commit / build date) |
 | `GET /metrics` | Prometheus metrics |
 | `GET /v1/models` | Available aliases |
 | `POST /v1/chat/completions` | OpenAI-compatible chat completions, including streaming |
 | `POST /v1/responses` | OpenAI Responses API passthrough, including streaming (OpenAI-compatible providers) |
 | `POST /v1/embeddings` | OpenAI-compatible embeddings |
 
-`/healthz` and `/livez` return `200`. `/readyz` returns `503` during the configured startup window and `204` afterward: 5 seconds in `configs/config.docker.yaml` and 10 seconds in `configs/config.example.yaml`.
+`/healthz` and `/livez` return `200`. `/readyz` returns `503` during the startup window or while a dependency probe fails, then `204`: 5 seconds in `configs/config.docker.yaml` and 10 seconds in `configs/config.example.yaml`. Set `ops_token_env` to require a bearer token on operational endpoints.
+
+## Production hardening
+
+- **Dependency-aware readiness & fail-fast startup** — a replica whose Redis is unreachable reports 503, and the process refuses to start with a misconfigured backend.
+- **Quota that cannot be bypassed** — per-key `max_requests_per_day` counters, estimated token charging when upstreams omit usage or a stream ends before a usage chunk (failure, timeout, client abort), and per-request ceilings via `max_tokens_per_request`.
+- **Stream timeouts** — `server.stream_idle_timeout` / `server.stream_max_duration` bound silent and endless streams, ending them with an SSE error frame.
+- **Idempotent retries** — with `server.idempotency_enabled: true`, clients sending an `Idempotency-Key` on non-streaming chat/responses get the cached response on retry instead of a second upstream execution and second charge.
+- **HTTP timeouts** — `server.read_timeout` / `server.idle_timeout` (defaults 30s/90s); `WriteTimeout` is intentionally unset so streams can run indefinitely.
+- **Ops auth** — `ops_token_env` protects `/metrics`, `/readyz`, `/version`.
+- **Hashed API keys** — `go run ./cmd/keygen -sha256` for digest-based key config and clean rotation.
+- **Guardrails escape hatch** — `guardrails.allowlist` bypasses scanning for false-positive-prone payloads in block mode.
+- **Circuit breaker** — enabled in the example configs; trips on consecutive upstream failures.
+
+See [Operations guide](docs/operations.md) for the multi-replica runbook, load testing (`scripts/load_test.sh`), and alerting. Reference Kubernetes manifests live in `deploy/k8s.yaml`.
 
 ## Documentation
 
 - [Architecture](docs/architecture.md): request pipeline, provider behavior, Redis distributed state, guardrails, and observability.
 - [Extending](docs/extending.md): custom authentication, usage sinks, and storage drivers.
+- [Operations](docs/operations.md): multi-replica production runbook, probes, scaling, secrets, and alerting.
 - [Configuration example](configs/config.example.yaml): all supported built-in settings.
 - [Security policy](SECURITY.md): vulnerability reporting process.
 - [Contributing](CONTRIBUTING.md): local contribution workflow.
