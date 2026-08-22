@@ -142,7 +142,11 @@ func quotaKey(scope QuotaScope) string {
 	if scope.Window == WindowMonthly {
 		windowName = "monthly"
 	}
-	key := "quota:" + windowName + ":" + scope.KeyID
+	metric := scope.Metric
+	if metric == "" {
+		metric = "tokens"
+	}
+	key := "quota:" + windowName + ":" + metric + ":" + scope.KeyID
 	if scope.Alias != "" {
 		key += ":" + scope.Alias
 	}

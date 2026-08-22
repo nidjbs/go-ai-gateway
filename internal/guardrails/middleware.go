@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/nidjbs/go-ai-gateway/internal/apierr"
@@ -29,6 +30,9 @@ type Config struct {
 	CanaryEnabled    bool    // whether outbound canary token detection is active
 	CanaryBufferSize int     // outbound detection buffer size in bytes
 	Tracker          TrackerConfig
+	// Allowlist holds substrings that bypass scanning when present in the
+	// message content — an escape hatch for false-positive-prone payloads.
+	Allowlist []string
 }
 
 // DefaultConfig returns the default configuration.
@@ -92,6 +96,10 @@ func (m *Middleware) Handle(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if m.allowlisted(messages) {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		result := m.scanner.ScanMessages(messages, m.config.Threshold)
 
@@ -142,6 +150,28 @@ func (m *Middleware) Handle(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// allowlisted reports whether any message content contains a configured
+// allowlist substring. It gives operators an escape hatch for payloads that
+// reliably false-positive (benchmark suites, red-team exercises, structured
+// tool data) without disabling the whole layer.
+func (m *Middleware) allowlisted(messages []Message) bool {
+	if len(m.config.Allowlist) == 0 {
+		return false
+	}
+	var buf strings.Builder
+	for _, msg := range messages {
+		buf.WriteString(msg.Content)
+		buf.WriteByte('\n')
+	}
+	content := buf.String()
+	for _, entry := range m.config.Allowlist {
+		if entry != "" && strings.Contains(content, entry) {
+			return true
+		}
+	}
+	return false
 }
 
 // ScanResultFromContext retrieves the guardrails scan result from the context.

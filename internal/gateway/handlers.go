@@ -9,7 +9,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/tidwall/sjson"
@@ -45,6 +48,15 @@ type handler struct {
 	keyConcurrency func(keyID string) *concurrency.Limiter
 	now            func() time.Time
 	apiKeyLimits   map[string]config.KeyLimits
+	idemMu         *sync.Mutex
+	idem           map[string]idemEntry
+}
+
+// idemEntry is one cached successful response keyed by (api key, Idempotency-Key).
+type idemEntry struct {
+	status   int
+	body     []byte
+	storedAt time.Time
 }
 
 // usageRecord is the structured payload every handler passes to recordUsage.
@@ -126,6 +138,18 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 					return
 				}
 			}
+			if h.quotaStore != nil && limits.MaxRequestsPerDay > 0 {
+				status := h.quotaStore.Charge(ratelimit.QuotaScope{KeyID: principal.APIKeyID, Window: ratelimit.WindowDaily, Metric: ratelimit.RequestsMetric}, limits.MaxRequestsPerDay, 1, h.now())
+				if status.Used > limits.MaxRequestsPerDay {
+					h.recordUsage(ctx, usageRecord{
+						started: started, endpoint: requestEndpoint(r),
+						candidate: routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID},
+						status:    http.StatusTooManyRequests, errorType: "quota_exceeded_requests",
+					})
+					apierr.Write(w, http.StatusTooManyRequests, "quota_exceeded_requests", "rate_limit_error", "API key daily request quota exceeded")
+					return
+				}
+			}
 			if h.quotaStore != nil && limits.PredayTokens > 0 {
 				status := h.quotaStore.Peek(ratelimit.QuotaScope{KeyID: principal.APIKeyID, Window: ratelimit.WindowDaily}, limits.PredayTokens, h.now())
 				writeQuotaHeaders(w, status)
@@ -202,9 +226,13 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
 			return
 		}
+		body = h.capRequestTokens(principal, body)
 	}
 	if request.Stream {
 		h.chatStream(w, r, body, request.Model, candidates)
+		return
+	}
+	if h.replayIdempotent(w, r, "chat.completions", request.Model, h.now()) {
 		return
 	}
 	started := h.now()
@@ -217,7 +245,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
-		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.Usage.Total()))
+		h.chargeQuota(w, principal.APIKeyID, request.Model, h.chargeableTokens(int64(result.Usage.Total()), body))
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.recordUsage(r.Context(), usageRecord{
@@ -229,6 +257,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		started: started, endpoint: "chat.completions", alias: request.Model, candidate: candidate,
 		usage: result.Usage, status: http.StatusOK,
 	})
+	h.storeIdempotent(r, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.logger.Info("request complete", "request_id", requestID(r), "endpoint", "chat.completions", "provider", candidate.Name, "attempts", attempts.Total, "status", http.StatusOK, "upstream_duration_ms", time.Since(started).Milliseconds())
 }
 
@@ -243,11 +272,17 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
-		return
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
+			return
+		}
+		body = h.capRequestTokens(principal, body)
 	}
 	if request.Stream {
 		h.responsesStream(w, r, body, request.Model, candidates)
+		return
+	}
+	if h.replayIdempotent(w, r, "responses", request.Model, h.now()) {
 		return
 	}
 	started := h.now()
@@ -260,11 +295,12 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
-		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.Usage.Total()))
+		h.chargeQuota(w, principal.APIKeyID, request.Model, h.chargeableTokens(int64(result.Usage.Total()), body))
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK, attempts: attempts})
 	h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK})
+	h.storeIdempotent(r, http.StatusOK, replaceModel(result.Body, request.Model))
 }
 
 func (h handler) parseResponses(w http.ResponseWriter, r *http.Request) (json.RawMessage, responsesRequest, []routing.Candidate, bool) {
@@ -321,15 +357,27 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	streamCtx, cancelStream := context.WithCancel(r.Context())
+	defer cancelStream()
+	idleFired, maxFired, resetIdle, stopWatchdogs := startStreamWatchdogs(h.config.Server.StreamIdleTimeout, h.config.Server.StreamMaxDuration, cancelStream)
+	defer stopWatchdogs()
+
 	seen := false
 	var firstToken time.Time
-	for result := range pumpStream(r.Context(), stream) {
+	var emittedRunes int64
+	for result := range pumpStream(streamCtx, stream) {
+		resetIdle()
+		if idleFired() || maxFired() {
+			h.writeStreamTimeout(w, r, started, "responses", alias, candidate, firstToken, attempts, body, emittedRunes, idleFired, maxFired)
+			return
+		}
 		if result.err != nil {
 			err := result.err
 			if err != io.EOF && !errors.Is(err, context.Canceled) {
 				_, _ = fmt.Fprintf(w, "event: error\ndata: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
 				flusher.Flush()
 			}
+			h.chargeStreamEstimate(w, r, alias, body, emittedRunes)
 			errorType, streamOutcome, status := streamOutcomeFor(result.err, r.Context())
 			h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, ttft: firstToken, streaming: true, status: status, errorType: errorType, streamOutcome: streamOutcome, attempts: attempts})
 			h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, firstToken: firstToken, status: status, errorType: errorType})
@@ -337,6 +385,7 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 		}
 		event := result.event
 		if len(event.Data) > 0 {
+			emittedRunes += int64(utf8.RuneCount(event.Data))
 			if event.Event != "" {
 				_, _ = fmt.Fprintf(w, "event: %s\n", event.Event)
 			}
@@ -356,6 +405,9 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 			h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, usage: event.Usage, firstToken: firstToken, status: http.StatusOK})
 			return
 		}
+	}
+	if idleFired() || maxFired() {
+		h.writeStreamTimeout(w, r, started, "responses", alias, candidate, firstToken, attempts, body, emittedRunes, idleFired, maxFired)
 	}
 }
 
@@ -468,15 +520,27 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	streamCtx, cancelStream := context.WithCancel(r.Context())
+	defer cancelStream()
+	idleFired, maxFired, resetIdle, stopWatchdogs := startStreamWatchdogs(h.config.Server.StreamIdleTimeout, h.config.Server.StreamMaxDuration, cancelStream)
+	defer stopWatchdogs()
+
 	var firstToken time.Time
+	var emittedRunes int64
 	// pumpStream pushes events over a bounded channel, applying backpressure on slow clients.
-	for result := range pumpStream(r.Context(), stream) {
+	for result := range pumpStream(streamCtx, stream) {
+		resetIdle()
+		if idleFired() || maxFired() {
+			h.writeStreamTimeout(w, r, started, "chat.completions", alias, candidate, firstToken, attempts, body, emittedRunes, idleFired, maxFired)
+			return
+		}
 		if result.err != nil {
 			err := result.err
 			if err != io.EOF && !errors.Is(err, context.Canceled) {
 				_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
 				flusher.Flush()
 			}
+			h.chargeStreamEstimate(w, r, alias, body, emittedRunes)
 			errorType, streamOutcome, status := streamOutcomeFor(result.err, r.Context())
 			h.recordUsage(r.Context(), usageRecord{
 				started: started, endpoint: "chat.completions", alias: alias, candidate: candidate,
@@ -509,6 +573,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 			})
 			return
 		}
+		emittedRunes += int64(utf8.RuneCount(event.Data))
 		if firstToken.IsZero() {
 			firstToken = h.now()
 			h.recordUsage(r.Context(), usageRecord{
@@ -520,6 +585,94 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(event.Data, alias))
 		flusher.Flush()
 	}
+	if idleFired() || maxFired() {
+		h.writeStreamTimeout(w, r, started, "chat.completions", alias, candidate, firstToken, attempts, body, emittedRunes, idleFired, maxFired)
+	}
+}
+
+// startStreamWatchdogs arms idle and maximum-duration timers for a streaming
+// response. idle bounds the gap between consecutive upstream events; max
+// bounds the total stream lifetime. Either timer firing cancels the pump
+// context. The returned predicates report which timer fired, resetIdle re-arms
+// the idle timer after each event, and stop releases both timers.
+func startStreamWatchdogs(idle, max time.Duration, cancel context.CancelFunc) (idleFired, maxFired func() bool, resetIdle func(), stop func()) {
+	var idleFlag atomic.Bool
+	var maxFlag atomic.Bool
+	var idleTimer *time.Timer
+	var maxTimer *time.Timer
+	if idle > 0 {
+		idleTimer = time.AfterFunc(idle, func() {
+			idleFlag.Store(true)
+			cancel()
+		})
+	}
+	if max > 0 {
+		maxTimer = time.AfterFunc(max, func() {
+			maxFlag.Store(true)
+			cancel()
+		})
+	}
+	return func() bool { return idleFlag.Load() },
+		func() bool { return maxFlag.Load() },
+		func() {
+			if idleTimer != nil {
+				idleTimer.Reset(idle)
+			}
+		},
+		func() {
+			if idleTimer != nil {
+				idleTimer.Stop()
+			}
+			if maxTimer != nil {
+				maxTimer.Stop()
+			}
+		}
+}
+
+// chargeStreamEstimate charges a stream that ended without an upstream usage
+// chunk: estimated input tokens plus an output-token estimate derived from the
+// bytes already emitted to the client. Without this, streams that fail, time
+// out, or get aborted mid-generation would bypass quota and cost accounting
+// entirely.
+func (h handler) chargeStreamEstimate(w http.ResponseWriter, r *http.Request, alias string, body []byte, emittedRunes int64) {
+	principal, ok := auth.PrincipalFromContext(r.Context())
+	if !ok || principal.APIKeyID == "" {
+		return
+	}
+	delta := estimateTokens(body) + runesToTokenEstimate(emittedRunes)
+	if delta <= 0 {
+		return
+	}
+	h.chargeQuota(w, principal.APIKeyID, alias, delta)
+}
+
+// writeStreamTimeout terminates a stream that exceeded its idle or maximum
+// duration limit with an SSE error frame, audit event, and metric. The reason
+// is derived from whichever watchdog fired.
+func (h handler) writeStreamTimeout(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, candidate routing.Candidate, firstToken time.Time, attempts retry.Attempts, body []byte, emittedRunes int64, idleFired, maxFired func() bool) {
+	h.chargeStreamEstimate(w, r, alias, body, emittedRunes)
+	code, message := "upstream_idle_timeout", "upstream stream idle timeout exceeded"
+	if maxFired() {
+		code, message = "stream_max_duration_exceeded", "stream maximum duration exceeded"
+	}
+	flusher, _ := w.(http.Flusher)
+	if endpoint == "responses" {
+		_, _ = fmt.Fprintf(w, "event: error\ndata: {\"error\":{\"message\":%q,\"type\":%q,\"code\":%q}}\n\n", message, code, code)
+	} else {
+		_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":%q,\"code\":%q}}\n\n", message, code, code)
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+	h.logger.Warn("stream terminated by timeout", "request_id", requestID(r), "endpoint", endpoint, "alias", alias, "error_type", code)
+	h.recordUsage(r.Context(), usageRecord{
+		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
+		ttft: firstToken, streaming: true, status: http.StatusBadGateway, errorType: code, streamOutcome: "stream_timeout", attempts: attempts,
+	})
+	h.recordMetrics(r.Context(), metricsRecord{
+		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
+		firstToken: firstToken, status: http.StatusBadGateway, errorType: code,
+	})
 }
 
 // streamOutcomeFor classifies a stream error into (errorType, streamOutcome, status).
@@ -590,7 +743,7 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
-		h.chargeQuota(w, principal.APIKeyID, request.Model, int64(result.Usage.Total()))
+		h.chargeQuota(w, principal.APIKeyID, request.Model, h.chargeableTokens(int64(result.Usage.Total()), body))
 	}
 	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
 	h.recordUsage(r.Context(), usageRecord{
@@ -706,6 +859,175 @@ func replaceModel(body []byte, model string) []byte {
 		return body
 	}
 	return out
+}
+
+// chargeableTokens returns the token delta to charge for a request. When the
+// upstream reports usage that value is used as-is; otherwise the input body is
+// estimated so quotas and cost controls stay enforceable against providers
+// that omit usage fields.
+func (h handler) chargeableTokens(reported int64, body []byte) int64 {
+	if reported > 0 {
+		return reported
+	}
+	return estimateTokens(body)
+}
+
+// estimateTokens returns a conservative token estimate for a request body:
+// roughly 1 token per 3 UTF-8 runes. It errs toward over-counting for dense
+// scripts so quota enforcement never becomes looser than the reported-usage
+// path.
+func estimateTokens(body []byte) int64 {
+	if len(body) == 0 {
+		return 1
+	}
+	est := int64(utf8.RuneCount(body) / 3)
+	if est < 1 {
+		est = 1
+	}
+	return est
+}
+
+// capRequestTokens clamps the client's max_tokens / max_completion_tokens /
+// max_output_tokens to the per-key ceiling when one is configured, so a single
+// request can never burn more than its budget even if the upstream honors a
+// larger value.
+func (h handler) capRequestTokens(principal auth.Principal, body []byte) []byte {
+	limits, ok := h.apiKeyLimits[principal.APIKeyID]
+	if !ok || limits.MaxTokensPerRequest <= 0 {
+		return body
+	}
+	return capRequestBody(body, limits.MaxTokensPerRequest)
+}
+
+// capRequestBody rewrites the request body so each token-ceiling field never
+// exceeds cap. Fields absent from the body are left untouched.
+func capRequestBody(body []byte, cap int64) []byte {
+	out := body
+	for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		var parsed map[string]json.RawMessage
+		if err := json.Unmarshal(out, &parsed); err != nil {
+			return out
+		}
+		raw, ok := parsed[field]
+		if !ok || len(raw) == 0 {
+			continue
+		}
+		var v int64
+		if err := json.Unmarshal(raw, &v); err != nil || v <= 0 || v <= cap {
+			continue
+		}
+		modified, err := sjson.SetBytes(out, field, cap)
+		if err != nil {
+			continue
+		}
+		out = modified
+	}
+	return out
+}
+
+// runesToTokenEstimate converts accumulated event-payload runes into an
+// output-token estimate (~1 token per 3 runes), used when a stream ends
+// before the upstream delivers a usage chunk.
+func runesToTokenEstimate(runes int64) int64 {
+	if runes <= 0 {
+		return 0
+	}
+	est := runes / 3
+	if est < 1 {
+		est = 1
+	}
+	return est
+}
+
+// idempotencyEnabled reports whether the Idempotency-Key replay cache is on.
+func (h handler) idempotencyEnabled() bool { return h.config.Server.IdempotencyEnabled }
+
+// idemTTL returns the replay-cache TTL, defaulting to one hour for servers
+// constructed without the config loader's defaults.
+func (h handler) idemTTL() time.Duration {
+	if h.config.Server.IdempotencyTTL > 0 {
+		return h.config.Server.IdempotencyTTL
+	}
+	return time.Hour
+}
+
+// idemCacheKey returns the cache key for a request: the Idempotency-Key header
+// namespaced by the authenticated API key so one tenant can never replay
+// another's response. Empty when the header is absent.
+func (h handler) idemCacheKey(r *http.Request) string {
+	base := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if base == "" {
+		return ""
+	}
+	keyID := ""
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		keyID = principal.APIKeyID
+	}
+	return keyID + ":" + base
+}
+
+// replayIdempotent returns true after writing the cached response when the
+// request carries an Idempotency-Key that already produced a successful
+// response within the TTL. Replays are not re-executed and are not re-charged,
+// so retries from clients or proxies never double-bill.
+func (h handler) replayIdempotent(w http.ResponseWriter, r *http.Request, endpoint, alias string, started time.Time) bool {
+	if !h.idempotencyEnabled() {
+		return false
+	}
+	key := h.idemCacheKey(r)
+	if key == "" {
+		return false
+	}
+	h.idemMu.Lock()
+	entry, ok := h.idem[key]
+	h.idemMu.Unlock()
+	if !ok {
+		return false
+	}
+	if time.Since(entry.storedAt) > h.idemTTL() {
+		h.idemMu.Lock()
+		delete(h.idem, key)
+		h.idemMu.Unlock()
+		return false
+	}
+	writeRawJSON(w, entry.status, entry.body)
+	h.recordUsage(r.Context(), usageRecord{
+		started: started, endpoint: endpoint, alias: alias,
+		status: entry.status, errorType: "idempotent_replay",
+	})
+	h.logger.Info("idempotent replay served", "request_id", requestID(r), "endpoint", endpoint, "alias", alias)
+	return true
+}
+
+// storeIdempotent caches a successful non-streaming response for replay.
+// The cache is bounded (4096 entries); expired entries are evicted first and
+// the oldest survivor is dropped when the cache is still full.
+func (h handler) storeIdempotent(r *http.Request, status int, body []byte) {
+	if !h.idempotencyEnabled() {
+		return
+	}
+	key := h.idemCacheKey(r)
+	if key == "" {
+		return
+	}
+	h.idemMu.Lock()
+	defer h.idemMu.Unlock()
+	if len(h.idem) >= 4096 {
+		oldestKey, oldestAt := "", time.Now()
+		for k, e := range h.idem {
+			if time.Since(e.storedAt) > h.idemTTL() {
+				delete(h.idem, k)
+				continue
+			}
+			if e.storedAt.Before(oldestAt) {
+				oldestAt, oldestKey = e.storedAt, k
+			}
+		}
+		if len(h.idem) >= 4096 && oldestKey != "" {
+			delete(h.idem, oldestKey)
+		}
+	}
+	h.idem[key] = idemEntry{status: status, body: append([]byte(nil), body...), storedAt: time.Now()}
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

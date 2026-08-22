@@ -245,7 +245,11 @@ func quotaStatusFor(scope QuotaScope, limit int64, used int64, now time.Time) Qu
 }
 
 func bucketKey(scope QuotaScope) string {
-	return strconvItoa(int(scope.Window)) + "|" + scope.KeyID + "|" + scope.Alias
+	metric := scope.Metric
+	if metric == "" {
+		metric = "tokens"
+	}
+	return strconvItoa(int(scope.Window)) + "|" + metric + "|" + scope.KeyID + "|" + scope.Alias
 }
 
 func strconvItoa(n int) string {

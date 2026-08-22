@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,8 +14,29 @@ import (
 type apiKeyRecord struct {
 	teamID   string
 	apiKeyID string
-	key      string
+	digest   string
 	limits   config.KeyLimits
+}
+
+// keyDigest normalizes a configured key into its SHA-256 hex digest. A key
+// configured as "sha256:<hex>" is validated and used verbatim; any other
+// value is treated as a plaintext key and hashed at startup, so plaintext
+// never needs to live in process memory. Clients always authenticate with
+// the plaintext key, which is hashed per request before lookup.
+func keyDigest(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if strings.HasPrefix(value, "sha256:") {
+		hexPart := strings.TrimPrefix(value, "sha256:")
+		if len(hexPart) != sha256.Size*2 {
+			return "", fmt.Errorf("invalid sha256 key digest (want %d hex chars)", sha256.Size*2)
+		}
+		if _, err := hex.DecodeString(hexPart); err != nil {
+			return "", fmt.Errorf("invalid sha256 key digest: %w", err)
+		}
+		return strings.ToLower(hexPart), nil
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 type apiKeyAuthenticator struct {
@@ -24,14 +47,17 @@ func newAPIKeyAuthenticator(teams []config.TeamConfig) (Authenticator, error) {
 	keys := make(map[string]apiKeyRecord)
 	for _, team := range teams {
 		for _, key := range team.APIKeys {
-			raw := strings.TrimSpace(key.Key)
-			if _, exists := keys[raw]; exists {
+			digest, err := keyDigest(key.Key)
+			if err != nil {
+				return nil, fmt.Errorf("team %q api key %q: %w", team.ID, key.ID, err)
+			}
+			if _, exists := keys[digest]; exists {
 				return nil, fmt.Errorf("duplicate api key while building auth registry")
 			}
-			keys[raw] = apiKeyRecord{
+			keys[digest] = apiKeyRecord{
 				teamID:   team.ID,
 				apiKeyID: key.ID,
-				key:      raw,
+				digest:   digest,
 				limits:   key.Limits,
 			}
 		}
@@ -47,7 +73,11 @@ func (a apiKeyAuthenticator) Authenticate(_ context.Context, r *http.Request) (P
 	if !ok {
 		return Principal{}, ErrUnauthorized
 	}
-	record, ok := a.keys[provided]
+	digest, err := keyDigest(provided)
+	if err != nil {
+		return Principal{}, ErrUnauthorized
+	}
+	record, ok := a.keys[digest]
 	if !ok {
 		return Principal{}, ErrUnauthorized
 	}
@@ -59,6 +89,10 @@ func (a apiKeyAuthenticator) Authenticate(_ context.Context, r *http.Request) (P
 }
 
 func (a apiKeyAuthenticator) Lookup(rawKey string) (apiKeyRecord, bool) {
-	record, ok := a.keys[strings.TrimSpace(rawKey)]
+	digest, err := keyDigest(rawKey)
+	if err != nil {
+		return apiKeyRecord{}, false
+	}
+	record, ok := a.keys[digest]
 	return record, ok
 }

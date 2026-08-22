@@ -35,11 +35,22 @@ const (
 
 // QuotaScope identifies which bucket of a QuotaStore a call targets.
 // Alias is empty for key-aggregate quotas; non-empty targets a specific alias.
+// Metric distinguishes counter dimensions that share a key: the zero value
+// ("") means token usage, "requests" is the per-key request counter. Keeping
+// it separate from Alias ensures request counters never alias with per-alias
+// token buckets.
 type QuotaScope struct {
 	KeyID  string
 	Alias  string
 	Window QuotaWindow
+	Metric string
 }
+
+// TokenMetric is the zero-value metric: token usage buckets.
+const TokenMetric = ""
+
+// RequestsMetric identifies the per-key request counter dimension.
+const RequestsMetric = "requests"
 
 // QuotaStatus describes the token usage for a single (KeyID, Alias, Window)
 // bucket.

@@ -16,6 +16,7 @@ type Config struct {
 	Listen            string               `yaml:"listen"`
 	Healthz           string               `yaml:"healthz"`
 	ReadyzWaitTime    time.Duration        `yaml:"readyz_wait_time"`
+	OpsTokenEnv       string               `yaml:"ops_token_env"`
 	Auth              AuthConfig           `yaml:"auth"`
 	Providers         map[string]Provider  `yaml:"providers"`
 	Aliases           map[string]Alias     `yaml:"aliases"`
@@ -87,11 +88,13 @@ type APIKeyConfig struct {
 }
 
 type KeyLimits struct {
-	RPS               float64          `yaml:"rps"`
-	Burst             int              `yaml:"burst"`
-	PredayTokens      int64            `yaml:"preday_tokens"`
-	MonthlyTokens     int64            `yaml:"monthly_tokens"`
-	AliasPredayTokens map[string]int64 `yaml:"alias_preday_tokens"`
+	RPS                 float64          `yaml:"rps"`
+	Burst               int              `yaml:"burst"`
+	PredayTokens        int64            `yaml:"preday_tokens"`
+	MonthlyTokens       int64            `yaml:"monthly_tokens"`
+	AliasPredayTokens   map[string]int64 `yaml:"alias_preday_tokens"`
+	MaxRequestsPerDay   int64            `yaml:"max_requests_per_day"`
+	MaxTokensPerRequest int64            `yaml:"max_tokens_per_request"`
 }
 
 type RetryConfig struct {
@@ -131,10 +134,20 @@ type TracingConfig struct {
 	ServiceName string  `yaml:"service_name"`
 }
 
-// ServerConfig caps in-flight concurrency. Both fields are zero (= unlimited) by default; over-cap requests get 503 server_overloaded.
+// ServerConfig caps in-flight concurrency and bounds request/stream lifetimes.
+// Concurrency fields default to zero (= unlimited); over-cap requests get 503
+// server_overloaded. StreamIdleTimeout bounds the gap between consecutive
+// upstream events, StreamMaxDuration bounds total stream lifetime, and
+// ReadTimeout/IdleTimeout are net/http server timeouts (zero = disabled).
 type ServerConfig struct {
-	MaxConcurrentRequests int `yaml:"max_concurrent_requests"`
-	MaxConcurrentPerKey   int `yaml:"max_concurrent_per_key"`
+	MaxConcurrentRequests int           `yaml:"max_concurrent_requests"`
+	MaxConcurrentPerKey   int           `yaml:"max_concurrent_per_key"`
+	StreamIdleTimeout     time.Duration `yaml:"stream_idle_timeout"`
+	StreamMaxDuration     time.Duration `yaml:"stream_max_duration"`
+	ReadTimeout           time.Duration `yaml:"read_timeout"`
+	IdleTimeout           time.Duration `yaml:"idle_timeout"`
+	IdempotencyEnabled    bool          `yaml:"idempotency_enabled"`
+	IdempotencyTTL        time.Duration `yaml:"idempotency_ttl"`
 }
 
 // GuardrailsConfig controls prompt-injection protection. Mode is "off"|"flag"|"block"; Tracker.Driver selects per-key penalty state storage.
@@ -143,6 +156,10 @@ type GuardrailsConfig struct {
 	Mode      string                  `yaml:"mode"`
 	Threshold float64                 `yaml:"threshold"`
 	Tracker   GuardrailsTrackerConfig `yaml:"tracker"`
+	// Allowlist holds substrings that bypass scanning when present in the
+	// request's message content — an escape hatch for false-positive-prone
+	// payloads (benchmark suites, red-team exercises, structured tool data).
+	Allowlist []string `yaml:"allowlist"`
 }
 
 // GuardrailsTrackerConfig binds penalty policy with a storage-driver selector so state can move from in-process to Redis.
@@ -280,6 +297,24 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Server.MaxConcurrentPerKey < 0 {
 		c.Server.MaxConcurrentPerKey = 0
+	}
+	if c.Server.StreamIdleTimeout < 0 {
+		c.Server.StreamIdleTimeout = 0
+	}
+	if c.Server.StreamMaxDuration < 0 {
+		c.Server.StreamMaxDuration = 0
+	}
+	// Safe http.Server defaults: bound slow request bodies and reap idle
+	// keep-alive connections. WriteTimeout is intentionally never set so
+	// streaming responses can run indefinitely.
+	if c.Server.ReadTimeout == 0 {
+		c.Server.ReadTimeout = 30 * time.Second
+	}
+	if c.Server.IdleTimeout == 0 {
+		c.Server.IdleTimeout = 90 * time.Second
+	}
+	if c.Server.IdempotencyTTL == 0 {
+		c.Server.IdempotencyTTL = time.Hour
 	}
 }
 
@@ -432,6 +467,12 @@ func (c *Config) validateTeams() error {
 			}
 			if key.Limits.MonthlyTokens < 0 {
 				return fmt.Errorf("teams[%d].api_keys[%d]: limits.monthly_tokens must be non-negative", i, j)
+			}
+			if key.Limits.MaxRequestsPerDay < 0 {
+				return fmt.Errorf("teams[%d].api_keys[%d]: limits.max_requests_per_day must be non-negative", i, j)
+			}
+			if key.Limits.MaxTokensPerRequest < 0 {
+				return fmt.Errorf("teams[%d].api_keys[%d]: limits.max_tokens_per_request must be non-negative", i, j)
 			}
 			for alias, q := range key.Limits.AliasPredayTokens {
 				if q < 0 {

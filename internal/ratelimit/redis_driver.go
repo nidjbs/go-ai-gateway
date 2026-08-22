@@ -82,13 +82,23 @@ func newRedisQuotaStore(opts map[string]any) (QuotaStore, error) {
 	return NewRedisQuotaStore(o.client()), nil
 }
 
-// pingRedis verifies connectivity at boot so a misconfigured cluster fails
-// fast rather than silently degrading to fail-open at request time.
-func pingRedis(client *redis.Client) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := client.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("redis ping: %w", err)
+// NewRedisPinger returns a readiness probe that pings the Redis server
+// described by opts. The probe is safe for concurrent use and bounds each
+// ping to one second so readyz never stalls on a dead backend. Gateway
+// startup invokes the probe once to fail fast on a misconfigured cluster
+// instead of silently degrading to fail-open at request time.
+func NewRedisPinger(opts map[string]any) (func() error, error) {
+	o, err := parseRedisOptions(opts)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	client := o.client()
+	return func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := client.Ping(ctx).Err(); err != nil {
+			return fmt.Errorf("redis ping: %w", err)
+		}
+		return nil
+	}, nil
 }

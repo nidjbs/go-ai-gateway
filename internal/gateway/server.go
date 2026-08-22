@@ -2,11 +2,15 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +29,7 @@ import (
 	"github.com/nidjbs/go-ai-gateway/internal/provider"
 	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
 	"github.com/nidjbs/go-ai-gateway/internal/usage"
+	"github.com/nidjbs/go-ai-gateway/internal/version"
 )
 
 // maxPerKeyLimiters caps the per-key limiter map to prevent unbounded growth
@@ -49,6 +54,7 @@ type readiness struct {
 	startedAt time.Time
 	waitTime  time.Duration
 	draining  atomic.Bool
+	checks    []func() error
 }
 
 func (r *readiness) healthz(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
@@ -57,6 +63,12 @@ func (r *readiness) readyz(w http.ResponseWriter, _ *http.Request) {
 	if r.draining.Load() || (r.waitTime > 0 && time.Since(r.startedAt) < r.waitTime) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
+	}
+	for _, check := range r.checks {
+		if err := check(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -161,6 +173,16 @@ func New(deps Deps) (*Server, error) {
 	}
 
 	ready := &readiness{startedAt: deps.Now(), waitTime: deps.Config.ReadyzWaitTime}
+	for _, driver := range []config.StorageDriver{deps.Config.RateLimit, deps.Config.Quota} {
+		if driver.Driver != "redis" {
+			continue
+		}
+		ping, err := ratelimit.NewRedisPinger(driver.Options)
+		if err != nil {
+			return nil, fmt.Errorf("readiness probe (%s): %w", driver.Driver, err)
+		}
+		ready.checks = append(ready.checks, ping)
+	}
 
 	guardrailCfg := deps.Config.Guardrails
 	if guardrailCfg.Mode == "" {
@@ -180,6 +202,7 @@ func New(deps Deps) (*Server, error) {
 		Mode:      guardrailCfg.Mode,
 		Threshold: guardrailCfg.Threshold,
 		Tracker:   trackerPolicy,
+		Allowlist: guardrailCfg.Allowlist,
 	}, tracker, deps.Logger)
 
 	server := &Server{
@@ -191,11 +214,19 @@ func New(deps Deps) (*Server, error) {
 		closer:              sinkCloser(usageSink),
 		guardrailMiddleware: guardrailMW.Handle,
 	}
-	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, breaker: deps.Breaker, keyConcurrency: server.keyLimiter, now: deps.Now, apiKeyLimits: deps.APIKeyLimits}
+	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, breaker: deps.Breaker, keyConcurrency: server.keyLimiter, now: deps.Now, apiKeyLimits: deps.APIKeyLimits, idem: make(map[string]idemEntry), idemMu: &sync.Mutex{}}
 	ops := chi.NewRouter()
+	if deps.Config.OpsTokenEnv != "" {
+		token := strings.TrimSpace(os.Getenv(deps.Config.OpsTokenEnv))
+		if token == "" {
+			return nil, fmt.Errorf("ops_token_env %q is unset or empty", deps.Config.OpsTokenEnv)
+		}
+		ops.Use(opsTokenMiddleware(token))
+	}
 	ops.Get("/healthz", ready.healthz)
 	ops.Get("/livez", ready.healthz)
 	ops.Get("/readyz", ready.readyz)
+	ops.Get("/version", versionHandler)
 	ops.Handle("/metrics", deps.Metrics.Handler())
 
 	router := chi.NewRouter()
@@ -219,12 +250,56 @@ func New(deps Deps) (*Server, error) {
 		r.Post("/v1/embeddings", handlers.embeddings)
 	})
 
-	server.HTTP = &http.Server{Addr: deps.Config.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second}
+	server.HTTP = &http.Server{
+		Addr:              deps.Config.Listen,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       deps.Config.Server.ReadTimeout,
+		IdleTimeout:       deps.Config.Server.IdleTimeout,
+	}
 	server.Ops = ops
 	server.ready = ready
 	server.limiter = limiter
 	server.quotaStore = quotaStore
 	return server, nil
+}
+
+// CheckReadiness runs all dependency readiness probes. The gateway calls it
+// once at startup so a misconfigured backend fails fast, and readyz re-runs
+// it per probe so orchestrators stop routing traffic when a backend drops.
+// versionHandler reports build metadata for operations tooling. Values are
+// injected at build time via -ldflags -X.
+func versionHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"version":    version.Version,
+		"commit":     version.Commit,
+		"build_date": version.BuildDate,
+	})
+}
+
+// opsTokenMiddleware requires a Bearer token (constant-time compare) on
+// operational endpoints when ops_token_env is configured.
+func opsTokenMiddleware(token string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+				apierr.Write(w, http.StatusUnauthorized, "invalid_api_key", "invalid_request_error", "Invalid ops token")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func (s *Server) CheckReadiness() error {
+	for _, check := range s.ready.checks {
+		if err := check(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // concurrencyMiddleware rejects requests when the gateway-level in-flight cap
@@ -316,7 +391,18 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	health := &http.Server{Addr: cfg.Healthz, Handler: server.Ops, ReadHeaderTimeout: 10 * time.Second}
+	// Fail fast when a configured dependency (e.g. Redis) is unreachable at
+	// boot instead of silently degrading to fail-open at request time.
+	if err := server.CheckReadiness(); err != nil {
+		return fmt.Errorf("startup readiness: %w", err)
+	}
+	health := &http.Server{
+		Addr:              cfg.Healthz,
+		Handler:           server.Ops,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.Server.ReadTimeout,
+		IdleTimeout:       cfg.Server.IdleTimeout,
+	}
 	errCh := make(chan error, 2)
 	serve := func(s *http.Server) {
 		if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
