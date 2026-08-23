@@ -42,12 +42,13 @@ return { used, remaining }
 `
 
 type redisQuotaStore struct {
-	client *redis.Client
+	client redis.UniversalClient
 	script *redis.Script
 }
 
-// NewRedisQuotaStore wraps an already-configured *redis.Client.
-func NewRedisQuotaStore(client *redis.Client) QuotaStore {
+// NewRedisQuotaStore wraps an already-configured Redis client (standalone,
+// Sentinel, or Cluster — any redis.Cmdable implementation works).
+func NewRedisQuotaStore(client redis.UniversalClient) QuotaStore {
 	return &redisQuotaStore{
 		client: client,
 		script: redis.NewScript(quotaChargeScript),

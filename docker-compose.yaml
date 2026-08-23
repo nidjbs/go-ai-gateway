@@ -12,6 +12,12 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Ephemeral by default (no persistence): rate-limit buckets and quota
+    # counters reset on restart, which is fine for the smoke test. For
+    # production with key revocation, switch to AOF persistence so a restart
+    # does not silently un-revoke keys:
+    #   command: ["redis-server", "--appendonly", "yes"]
+    #   volumes: [redis-data:/data]
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]

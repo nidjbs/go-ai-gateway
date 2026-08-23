@@ -24,10 +24,12 @@ import (
 	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
 	"github.com/nidjbs/go-ai-gateway/internal/concurrency"
 	"github.com/nidjbs/go-ai-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/dlp"
 	"github.com/nidjbs/go-ai-gateway/internal/guardrails"
 	"github.com/nidjbs/go-ai-gateway/internal/metrics"
 	"github.com/nidjbs/go-ai-gateway/internal/provider"
 	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
+	"github.com/nidjbs/go-ai-gateway/internal/revocation"
 	"github.com/nidjbs/go-ai-gateway/internal/usage"
 	"github.com/nidjbs/go-ai-gateway/internal/version"
 )
@@ -87,6 +89,8 @@ type Server struct {
 	now                 func() time.Time
 	closer              io.Closer // optional sink/handle released on graceful shutdown
 	guardrailMiddleware func(next http.Handler) http.Handler
+	revoker             revocation.Store
+	dlpDetector         *dlp.Detector
 }
 
 // keyLimiter returns the per-key concurrency limiter for keyID, allocating
@@ -205,6 +209,30 @@ func New(deps Deps) (*Server, error) {
 		Allowlist: guardrailCfg.Allowlist,
 	}, tracker, deps.Logger)
 
+	// Admin surface (key revocation + usage queries); token required when enabled.
+	var revoker revocation.Store
+	if deps.Config.Admin.Enabled {
+		token := strings.TrimSpace(os.Getenv(deps.Config.Admin.TokenEnv))
+		if token == "" {
+			return nil, fmt.Errorf("admin.token_env %q is unset or empty", deps.Config.Admin.TokenEnv)
+		}
+		revoker, err = revocation.New(deps.Config.Admin.Revocation, deps.Config.Admin.CacheTTL, deps.Config.Admin.RevokeTTL, deps.Logger)
+		if err != nil {
+			return nil, fmt.Errorf("admin revocation: %w", err)
+		}
+	}
+
+	dlpDetector, err := dlp.New(dlp.Config{
+		Enabled:   deps.Config.DLP.Enabled,
+		Mode:      deps.Config.DLP.Mode,
+		MaskText:  deps.Config.DLP.MaskText,
+		Patterns:  deps.Config.DLP.Patterns,
+		CarrySize: deps.Config.DLP.CarrySize,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dlp: %w", err)
+	}
+
 	server := &Server{
 		config:              deps.Config,
 		logger:              deps.Logger,
@@ -213,8 +241,10 @@ func New(deps Deps) (*Server, error) {
 		now:                 deps.Now,
 		closer:              sinkCloser(usageSink),
 		guardrailMiddleware: guardrailMW.Handle,
+		revoker:             revoker,
+		dlpDetector:         dlpDetector,
 	}
-	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, breaker: deps.Breaker, keyConcurrency: server.keyLimiter, now: deps.Now, apiKeyLimits: deps.APIKeyLimits, idem: make(map[string]idemEntry), idemMu: &sync.Mutex{}}
+	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, breaker: deps.Breaker, keyConcurrency: server.keyLimiter, now: deps.Now, apiKeyLimits: deps.APIKeyLimits, idem: make(map[string]idemEntry), idemMu: &sync.Mutex{}, revoker: revoker, dlpDetector: dlpDetector}
 	ops := chi.NewRouter()
 	if deps.Config.OpsTokenEnv != "" {
 		token := strings.TrimSpace(os.Getenv(deps.Config.OpsTokenEnv))
@@ -228,9 +258,22 @@ func New(deps Deps) (*Server, error) {
 	ops.Get("/readyz", ready.readyz)
 	ops.Get("/version", versionHandler)
 	ops.Handle("/metrics", deps.Metrics.Handler())
+	if deps.Config.Admin.Enabled {
+		token := strings.TrimSpace(os.Getenv(deps.Config.Admin.TokenEnv))
+		ops.Group(func(r chi.Router) {
+			r.Use(adminTokenMiddleware(token))
+			r.Post("/admin/keys/revoke", handlers.revokeKey)
+			r.Get("/admin/keys/revoked", handlers.listRevoked)
+			r.Get("/admin/usage/summary", handlers.usageSummary)
+			r.Get("/admin/usage/series", handlers.usageSeries)
+		})
+	}
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, clientInfoMiddleware)
+	if deps.Config.Server.AccessLog.Enabled {
+		router.Use(accessLogMiddleware(deps.Logger, deps.Config.Server.AccessLog))
+	}
 	if deps.Config.Tracing.Enabled {
 		router.Use(otelhttp.NewMiddleware("ai-gateway"))
 	}

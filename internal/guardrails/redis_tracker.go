@@ -2,12 +2,12 @@ package guardrails
 
 import (
 	"context"
-	"crypto/tls"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/nidjbs/go-ai-gateway/internal/redisutil"
 )
 
 // Redis driver registration. Registers itself with guardrails.TrackerRegistry
@@ -52,7 +52,7 @@ return 0
 `
 
 type redisTracker struct {
-	client *redis.Client
+	client redis.UniversalClient
 	script *redis.Script
 	policy TrackerConfig
 }
@@ -73,23 +73,12 @@ func newRedisTracker(opts map[string]any) (Tracker, error) {
 	}, nil
 }
 
-func newRedisClientFromOpts(opts map[string]any) (*redis.Client, error) {
-	addr := stringOption(opts, "addr", "127.0.0.1:6379")
-	if addr == "" {
-		return nil, errors.New("redis tracker: addr is required")
+func newRedisClientFromOpts(opts map[string]any) (redis.UniversalClient, error) {
+	o, err := redisutil.Parse(opts)
+	if err != nil {
+		return nil, fmt.Errorf("redis tracker: %w", err)
 	}
-	rcfg := &redis.Options{
-		Addr:         addr,
-		Password:     stringOption(opts, "password", ""),
-		DB:           intOption(opts, "db", 0),
-		DialTimeout:  durationOption(opts, "dial_timeout", 2*time.Second),
-		ReadTimeout:  durationOption(opts, "read_timeout", 250*time.Millisecond),
-		WriteTimeout: durationOption(opts, "read_timeout", 250*time.Millisecond),
-	}
-	if boolOption(opts, "tls", false) {
-		rcfg.TLSConfig = &tls.Config{}
-	}
-	client := redis.NewClient(rcfg)
+	client := o.UniversalClient()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := client.Ping(ctx).Err(); err != nil {

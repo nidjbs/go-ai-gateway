@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,10 +23,12 @@ import (
 	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
 	"github.com/nidjbs/go-ai-gateway/internal/concurrency"
 	"github.com/nidjbs/go-ai-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/dlp"
 	"github.com/nidjbs/go-ai-gateway/internal/metrics"
 	"github.com/nidjbs/go-ai-gateway/internal/provider"
 	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
 	"github.com/nidjbs/go-ai-gateway/internal/retry"
+	"github.com/nidjbs/go-ai-gateway/internal/revocation"
 	"github.com/nidjbs/go-ai-gateway/internal/routing"
 	"github.com/nidjbs/go-ai-gateway/internal/usage"
 )
@@ -50,6 +53,8 @@ type handler struct {
 	apiKeyLimits   map[string]config.KeyLimits
 	idemMu         *sync.Mutex
 	idem           map[string]idemEntry
+	revoker        revocation.Store
+	dlpDetector    *dlp.Detector
 }
 
 // idemEntry is one cached successful response keyed by (api key, Idempotency-Key).
@@ -107,7 +112,17 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		ctx := auth.ContextWithPrincipal(r.Context(), principal)
+		recordAccessPrincipal(r.Context(), principal)
 		if principal.APIKeyID != "" {
+			if h.revoker != nil && h.revoker.IsRevoked(principal.APIKeyID) {
+				h.recordUsage(r.Context(), usageRecord{
+					started: started, endpoint: requestEndpoint(r),
+					candidate: routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID},
+					status:    http.StatusUnauthorized, errorType: "revoked_api_key",
+				})
+				apierr.Write(w, http.StatusUnauthorized, "revoked_api_key", "invalid_request_error", "API key has been revoked")
+				return
+			}
 			if h.keyConcurrency != nil {
 				kl := h.keyConcurrency(principal.APIKeyID)
 				if kl != nil && !kl.TryAcquire() {
@@ -222,6 +237,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	recordAccessAlias(r.Context(), request.Model)
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
 		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
 			return
@@ -247,7 +263,12 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
 		h.chargeQuota(w, principal.APIKeyID, request.Model, h.chargeableTokens(int64(result.Usage.Total()), body))
 	}
-	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
+	respBody := replaceModel(result.Body, request.Model)
+	var proceed bool
+	if respBody, proceed = h.dlpResponseBody(w, r, started, "chat.completions", request.Model, candidate, respBody); !proceed {
+		return
+	}
+	writeRawJSON(w, http.StatusOK, respBody)
 	h.recordUsage(r.Context(), usageRecord{
 		started: started, endpoint: "chat.completions", alias: request.Model, candidate: candidate,
 		usage:  result.Usage,
@@ -257,7 +278,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		started: started, endpoint: "chat.completions", alias: request.Model, candidate: candidate,
 		usage: result.Usage, status: http.StatusOK,
 	})
-	h.storeIdempotent(r, http.StatusOK, replaceModel(result.Body, request.Model))
+	h.storeIdempotent(r, http.StatusOK, respBody)
 	h.logger.Info("request complete", "request_id", requestID(r), "endpoint", "chat.completions", "provider", candidate.Name, "attempts", attempts.Total, "status", http.StatusOK, "upstream_duration_ms", time.Since(started).Milliseconds())
 }
 
@@ -272,6 +293,7 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	recordAccessAlias(r.Context(), request.Model)
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
 		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
 			return
@@ -297,10 +319,15 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
 		h.chargeQuota(w, principal.APIKeyID, request.Model, h.chargeableTokens(int64(result.Usage.Total()), body))
 	}
-	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
+	respBody := replaceModel(result.Body, request.Model)
+	var proceed bool
+	if respBody, proceed = h.dlpResponseBody(w, r, started, "responses", request.Model, candidate, respBody); !proceed {
+		return
+	}
+	writeRawJSON(w, http.StatusOK, respBody)
 	h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK, attempts: attempts})
 	h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK})
-	h.storeIdempotent(r, http.StatusOK, replaceModel(result.Body, request.Model))
+	h.storeIdempotent(r, http.StatusOK, respBody)
 }
 
 func (h handler) parseResponses(w http.ResponseWriter, r *http.Request) (json.RawMessage, responsesRequest, []routing.Candidate, bool) {
@@ -362,6 +389,10 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 	idleFired, maxFired, resetIdle, stopWatchdogs := startStreamWatchdogs(h.config.Server.StreamIdleTimeout, h.config.Server.StreamMaxDuration, cancelStream)
 	defer stopWatchdogs()
 
+	var streamMasker *dlp.StreamMasker
+	if h.dlpDetector != nil && h.dlpDetector.Enabled() {
+		streamMasker = h.dlpDetector.NewStreamMasker()
+	}
 	seen := false
 	var firstToken time.Time
 	var emittedRunes int64
@@ -385,11 +416,22 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 		}
 		event := result.event
 		if len(event.Data) > 0 {
-			emittedRunes += int64(utf8.RuneCount(event.Data))
+			data := event.Data
+			if streamMasker != nil {
+				if h.dlpDetector.RejectMode() {
+					if hits := streamMasker.Reject(data); len(hits) > 0 {
+						h.writeDLPRejectStream(w, r, started, "responses", alias, candidate, firstToken, attempts, body, emittedRunes, hits)
+						return
+					}
+				} else {
+					data = streamMasker.Process(data)
+				}
+			}
+			emittedRunes += int64(utf8.RuneCount(data))
 			if event.Event != "" {
 				_, _ = fmt.Fprintf(w, "event: %s\n", event.Event)
 			}
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(event.Data, alias))
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(data, alias))
 			flusher.Flush()
 			if !seen {
 				seen = true
@@ -398,12 +440,26 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 			}
 		}
 		if event.Done {
+			if streamMasker != nil {
+				if tail := streamMasker.Flush(); len(tail) > 0 {
+					if h.dlpDetector.MaskMode() {
+						_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(tail, alias))
+						flusher.Flush()
+					}
+				}
+			}
 			if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
 				h.chargeQuota(w, principal.APIKeyID, alias, int64(event.Usage.Total()))
 			}
 			h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, usage: event.Usage, ttft: firstToken, streaming: true, status: http.StatusOK, streamOutcome: "completed", attempts: attempts})
 			h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, usage: event.Usage, firstToken: firstToken, status: http.StatusOK})
 			return
+		}
+	}
+	if streamMasker != nil {
+		if tail := streamMasker.Flush(); len(tail) > 0 && h.dlpDetector.MaskMode() {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(tail, alias))
+			flusher.Flush()
 		}
 	}
 	if idleFired() || maxFired() {
@@ -527,6 +583,10 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 
 	var firstToken time.Time
 	var emittedRunes int64
+	var streamMasker *dlp.StreamMasker
+	if h.dlpDetector != nil && h.dlpDetector.Enabled() {
+		streamMasker = h.dlpDetector.NewStreamMasker()
+	}
 	// pumpStream pushes events over a bounded channel, applying backpressure on slow clients.
 	for result := range pumpStream(streamCtx, stream) {
 		resetIdle()
@@ -555,6 +615,12 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 		}
 		event := result.event
 		if event.Done {
+			if streamMasker != nil && h.dlpDetector.MaskMode() {
+				if tail := streamMasker.Flush(); len(tail) > 0 {
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(tail, alias))
+					flusher.Flush()
+				}
+			}
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
@@ -573,7 +639,18 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 			})
 			return
 		}
-		emittedRunes += int64(utf8.RuneCount(event.Data))
+		data := event.Data
+		if streamMasker != nil && len(data) > 0 {
+			if h.dlpDetector.RejectMode() {
+				if hits := streamMasker.Reject(data); len(hits) > 0 {
+					h.writeDLPRejectStream(w, r, started, "chat.completions", alias, candidate, firstToken, attempts, body, emittedRunes, hits)
+					return
+				}
+			} else {
+				data = streamMasker.Process(data)
+			}
+		}
+		emittedRunes += int64(utf8.RuneCount(data))
 		if firstToken.IsZero() {
 			firstToken = h.now()
 			h.recordUsage(r.Context(), usageRecord{
@@ -582,8 +659,14 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 				status: http.StatusOK, streamOutcome: "first_token", attempts: attempts,
 			})
 		}
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(event.Data, alias))
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(data, alias))
 		flusher.Flush()
+	}
+	if streamMasker != nil {
+		if tail := streamMasker.Flush(); len(tail) > 0 {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(tail, alias))
+			flusher.Flush()
+		}
 	}
 	if idleFired() || maxFired() {
 		h.writeStreamTimeout(w, r, started, "chat.completions", alias, candidate, firstToken, attempts, body, emittedRunes, idleFired, maxFired)
@@ -675,6 +758,54 @@ func (h handler) writeStreamTimeout(w http.ResponseWriter, r *http.Request, star
 	})
 }
 
+// writeDLPRejectNonStreaming rejects a completed response that tripped DLP.
+func (h handler) writeDLPRejectNonStreaming(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, candidate routing.Candidate, hits []dlp.Hit) {
+	h.logDLPHits(r.Context(), endpoint, alias, hits, "reject")
+	h.recordUsage(r.Context(), usageRecord{
+		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
+		status: http.StatusBadRequest, errorType: "dlp_rejected",
+	})
+	h.recordMetrics(r.Context(), metricsRecord{
+		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
+		status: http.StatusBadRequest, errorType: "dlp_rejected",
+	})
+	apierr.Write(w, http.StatusBadRequest, "dlp_rejected", "content_policy_error", "Response blocked by data-loss prevention policy")
+}
+
+// writeDLPRejectStream ends a stream that tripped DLP with an SSE error frame.
+func (h handler) writeDLPRejectStream(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, candidate routing.Candidate, firstToken time.Time, attempts retry.Attempts, body []byte, emittedRunes int64, hits []dlp.Hit) {
+	h.chargeStreamEstimate(w, r, alias, body, emittedRunes)
+	h.logDLPHits(r.Context(), endpoint, alias, hits, "reject")
+	flusher, _ := w.(http.Flusher)
+	if endpoint == "responses" {
+		_, _ = fmt.Fprintf(w, "event: error\ndata: {\"error\":{\"message\":%q,\"type\":\"content_policy_error\",\"code\":\"dlp_rejected\"}}\n\n", "Response blocked by data-loss prevention policy")
+	} else {
+		_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"content_policy_error\",\"code\":\"dlp_rejected\"}}\n\n", "Response blocked by data-loss prevention policy")
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+	h.recordUsage(r.Context(), usageRecord{
+		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
+		ttft: firstToken, streaming: true, status: http.StatusBadRequest, errorType: "dlp_rejected", streamOutcome: "dlp_rejected", attempts: attempts,
+	})
+	h.recordMetrics(r.Context(), metricsRecord{
+		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
+		firstToken: firstToken, status: http.StatusBadRequest, errorType: "dlp_rejected",
+	})
+}
+
+// logDLPHits logs the enforcement event and bumps the per-pattern metric.
+func (h handler) logDLPHits(ctx context.Context, endpoint, alias string, hits []dlp.Hit, mode string) {
+	patterns := dlpHitPatterns(hits)
+	h.logger.Warn("dlp enforcement", "endpoint", endpoint, "alias", alias, "mode", mode, "patterns", patterns)
+	for _, p := range patterns {
+		if h.metrics != nil {
+			h.metrics.RecordDLP(ctx, p, mode)
+		}
+	}
+}
+
 // streamOutcomeFor classifies a stream error into (errorType, streamOutcome, status).
 // Client cancellation is 499; ProviderError kinds are mapped to their canonical labels;
 // everything else is upstream_error/502. Upstream HTTP statuses are sanitised to 502.
@@ -730,6 +861,7 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "no configured provider supports embeddings")
 		return
 	}
+	recordAccessAlias(r.Context(), request.Model)
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
 		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
 			return

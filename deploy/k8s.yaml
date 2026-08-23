@@ -117,6 +117,10 @@ spec:
       containers:
         - name: redis
           image: redis:7-alpine
+          # Ephemeral by default. For production with key revocation or quota
+          # history, enable AOF persistence and mount a volume:
+          #   args: ["--appendonly", "yes"]
+          #   volumeMounts: [{name: redis-data, mountPath: /data}]
           args: ["--save", "", "--appendonly", "no"]
           ports:
             - containerPort: 6379

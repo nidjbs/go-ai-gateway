@@ -50,6 +50,7 @@ type Recorder struct {
 	timeToFirstToken   apimetric.Float64Histogram
 	timePerOutputToken apimetric.Float64Histogram
 	tokenUsage         apimetric.Int64Histogram
+	dlpDetections      apimetric.Int64Counter
 }
 
 func New() (*Recorder, error) {
@@ -64,6 +65,17 @@ func New() (*Recorder, error) {
 }
 
 func (r *Recorder) Handler() http.Handler { return r.handler }
+
+// RecordDLP counts a DLP detection, labelled by pattern and mode.
+func (r *Recorder) RecordDLP(ctx context.Context, pattern, mode string) {
+	if r.dlpDetections == nil {
+		return
+	}
+	r.dlpDetections.Add(ctx, 1, apimetric.WithAttributes(
+		attribute.String("pattern", pattern),
+		attribute.String("mode", mode),
+	))
+}
 
 func (r *Recorder) Record(ctx context.Context, request Request, result Result) {
 	if request.StartedAt.IsZero() || result.CompletedAt.IsZero() || result.CompletedAt.Before(request.StartedAt) {
@@ -103,6 +115,7 @@ func newRecorder(meter apimetric.Meter, handler http.Handler) *Recorder {
 		timeToFirstToken:   must(meter.Float64Histogram("ai_gateway.llm.time_to_first_token", apimetric.WithUnit("s"), apimetric.WithExplicitBucketBoundaries(ttftBuckets...))),
 		timePerOutputToken: must(meter.Float64Histogram("ai_gateway.llm.time_per_output_token", apimetric.WithUnit("s"), apimetric.WithExplicitBucketBoundaries(llmTimePerOutputTokenBuckets...))),
 		tokenUsage:         must(meter.Int64Histogram("ai_gateway.llm.token.usage", apimetric.WithUnit("token"), apimetric.WithExplicitBucketBoundaries(tokenUsageBuckets...))),
+		dlpDetections:      must(meter.Int64Counter("ai_gateway.dlp.detections")),
 	}
 }
 

@@ -89,7 +89,10 @@ The Compose setup is a distributed-mode smoke test. It runs two gateway replicas
 | Limits and quotas | Per-key rate limits plus daily, monthly, and per-alias token quotas |
 | Distributed state | Redis-backed rate limits, quotas, and guardrail tracking across replicas |
 | Guardrails | Optional prompt-injection scanning and per-key penalty tracking |
-| Observability | Prometheus metrics, OpenTelemetry tracing, structured usage records |
+| Observability | Prometheus metrics, OpenTelemetry tracing, structured usage records, request-level access log |
+| Admin surface | Runtime API-key revocation + usage aggregation queries on the ops port |
+| Output DLP | Mask or reject PII/sensitive patterns (email, phone, cards, secrets) in responses, streaming-aware |
+| Redis failover | Sentinel / Cluster connection support for every Redis-backed layer |
 
 ## Configuration
 
@@ -173,6 +176,10 @@ Rotation is a config change + restart: add the new digest, restart, remove the o
 | `GET /readyz` | Dependency-aware readiness: 204 only after the startup window **and** when every configured backend (e.g. Redis) responds to its probe |
 | `GET /version` | Build metadata (version / commit / build date) |
 | `GET /metrics` | Prometheus metrics |
+| `POST /admin/keys/revoke` | Revoke an API key at runtime (admin token required) |
+| `GET /admin/keys/revoked` | List revoked keys (admin token required) |
+| `GET /admin/usage/summary` | Aggregated usage by team/key/alias/window (admin token, sqlite sink) |
+| `GET /admin/usage/series` | Per-hour/day usage time series (admin token, sqlite sink) |
 | `GET /v1/models` | Available aliases |
 | `POST /v1/chat/completions` | OpenAI-compatible chat completions, including streaming |
 | `POST /v1/responses` | OpenAI Responses API passthrough, including streaming (OpenAI-compatible providers) |
@@ -191,6 +198,11 @@ Rotation is a config change + restart: add the new digest, restart, remove the o
 - **Hashed API keys** — `go run ./cmd/keygen -sha256` for digest-based key config and clean rotation.
 - **Guardrails escape hatch** — `guardrails.allowlist` bypasses scanning for false-positive-prone payloads in block mode.
 - **Circuit breaker** — enabled in the example configs; trips on consecutive upstream failures.
+- **Runtime key revocation** — `POST /admin/keys/revoke` cuts off a leaked key in seconds (Redis-backed across replicas, within the lookup cache TTL) without a config change or restart.
+- **Usage queries** — `GET /admin/usage/summary` / `/series` answer "who spent what" from the SQLite sink.
+- **Access log** — opt-in structured request log (sampled, metadata only — request/response bodies are never logged).
+- **Output DLP** — mask or reject PII/sensitive patterns in chat/responses output, including streaming (cross-chunk detection via a carry window).
+- **Redis failover & persistence** — Sentinel/Cluster via `sentinel_addrs`/`master_name` on every Redis driver; documented failure semantics (fail-open) in the operations guide.
 
 See [Operations guide](docs/operations.md) for the multi-replica runbook, load testing (`scripts/load_test.sh`), and alerting. Reference Kubernetes manifests live in `deploy/k8s.yaml`.
 

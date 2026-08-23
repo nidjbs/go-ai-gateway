@@ -86,10 +86,36 @@ server:
   max_concurrent_per_key: 0    # in-flight requests per API key
   read_timeout: 30s            # http server read timeout (slow-body protection)
   idle_timeout: 90s            # reap idle keep-alive connections
-  stream_idle_timeout: 0       # kill streams silent for this long (0 = off)
-  stream_max_duration: 0       # hard ceiling on total stream lifetime (0 = off)
+  stream_idle_timeout: 0s      # kill streams silent for this long (0s = off)
+  stream_max_duration: 0s      # hard ceiling on total stream lifetime (0s = off)
   idempotency_enabled: false   # replay non-streaming responses for Idempotency-Key retries
   idempotency_ttl: 1h          # replay cache TTL
+  access_log:                  # structured per-request access logging (metadata only)
+    enabled: false
+    sample_ratio: 1.0          # 0.0-1.0 fraction of requests logged
+    # exclude_paths: ["/healthz"]  # default excludes probes/metrics
+
+# Admin surface: runtime key revocation + usage queries on the ops port.
+# When enabled, GATEWAY_ADMIN_TOKEN must be set or the gateway refuses to
+# start. Revocations are permanent by default; use revoke_ttl to bound them.
+# admin:
+#   enabled: true
+#   token_env: GATEWAY_ADMIN_TOKEN
+#   revocation:
+#     driver: redis               # "memory" (per-replica) or "redis" (shared)
+#     options:
+#       addr: 127.0.0.1:6379
+#   # revoke_ttl: 720h             # 0 = permanent (default; pair with AOF)
+#   # cache_ttl: 5s               # replica-local revocation cache TTL
+
+# Output-side DLP: mask or reject PII/sensitive patterns in model responses.
+# Patterns: email, phone, credit_card, ip_address, secret_key, ssn, url.
+# dlp:
+#   enabled: true
+#   mode: mask                    # "mask" replaces matches; "reject" fails the request
+#   mask_text: "[REDACTED]"
+#   patterns: [email, phone, credit_card, ip_address, secret_key, ssn]
+#   carry_size: 256               # stream boundary window (bytes)
 
 # OpenTelemetry tracing. When enabled, the gateway emits server spans for
 # each inbound request, client spans for each upstream call (with traceparent

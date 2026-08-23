@@ -66,12 +66,13 @@ return { allowed, math.floor(tokens) }
 const bucketIdleTTL = 3600
 
 type redisLimiter struct {
-	client *redis.Client
+	client redis.UniversalClient
 	script *redis.Script
 }
 
-// NewRedisLimiter wraps an already-configured *redis.Client.
-func NewRedisLimiter(client *redis.Client) Limiter {
+// NewRedisLimiter wraps an already-configured Redis client (standalone,
+// Sentinel, or Cluster — any redis.Cmdable implementation works).
+func NewRedisLimiter(client redis.UniversalClient) Limiter {
 	return &redisLimiter{
 		client: client,
 		script: redis.NewScript(tokenBucketScript),

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // SQLSink is a Sink backed by any *sql.DB. The driver package supplies the DDL
@@ -80,6 +81,60 @@ func (s *SQLSink) Close() error {
 	}
 	return s.db.Close()
 }
+
+// Summary aggregates usage_events rows matching f.
+func (s *SQLSink) Summary(ctx context.Context, f QueryFilter) (Summary, error) {
+	where, args := buildWhere(f, time.Now().UTC())
+	row := s.db.QueryRowContext(ctx, "SELECT "+summaryAggSQL+" FROM "+DefaultTable+where, args...)
+	return scanSummary(row.Scan)
+}
+
+// Series implements Queryer with hour/day buckets. started_at is truncated
+// to 19 chars for strftime (SQLite rejects the 'UTC'/'Z' time encodings).
+func (s *SQLSink) Series(ctx context.Context, f QueryFilter, bucket time.Duration) ([]Bucket, error) {
+	bucket = normalizeBucket(bucket)
+	where, args := buildWhere(f, time.Now().UTC())
+	format := bucketFormat(bucket)
+	ts := "substr(started_at, 1, 19)"
+	query := "SELECT strftime('" + format + "', " + ts + "), " + summaryAggSQL +
+		" FROM " + DefaultTable + where + " GROUP BY 1 ORDER BY 1"
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Bucket
+	for rows.Next() {
+		var b Bucket
+		var start string
+		if err := rows.Scan(&start, &b.Requests, &b.Successes, &b.Failures, &b.Streaming,
+			&b.InputTokens, &b.OutputTokens, &b.TotalTokens, &b.CostMicros, &b.DurationMS); err != nil {
+			return nil, err
+		}
+		parsed, err := time.Parse(bucketLayout(bucket), start)
+		if err != nil {
+			// Be lenient about strftime output shape; fall back to the
+			// bucket granularity anchored at the filter start.
+			parsed = bucketAnchor(f, bucket)
+		}
+		b.Start = parsed.UTC()
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// bucketAnchor yields a best-effort bucket start when strftime output fails to parse.
+func bucketAnchor(f QueryFilter, bucket time.Duration) time.Time {
+	from := f.From
+	if from.IsZero() {
+		from = time.Now().Add(-24 * time.Hour)
+	}
+	ts := from.Unix() - (from.Unix() % int64(bucket.Seconds()))
+	return time.Unix(ts, 0).UTC()
+}
+
+// Compile-time guarantee that SQLSink satisfies Queryer.
+var _ Queryer = (*SQLSink)(nil)
 
 // DefaultInsertSQL builds the INSERT statement for the SQLSink column list.
 // placeholders must match the target dialect ("?" for SQLite/MySQL, "$N" for Postgres).

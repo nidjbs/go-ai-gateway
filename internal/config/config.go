@@ -30,6 +30,8 @@ type Config struct {
 	Quota             StorageDriver        `yaml:"quota,omitempty"`
 	Usage             StorageDriver        `yaml:"usage,omitempty"`
 	Guardrails        GuardrailsConfig     `yaml:"guardrails,omitempty"`
+	Admin             AdminConfig          `yaml:"admin,omitempty"`
+	DLP               DLPConfig            `yaml:"dlp,omitempty"`
 	readyzWaitTimeSet bool
 }
 
@@ -53,6 +55,33 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 type AuthConfig struct {
 	Mode     string `yaml:"mode"`
 	TokenEnv string `yaml:"token_env"`
+}
+
+// AdminConfig controls the ops-port admin surface (key revocation, usage
+// queries). TokenEnv must be set when enabled or startup fails.
+type AdminConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	TokenEnv string `yaml:"token_env"`
+	// Revocation backend: "memory" (per-replica) or "redis" (shared); empty = memory.
+	Revocation StorageDriver `yaml:"revocation,omitempty"`
+	// RevokeTTL bounds a revocation's lifetime; 0 = permanent (default).
+	RevokeTTL time.Duration `yaml:"revoke_ttl,omitempty"`
+	// CacheTTL is the per-replica revocation lookup cache; default 5s.
+	CacheTTL time.Duration `yaml:"cache_ttl,omitempty"`
+}
+
+// DLPConfig controls output-side data-loss prevention: mask or reject
+// PII/sensitive patterns in generated content. Off by default.
+type DLPConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Mode    string `yaml:"mode"` // "mask" | "reject" (default mask)
+	// MaskText replaces detected matches; default "[REDACTED]".
+	MaskText string `yaml:"mask_text"`
+	// Patterns selects builtin categories (email, phone, credit_card,
+	// ip_address, secret_key, ssn, url); empty = default set.
+	Patterns []string `yaml:"patterns"`
+	// CarrySize is the stream boundary window for cross-chunk detection; default 256.
+	CarrySize int `yaml:"carry_size"`
 }
 
 type Provider struct {
@@ -146,14 +175,24 @@ type TracingConfig struct {
 // upstream events, StreamMaxDuration bounds total stream lifetime, and
 // ReadTimeout/IdleTimeout are net/http server timeouts (zero = disabled).
 type ServerConfig struct {
-	MaxConcurrentRequests int           `yaml:"max_concurrent_requests"`
-	MaxConcurrentPerKey   int           `yaml:"max_concurrent_per_key"`
-	StreamIdleTimeout     time.Duration `yaml:"stream_idle_timeout"`
-	StreamMaxDuration     time.Duration `yaml:"stream_max_duration"`
-	ReadTimeout           time.Duration `yaml:"read_timeout"`
-	IdleTimeout           time.Duration `yaml:"idle_timeout"`
-	IdempotencyEnabled    bool          `yaml:"idempotency_enabled"`
-	IdempotencyTTL        time.Duration `yaml:"idempotency_ttl"`
+	MaxConcurrentRequests int             `yaml:"max_concurrent_requests"`
+	MaxConcurrentPerKey   int             `yaml:"max_concurrent_per_key"`
+	StreamIdleTimeout     time.Duration   `yaml:"stream_idle_timeout"`
+	StreamMaxDuration     time.Duration   `yaml:"stream_max_duration"`
+	ReadTimeout           time.Duration   `yaml:"read_timeout"`
+	IdleTimeout           time.Duration   `yaml:"idle_timeout"`
+	IdempotencyEnabled    bool            `yaml:"idempotency_enabled"`
+	IdempotencyTTL        time.Duration   `yaml:"idempotency_ttl"`
+	AccessLog             AccessLogConfig `yaml:"access_log,omitempty"`
+}
+
+// AccessLogConfig enables per-request access logging (metadata only,
+// never bodies).
+type AccessLogConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// SampleRatio (0.0–1.0) is the fraction of requests logged; 1.0 logs all.
+	SampleRatio float64  `yaml:"sample_ratio"`
+	Exclude     []string `yaml:"exclude_paths,omitempty"` // path prefixes to skip
 }
 
 // GuardrailsConfig controls prompt-injection protection. Mode is "off"|"flag"|"block"; Tracker.Driver selects per-key penalty state storage.
@@ -322,6 +361,21 @@ func (c *Config) applyDefaults() {
 	if c.Server.IdempotencyTTL == 0 {
 		c.Server.IdempotencyTTL = time.Hour
 	}
+	if c.Server.AccessLog.SampleRatio == 0 {
+		c.Server.AccessLog.SampleRatio = 1.0
+	}
+	if c.Admin.CacheTTL == 0 {
+		c.Admin.CacheTTL = 5 * time.Second
+	}
+	if c.DLP.Mode == "" {
+		c.DLP.Mode = "mask"
+	}
+	if c.DLP.MaskText == "" {
+		c.DLP.MaskText = "[REDACTED]"
+	}
+	if c.DLP.CarrySize <= 0 {
+		c.DLP.CarrySize = 256
+	}
 }
 
 func (c *Config) resolveSecrets() error {
@@ -391,6 +445,14 @@ func (c *Config) Validate() error {
 			if strings.TrimSpace(candidate.Model) == "" {
 				return fmt.Errorf("alias %q providers[%d]: model is required", alias, i)
 			}
+		}
+	}
+	if c.Server.AccessLog.SampleRatio < 0 || c.Server.AccessLog.SampleRatio > 1 {
+		return errors.New("server.access_log.sample_ratio must be between 0 and 1")
+	}
+	if c.DLP.Enabled {
+		if c.DLP.Mode != "mask" && c.DLP.Mode != "reject" {
+			return fmt.Errorf("dlp.mode %q is unsupported (want mask or reject)", c.DLP.Mode)
 		}
 	}
 	return nil
