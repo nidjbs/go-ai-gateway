@@ -16,6 +16,8 @@ type Candidate struct {
 	APIKey   string
 	Timeout  time.Duration
 	Priority int
+	// Weight biases the loadbalance strategy (0 = never chosen as primary).
+	Weight int
 	// ForceUsage mirrors the provider's force_usage setting (nil = unset).
 	ForceUsage *bool
 }
@@ -36,7 +38,7 @@ func Resolve(cfg *config.Config, alias string) ([]Candidate, error) {
 		if providerType == "" {
 			providerType = "openai"
 		}
-		out = append(out, Candidate{Name: item.Name, Type: providerType, Model: item.Model, BaseURL: provider.BaseURL, APIKey: provider.APIKey, Timeout: provider.RequestTimeout, Priority: item.Priority, ForceUsage: provider.ForceUsage})
+		out = append(out, Candidate{Name: item.Name, Type: providerType, Model: item.Model, BaseURL: provider.BaseURL, APIKey: provider.APIKey, Timeout: provider.RequestTimeout, Priority: item.Priority, Weight: item.Weight, ForceUsage: provider.ForceUsage})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
 	return out, nil
