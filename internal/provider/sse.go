@@ -108,6 +108,8 @@ func (p *sseParser) Next() (sseEvent, error) {
 // readLine reads one line (LF or CRLF terminated) and trims the terminator.
 // Returns (nil, nil) for a blank line; (line, nil) for content;
 // (nil, io.EOF) at end of stream; or a size error if a line is too long.
+// Lines are accumulated across bufio.Reader buffer fills, so the effective
+// cap is sseMaxLine (4 MiB) rather than the 64 KiB reader buffer size.
 func (p *sseParser) readLine() ([]byte, error) {
 	var buf bytes.Buffer
 	for {
@@ -120,7 +122,9 @@ func (p *sseParser) readLine() ([]byte, error) {
 		}
 		if err != nil {
 			if errors.Is(err, bufio.ErrBufferFull) {
-				return nil, ErrSSELineTooLarge
+				// Line spans the buffer: keep accumulating until the
+				// terminator or the sseMaxLine cap is reached.
+				continue
 			}
 			// Trim trailing \n (and optional \r) for content lines.
 			line := buf.Bytes()

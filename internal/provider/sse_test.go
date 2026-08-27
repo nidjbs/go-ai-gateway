@@ -98,6 +98,22 @@ func TestSSEParserLineTooLarge(t *testing.T) {
 	}
 }
 
+func TestSSEParserAcceptsLongLineAcrossBuffers(t *testing.T) {
+	// A line far larger than the 64 KiB bufio.Reader buffer (but within
+	// sseMaxLine) must parse successfully — large tool-call JSON payloads
+	// depend on the effective cap being sseMaxLine, not the buffer size.
+	const size = 1 << 20 // 1 MiB
+	line := append([]byte("data: "), bytes.Repeat([]byte{'x'}, size)...)
+	line = append(line, '\n', '\n')
+	evt, err := newSSEParser(bytes.NewReader(line)).Next()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(evt.Data) != size {
+		t.Fatalf("data len = %d, want %d", len(evt.Data), size)
+	}
+}
+
 func TestSSEParserEventTooLarge(t *testing.T) {
 	// Many medium data lines joined by \n push past sseMaxEvent.
 	// Each line must carry the "data:" field so the parser treats it as
