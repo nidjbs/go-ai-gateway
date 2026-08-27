@@ -71,7 +71,11 @@ func Init(ctx context.Context, cfg config.TracingConfig) (ShutdownFunc, error) {
 	provider := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(sdktrace.TraceIDRatioBased(sampleRatio)),
+		// ParentBased keeps upstream (agent) traces intact: spans arriving
+		// with a sampled traceparent are always sampled, so the
+		// agent -> gateway -> LLM chain stays connected; only root spans are
+		// decided by the local ratio.
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRatio))),
 	)
 	otel.SetTracerProvider(provider)
 	return func(shutdownCtx context.Context) error {
