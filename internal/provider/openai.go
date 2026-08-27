@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 
 	"github.com/tidwall/sjson"
 
@@ -154,6 +155,7 @@ type openAIStream struct {
 	parser       *sseParser
 	response     *http.Response
 	cancel       context.CancelFunc
+	closeOnce    sync.Once
 	model        string
 	inputTokens  int
 	outputTokens int
@@ -301,15 +303,20 @@ func (s *openAIStream) nextResponses() (StreamEvent, error) {
 	}
 }
 
+// Close is safe for concurrent invocation: the gateway may close the stream
+// from both the pump cleanup goroutine and the handler's deferred Close.
 func (s *openAIStream) Close() error {
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
-	}
-	if s.response == nil || s.response.Body == nil {
-		return nil
-	}
-	return s.response.Body.Close()
+	var err error
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+			s.cancel = nil
+		}
+		if s.response != nil && s.response.Body != nil {
+			err = s.response.Body.Close()
+		}
+	})
+	return err
 }
 
 // bodyWithModel rewrites the "model" field in the request body using sjson's

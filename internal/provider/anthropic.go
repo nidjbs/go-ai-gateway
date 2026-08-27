@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/nidjbs/go-ai-gateway/internal/routing"
 )
@@ -528,9 +529,10 @@ func openAIFinishReason(reason string) string {
 }
 
 type anthropicStream struct {
-	parser   *sseParser
-	response *http.Response
-	cancel   context.CancelFunc
+	parser    *sseParser
+	response  *http.Response
+	cancel    context.CancelFunc
+	closeOnce sync.Once
 	// initialModel is the candidate model name sent on the wire; used as a
 	// fallback if the upstream message_start event omits the model field.
 	initialModel string
@@ -707,15 +709,20 @@ func nullableFinishReason(reason string) any {
 	return reason
 }
 
+// Close is safe for concurrent invocation: the gateway may close the stream
+// from both the pump cleanup goroutine and the handler's deferred Close.
 func (s *anthropicStream) Close() error {
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
-	}
-	if s.response == nil || s.response.Body == nil {
-		return nil
-	}
-	return s.response.Body.Close()
+	var err error
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+			s.cancel = nil
+		}
+		if s.response != nil && s.response.Body != nil {
+			err = s.response.Body.Close()
+		}
+	})
+	return err
 }
 
 var _ Adapter = (*anthropicAdapter)(nil)
