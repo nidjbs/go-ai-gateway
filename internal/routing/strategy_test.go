@@ -99,9 +99,9 @@ func TestOrderLeastLatencyFastestFirst(t *testing.T) {
 	tracker := NewLatencyTracker()
 	tracker.Record(Candidate{Name: "a", Model: "m-a"}, 100*time.Millisecond)
 	tracker.Record(Candidate{Name: "c", Model: "m-c"}, 20*time.Millisecond)
-	// b unobserved.
+	// b unobserved: it must be probed first so it can enter the ranking.
 	got := Order(StrategyLeastLatency, testCandidates(), tracker, func(int) int { return 0 })
-	want := []string{"c", "a", "b"}
+	want := []string{"b", "c", "a"}
 	for i, name := range want {
 		if got[i].Name != name {
 			t.Fatalf("order[%d] = %q, want %q (full %q)", i, got[i].Name, name, names(got))
@@ -113,9 +113,10 @@ func TestOrderLeastLatencyTiesBreakByPriority(t *testing.T) {
 	tracker := NewLatencyTracker()
 	tracker.Record(Candidate{Name: "b", Model: "m-b"}, 50*time.Millisecond)
 	tracker.Record(Candidate{Name: "a", Model: "m-a"}, 50*time.Millisecond)
+	// c is unobserved and probes first; the two observed ties order by priority.
 	got := Order(StrategyLeastLatency, testCandidates(), tracker, func(int) int { return 0 })
-	if got[0].Name != "a" || got[1].Name != "b" {
-		t.Fatalf("tie order = %q, want [a b]", names(got[:2]))
+	if got[1].Name != "a" || got[2].Name != "b" {
+		t.Fatalf("tie order = %q, want [c a b]", names(got))
 	}
 }
 

@@ -87,10 +87,11 @@ func orderLoadBalance(candidates []Candidate, randFn func(n int) int) []Candidat
 	return append([]Candidate{candidates[primary]}, rest...)
 }
 
-// orderLeastLatency sorts observed candidates by EWMA latency (fastest first)
-// and pins unobserved ones after them in priority order, so a provider with no
-// history is only tried once every observed candidate has failed. Ties break by
-// priority so the configured order still reads through.
+// orderLeastLatency sorts candidates so the fastest observed provider leads.
+// Unobserved candidates sort FIRST (by priority) so they get probed and enter
+// the latency ranking — otherwise one slow observed provider would shadow every
+// unobserved one forever. Once observed, a candidate joins the EWMA ranking
+// (fastest first, ties by priority).
 func orderLeastLatency(candidates []Candidate, tracker *LatencyTracker) []Candidate {
 	type entry struct {
 		c   Candidate
@@ -105,10 +106,11 @@ func orderLeastLatency(candidates []Candidate, tracker *LatencyTracker) []Candid
 		}
 		entries = append(entries, entry{c: c, lat: lat, obs: obs})
 	}
-	// Stable sort by (observed desc, latency asc, priority asc).
+	// Stable sort by (observed asc, latency asc, priority asc): unobserved
+	// candidates come first, then observed ones fastest-first.
 	sort.SliceStable(entries, func(i, j int) bool {
 		if entries[i].obs != entries[j].obs {
-			return entries[i].obs
+			return !entries[i].obs
 		}
 		if entries[i].lat != entries[j].lat {
 			return entries[i].lat < entries[j].lat
