@@ -148,6 +148,19 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		s.writeStream(w, request.Model, "primary partial", true)
 	case "stream_success":
 		s.writeStream(w, request.Model, "stream success", false)
+	case "slow_primary":
+		// Always-available response; the primary role just answers slowly so
+		// the least_latency strategy learns to prefer the backup.
+		if s.role == "primary" {
+			time.Sleep(200 * time.Millisecond)
+		}
+		s.writeCompletion(w, request.Model, map[string]string{"role": "assistant", "content": "slow response ok"}, "stop")
+	case "dlp_output":
+		// Content carrying PII so the gateway's output DLP can mask/reject it.
+		s.writeCompletion(w, request.Model, map[string]string{"role": "assistant", "content": "Contact me at user@example.com or +1-555-123-4567 for the report."}, "stop")
+	case "always_fail":
+		// Permanent 503 so the circuit breaker trips after the threshold.
+		s.writeFailure(w)
 	default:
 		if request.Stream {
 			s.writeStream(w, request.Model, "mock response", false)
