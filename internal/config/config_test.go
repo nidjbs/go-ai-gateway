@@ -196,3 +196,167 @@ teams:
 		t.Fatalf("Burst = %d, want 7", cfg.Teams[0].APIKeys[0].Limits.Burst)
 	}
 }
+
+func TestLoadAppliesGuardrailsDefaultsWhenEnabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+aliases:
+  chat:
+    provider: local
+    model: test-model
+guardrails:
+  enabled: true
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Guardrails.Mode != "flag" {
+		t.Errorf("Guardrails.Mode = %q, want %q (enabled without mode must not silently disable)", cfg.Guardrails.Mode, "flag")
+	}
+	if cfg.Guardrails.Threshold != 0.75 {
+		t.Errorf("Guardrails.Threshold = %v, want 0.75", cfg.Guardrails.Threshold)
+	}
+	if cfg.Guardrails.Tracker.MaxAttempts != 3 || cfg.Guardrails.Tracker.WindowSec != 60 || cfg.Guardrails.Tracker.PenaltySec != 30 {
+		t.Errorf("unexpected tracker defaults: %+v", cfg.Guardrails.Tracker)
+	}
+}
+
+func TestLoadRejectsInvalidGuardrailsModeAndThreshold(t *testing.T) {
+	for name, extra := range map[string]string{
+		"bad mode":      "  mode: nuke\n",
+		"bad threshold": "  mode: flag\n  threshold: 1.5\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(`providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+aliases:
+  chat:
+    provider: local
+    model: test-model
+guardrails:
+  enabled: true
+`+extra), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected config error for guardrails %q", name)
+			}
+		})
+	}
+}
+
+func TestLoadParsesAliasStrategyAndWeights(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+  backup:
+    base_url: http://127.0.0.2:19090/v1
+aliases:
+  chat:
+    strategy: loadbalance
+    providers:
+      - {name: local, model: model-a, priority: 0, weight: 3}
+      - {name: backup, model: model-b, priority: 1, weight: 1}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Aliases["chat"].Strategy; got != "loadbalance" {
+		t.Errorf("Strategy = %q, want loadbalance", got)
+	}
+	providers := cfg.Aliases["chat"].NormalizedProviders()
+	if len(providers) != 2 {
+		t.Fatalf("len(providers) = %d, want 2", len(providers))
+	}
+	if providers[0].Weight != 3 || providers[1].Weight != 1 {
+		t.Errorf("weights = (%d, %d), want (3, 1)", providers[0].Weight, providers[1].Weight)
+	}
+}
+
+func TestLoadRejectsInvalidAliasStrategyAndWeight(t *testing.T) {
+	for name, extra := range map[string]string{
+		"bad strategy":    "  strategy: roundrobin\n  provider: local\n  model: test-model\n",
+		"negative weight": "  provider: local\n  model: test-model\n  providers:\n    - {name: local, model: m, weight: -1}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(`providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+aliases:
+  chat:
+`+extra), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected config error for alias %q", name)
+			}
+		})
+	}
+}
+
+func TestLoadDefaultsAndHonorsMaxRequestBodyBytes(t *testing.T) {
+	base := `providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+aliases:
+  chat:
+    provider: local
+    model: test-model
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.MaxRequestBodyBytes != 1<<20 {
+		t.Errorf("default MaxRequestBodyBytes = %d, want %d", cfg.Server.MaxRequestBodyBytes, 1<<20)
+	}
+
+	path = filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(base+"server:\n  max_request_body_bytes: 8388608\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.MaxRequestBodyBytes != 8<<20 {
+		t.Errorf("explicit MaxRequestBodyBytes = %d, want %d", cfg.Server.MaxRequestBodyBytes, 8<<20)
+	}
+}
+
+func TestLoadRejectsInvalidTracingSampleRatio(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`providers:
+  local:
+    base_url: http://127.0.0.1:19090/v1
+aliases:
+  chat:
+    provider: local
+    model: test-model
+tracing:
+  enabled: true
+  sample_ratio: 2.0
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for tracing.sample_ratio > 1")
+	}
+}

@@ -45,6 +45,12 @@ providers:
     #   false  -> never inject; trust the upstream's default
     # force_usage: true
 
+# aliases map a client-visible model name to one or more upstream providers.
+# An alias with multiple providers forms a failover chain. Optional per-alias
+# routing strategy:
+#   fallback      -> try providers in priority order (default)
+#   loadbalance   -> pick a weighted-random primary each request (weight: N)
+#   least_latency -> try the fastest observed provider first (EWMA latency)
 aliases:
   chat:
     provider: local
@@ -52,6 +58,12 @@ aliases:
   embedding:
     provider: local
     model: mock-embedding
+  # Example weighted failover chain:
+  # chat-heavy:
+  #   strategy: loadbalance
+  #   providers:
+  #     - {name: local, model: mock-chat, priority: 0, weight: 3}
+  #     - {name: backup, model: mock-chat-b, priority: 1, weight: 1}
 
 retry:
   enabled: true
@@ -84,6 +96,9 @@ circuit_breaker:
 server:
   max_concurrent_requests: 0   # total in-flight requests across all keys
   max_concurrent_per_key: 0    # in-flight requests per API key
+  max_request_body_bytes: 1048576  # inbound JSON body cap; raise for agent
+                                   # workloads with large system prompts /
+                                   # tool definitions (default 1 MiB)
   read_timeout: 30s            # http server read timeout (slow-body protection)
   idle_timeout: 90s            # reap idle keep-alive connections
   stream_idle_timeout: 0s      # kill streams silent for this long (0s = off)

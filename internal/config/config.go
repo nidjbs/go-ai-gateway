@@ -99,6 +99,10 @@ type Provider struct {
 }
 
 type Alias struct {
+	// Strategy selects how the alias's provider chain is ordered per request:
+	// "fallback" (default, by priority), "loadbalance" (weighted random primary),
+	// or "least_latency" (fastest observed provider first).
+	Strategy  string          `yaml:"strategy,omitempty"`
 	Provider  string          `yaml:"provider,omitempty"`
 	Model     string          `yaml:"model,omitempty"`
 	Providers []AliasProvider `yaml:"providers,omitempty"`
@@ -108,6 +112,8 @@ type AliasProvider struct {
 	Name     string `yaml:"name"`
 	Model    string `yaml:"model"`
 	Priority int    `yaml:"priority"`
+	// Weight biases the loadbalance strategy (0 = never chosen as primary).
+	Weight int `yaml:"weight,omitempty"`
 }
 
 type TeamConfig struct {
@@ -175,15 +181,30 @@ type TracingConfig struct {
 // upstream events, StreamMaxDuration bounds total stream lifetime, and
 // ReadTimeout/IdleTimeout are net/http server timeouts (zero = disabled).
 type ServerConfig struct {
-	MaxConcurrentRequests int             `yaml:"max_concurrent_requests"`
-	MaxConcurrentPerKey   int             `yaml:"max_concurrent_per_key"`
-	StreamIdleTimeout     time.Duration   `yaml:"stream_idle_timeout"`
-	StreamMaxDuration     time.Duration   `yaml:"stream_max_duration"`
-	ReadTimeout           time.Duration   `yaml:"read_timeout"`
-	IdleTimeout           time.Duration   `yaml:"idle_timeout"`
-	IdempotencyEnabled    bool            `yaml:"idempotency_enabled"`
-	IdempotencyTTL        time.Duration   `yaml:"idempotency_ttl"`
-	AccessLog             AccessLogConfig `yaml:"access_log,omitempty"`
+	MaxConcurrentRequests int `yaml:"max_concurrent_requests"`
+	MaxConcurrentPerKey   int `yaml:"max_concurrent_per_key"`
+	// MaxRequestBodyBytes caps inbound JSON bodies (default 1 MiB). Raise it
+	// for agent workloads with large system prompts or tool definitions.
+	MaxRequestBodyBytes int64           `yaml:"max_request_body_bytes"`
+	StreamIdleTimeout   time.Duration   `yaml:"stream_idle_timeout"`
+	StreamMaxDuration   time.Duration   `yaml:"stream_max_duration"`
+	ReadTimeout         time.Duration   `yaml:"read_timeout"`
+	IdleTimeout         time.Duration   `yaml:"idle_timeout"`
+	IdempotencyEnabled  bool            `yaml:"idempotency_enabled"`
+	IdempotencyTTL      time.Duration   `yaml:"idempotency_ttl"`
+	AccessLog           AccessLogConfig `yaml:"access_log,omitempty"`
+}
+
+// defaultMaxRequestBodyBytes is the body cap used when MaxRequestBodyBytes is
+// unset — including programmatically-built configs that skip applyDefaults.
+const defaultMaxRequestBodyBytes int64 = 1 << 20
+
+// BodyLimit returns the effective request-body cap, defaulting to 1 MiB.
+func (s ServerConfig) BodyLimit() int64 {
+	if s.MaxRequestBodyBytes <= 0 {
+		return defaultMaxRequestBodyBytes
+	}
+	return s.MaxRequestBodyBytes
 }
 
 // AccessLogConfig enables per-request access logging (metadata only,
@@ -349,6 +370,9 @@ func (c *Config) applyDefaults() {
 	if c.Server.StreamMaxDuration < 0 {
 		c.Server.StreamMaxDuration = 0
 	}
+	if c.Server.MaxRequestBodyBytes <= 0 {
+		c.Server.MaxRequestBodyBytes = defaultMaxRequestBodyBytes
+	}
 	// Safe http.Server defaults: bound slow request bodies and reap idle
 	// keep-alive connections. WriteTimeout is intentionally never set so
 	// streaming responses can run indefinitely.
@@ -375,6 +399,29 @@ func (c *Config) applyDefaults() {
 	}
 	if c.DLP.CarrySize <= 0 {
 		c.DLP.CarrySize = 256
+	}
+	// Guardrails defaults only apply once the operator opts in via
+	// `enabled: true`; otherwise the feature stays fully off. Filling the
+	// mode/threshold/tracker fields here prevents two failure modes: an empty
+	// mode silently disabling the middleware, and a zero threshold blocking
+	// every request (scanner scores are >= 0).
+	if c.Guardrails.Enabled {
+		guardrailDefaults := DefaultGuardrailsConfig()
+		if c.Guardrails.Mode == "" {
+			c.Guardrails.Mode = guardrailDefaults.Mode
+		}
+		if c.Guardrails.Threshold <= 0 {
+			c.Guardrails.Threshold = guardrailDefaults.Threshold
+		}
+		if c.Guardrails.Tracker.MaxAttempts <= 0 {
+			c.Guardrails.Tracker.MaxAttempts = guardrailDefaults.Tracker.MaxAttempts
+		}
+		if c.Guardrails.Tracker.WindowSec <= 0 {
+			c.Guardrails.Tracker.WindowSec = guardrailDefaults.Tracker.WindowSec
+		}
+		if c.Guardrails.Tracker.PenaltySec <= 0 {
+			c.Guardrails.Tracker.PenaltySec = guardrailDefaults.Tracker.PenaltySec
+		}
 	}
 }
 
@@ -431,6 +478,9 @@ func (c *Config) Validate() error {
 		return errors.New("at least one alias is required")
 	}
 	for alias, definition := range c.Aliases {
+		if s := definition.Strategy; s != "" && s != "fallback" && s != "loadbalance" && s != "least_latency" {
+			return fmt.Errorf("alias %q: strategy %q is unsupported (want fallback, loadbalance, or least_latency)", alias, s)
+		}
 		providers := definition.Providers
 		if len(providers) == 0 && definition.Provider != "" {
 			providers = []AliasProvider{{Name: definition.Provider, Model: definition.Model}}
@@ -445,10 +495,29 @@ func (c *Config) Validate() error {
 			if strings.TrimSpace(candidate.Model) == "" {
 				return fmt.Errorf("alias %q providers[%d]: model is required", alias, i)
 			}
+			if candidate.Weight < 0 {
+				return fmt.Errorf("alias %q providers[%d]: weight must not be negative", alias, i)
+			}
 		}
 	}
 	if c.Server.AccessLog.SampleRatio < 0 || c.Server.AccessLog.SampleRatio > 1 {
 		return errors.New("server.access_log.sample_ratio must be between 0 and 1")
+	}
+	if c.Server.MaxRequestBodyBytes < 0 {
+		return errors.New("server.max_request_body_bytes must not be negative")
+	}
+	if c.Guardrails.Enabled {
+		switch c.Guardrails.Mode {
+		case "off", "flag", "block":
+		default:
+			return fmt.Errorf("guardrails.mode %q is unsupported (want off, flag, or block)", c.Guardrails.Mode)
+		}
+		if c.Guardrails.Mode != "off" && (c.Guardrails.Threshold <= 0 || c.Guardrails.Threshold > 1) {
+			return errors.New("guardrails.threshold must be greater than 0 and at most 1 when guardrails is enabled")
+		}
+	}
+	if c.Tracing.SampleRatio < 0 || c.Tracing.SampleRatio > 1 {
+		return errors.New("tracing.sample_ratio must be between 0 and 1")
 	}
 	if c.DLP.Enabled {
 		if c.DLP.Mode != "mask" && c.DLP.Mode != "reject" {
