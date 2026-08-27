@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -190,6 +191,110 @@ func TestExecuteStopsWhenSleepCanceled(t *testing.T) {
 	}, func(context.Context, time.Duration) error { return context.Canceled }, func() float64 { return 0.5 })
 	if !errors.Is(err, context.Canceled) || attempts.Total != 1 {
 		t.Fatalf("attempts = %d, err = %v; want cancellation after one attempt", attempts.Total, err)
+	}
+}
+
+func TestBreakerErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool // true = counted as a provider failure by the breaker
+	}{
+		{"nil is success", nil, false},
+		{"network counted", &provider.ProviderError{Kind: provider.ErrorKindNetwork}, true},
+		{"timeout counted", &provider.ProviderError{Kind: provider.ErrorKindTimeout}, true},
+		{"protocol counted", &provider.ProviderError{Kind: provider.ErrorKindProtocol}, true},
+		{"upstream 500 counted", &provider.ProviderError{Kind: provider.ErrorKindUpstream, Status: 500}, true},
+		{"upstream 503 counted", &provider.ProviderError{Kind: provider.ErrorKindUpstream, Status: 503}, true},
+		{"upstream 400 not counted", &provider.ProviderError{Kind: provider.ErrorKindUpstream, Status: 400}, false},
+		{"upstream 429 not counted", &provider.ProviderError{Kind: provider.ErrorKindUpstream, Status: 429}, false},
+		{"invalid_request not counted", &provider.ProviderError{Kind: provider.ErrorKindInvalidRequest}, false},
+		{"canceled not counted", &provider.ProviderError{Kind: provider.ErrorKindCanceled}, false},
+		{"context canceled not counted", context.Canceled, false},
+		{"http 503 counted", &provider.HTTPError{StatusCode: 503}, true},
+		{"http 400 not counted", &provider.HTTPError{StatusCode: 400}, false},
+		{"plain error counted", errors.New("boom"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := breakerErr(tt.err)
+			if (got != nil) != tt.want {
+				t.Errorf("breakerErr(%v) counted=%v, want counted=%v", tt.err, got != nil, tt.want)
+			}
+		})
+	}
+}
+
+// recordingBreaker captures every Record call for inspection.
+type recordingBreaker struct {
+	mu    sync.Mutex
+	calls []error
+}
+
+func (b *recordingBreaker) Allow(string, time.Time) error { return nil }
+
+func (b *recordingBreaker) Record(_ string, _ time.Time, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.calls = append(b.calls, err)
+}
+
+func TestExecuteBreakerIgnoresClientErrors(t *testing.T) {
+	rb := &recordingBreaker{}
+	cfg := config.RetryConfig{MaxAttemptsPerProvider: 3, RetryableStatuses: []int{503}}
+	_, _, _, err := execute(context.Background(), cfg, config.FailoverConfig{}, rb, []routing.Candidate{{Name: "primary"}}, func(context.Context, routing.Candidate) (string, error) {
+		return "", &provider.ProviderError{Kind: provider.ErrorKindUpstream, Status: 400}
+	}, func(context.Context, time.Duration) error { return nil }, func() float64 { return 0.5 })
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if len(rb.calls) != 1 {
+		t.Fatalf("records = %d, want 1", len(rb.calls))
+	}
+	if rb.calls[0] != nil {
+		t.Errorf("record[0] = %v, want nil (client 400 must not count toward the breaker)", rb.calls[0])
+	}
+}
+
+func TestExecuteBreakerTripsOnServerErrors(t *testing.T) {
+	breaker := circuitbreaker.New(circuitbreaker.Config{
+		FailureThreshold:         3,
+		OpenDuration:             time.Minute,
+		HalfOpenMaxRequests:      1,
+		HalfOpenSuccessThreshold: 1,
+	})
+	cfg := config.RetryConfig{MaxAttemptsPerProvider: 5, RetryableStatuses: []int{503}}
+	_, _, _, err := execute(context.Background(), cfg, config.FailoverConfig{}, breaker, []routing.Candidate{{Name: "primary"}}, func(context.Context, routing.Candidate) (string, error) {
+		return "", &provider.ProviderError{Kind: provider.ErrorKindUpstream, Status: 503}
+	}, func(context.Context, time.Duration) error { return nil }, func() float64 { return 0.5 })
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if got := breaker.Allow("primary|", time.Now()); got == nil {
+		t.Error("breaker should be open after 3 consecutive 5xx")
+	}
+}
+
+func TestExecuteBreakerStaysClosedOnRepeatedClientErrors(t *testing.T) {
+	breaker := circuitbreaker.New(circuitbreaker.Config{
+		FailureThreshold:         3,
+		OpenDuration:             time.Minute,
+		HalfOpenMaxRequests:      1,
+		HalfOpenSuccessThreshold: 1,
+	})
+	cfg := config.RetryConfig{MaxAttemptsPerProvider: 1, RetryableStatuses: []int{503}}
+	for i := 0; i < 5; i++ {
+		_, _, _, err := execute(context.Background(), cfg, config.FailoverConfig{}, breaker, []routing.Candidate{{Name: "primary"}}, func(context.Context, routing.Candidate) (string, error) {
+			return "", &provider.ProviderError{Kind: provider.ErrorKindUpstream, Status: 400}
+		}, func(context.Context, time.Duration) error { return nil }, func() float64 { return 0.5 })
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	}
+	if got := breaker.Allow("primary|", time.Now()); got != nil {
+		t.Error("breaker must stay closed after repeated client 400s")
 	}
 }
 

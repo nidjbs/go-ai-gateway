@@ -88,7 +88,12 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 				attemptSpan.SetStatus(codes.Error, err.Error())
 			}
 			attemptSpan.End()
-			breaker.Record(breakerKey, now, err)
+			// Client-caused errors (4xx, 429, canceled, invalid request) must
+			// not trip the provider breaker: a misbehaving client could
+			// otherwise cut off every other tenant. They count as "healthy"
+			// responses (the provider processed the call), so a success or a
+			// client error both reset the consecutive-failure streak.
+			breaker.Record(breakerKey, now, breakerErr(err))
 			if err != nil {
 				cancel()
 				lastErr = err
@@ -134,6 +139,38 @@ func backoffDuration(cfg config.RetryConfig, retryIndex uint, random func() floa
 		base = math.Min(base, float64(cfg.MaxInterval))
 	}
 	return time.Duration(math.Max(0, base))
+}
+
+// breakerErr returns err unchanged when the failure indicates an unhealthy
+// provider (transport, timeout, upstream 5xx, protocol), and nil when it was
+// caused by the client (4xx, 429, canceled, invalid request). The breaker
+// treats nil as success, so client-caused errors reset the failure streak
+// instead of tripping the provider open.
+func breakerErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var pe *provider.ProviderError
+	if errors.As(err, &pe) {
+		switch pe.Kind {
+		case provider.ErrorKindInvalidRequest, provider.ErrorKindCanceled:
+			return nil
+		case provider.ErrorKindUpstream:
+			if pe.Status >= 400 && pe.Status < 500 {
+				return nil
+			}
+		}
+	}
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	var httpErr *provider.HTTPError
+	if errors.As(err, &httpErr) {
+		if httpErr.StatusCode >= 400 && httpErr.StatusCode < 500 {
+			return nil
+		}
+	}
+	return err
 }
 
 func retryable(err error, cfg config.RetryConfig) bool {
