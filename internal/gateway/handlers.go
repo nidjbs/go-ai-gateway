@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +27,7 @@ import (
 	"github.com/nidjbs/go-ai-gateway/internal/config"
 	"github.com/nidjbs/go-ai-gateway/internal/dlp"
 	"github.com/nidjbs/go-ai-gateway/internal/metrics"
+	"github.com/nidjbs/go-ai-gateway/internal/plugin"
 	"github.com/nidjbs/go-ai-gateway/internal/provider"
 	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
 	"github.com/nidjbs/go-ai-gateway/internal/retry"
@@ -34,7 +37,6 @@ import (
 )
 
 const (
-	maxRequestBodyBytes  = 1 << 20
 	upstreamErrorMessage = "upstream request failed"
 )
 
@@ -55,6 +57,8 @@ type handler struct {
 	idem           map[string]idemEntry
 	revoker        revocation.Store
 	dlpDetector    *dlp.Detector
+	latency        *routing.LatencyTracker
+	plugins        *plugin.Manager
 }
 
 // idemEntry is one cached successful response keyed by (api key, Idempotency-Key).
@@ -238,6 +242,11 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	recordAccessAlias(r.Context(), request.Model)
+	started := h.now()
+	body, ok = h.runBeforePlugins(w, r, started, "chat.completions", request.Model, body)
+	if !ok {
+		return
+	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
 		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
 			return
@@ -248,13 +257,12 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		h.chatStream(w, r, body, request.Model, candidates)
 		return
 	}
-	if h.replayIdempotent(w, r, "chat.completions", request.Model, h.now()) {
+	if h.replayIdempotent(w, r, "chat.completions", request.Model, started) {
 		return
 	}
-	started := h.now()
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
 	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
-		return h.provider.Do(ctx, adapterRequest, c)
+		return h.doWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
 		h.writeProviderError(w, r, started, "chat.completions", request.Model, candidate, false, err)
@@ -266,6 +274,10 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	respBody := replaceModel(result.Body, request.Model)
 	var proceed bool
 	if respBody, proceed = h.dlpResponseBody(w, r, started, "chat.completions", request.Model, candidate, respBody); !proceed {
+		return
+	}
+	respBody, proceed = h.runAfterPlugins(w, r, started, "chat.completions", request.Model, result.Usage, http.StatusOK, respBody)
+	if !proceed {
 		return
 	}
 	writeRawJSON(w, http.StatusOK, respBody)
@@ -294,6 +306,11 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	recordAccessAlias(r.Context(), request.Model)
+	started := h.now()
+	body, ok = h.runBeforePlugins(w, r, started, "responses", request.Model, body)
+	if !ok {
+		return
+	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
 		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
 			return
@@ -304,13 +321,12 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 		h.responsesStream(w, r, body, request.Model, candidates)
 		return
 	}
-	if h.replayIdempotent(w, r, "responses", request.Model, h.now()) {
+	if h.replayIdempotent(w, r, "responses", request.Model, started) {
 		return
 	}
-	started := h.now()
 	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
 	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
-		return h.provider.Do(ctx, adapterRequest, c)
+		return h.doWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
 		h.writeProviderError(w, r, started, "responses", request.Model, candidate, false, err)
@@ -324,6 +340,10 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 	if respBody, proceed = h.dlpResponseBody(w, r, started, "responses", request.Model, candidate, respBody); !proceed {
 		return
 	}
+	respBody, proceed = h.runAfterPlugins(w, r, started, "responses", request.Model, result.Usage, http.StatusOK, respBody)
+	if !proceed {
+		return
+	}
 	writeRawJSON(w, http.StatusOK, respBody)
 	h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK, attempts: attempts})
 	h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK})
@@ -333,7 +353,7 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 func (h handler) parseResponses(w http.ResponseWriter, r *http.Request) (json.RawMessage, responsesRequest, []routing.Candidate, bool) {
 	started := h.now()
 	var request responsesRequest
-	body, err := readBody(w, r)
+	body, err := readBody(w, r, h.config.Server.BodyLimit())
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, "", routing.Candidate{}, err.Error())
 		return nil, request, nil, false
@@ -361,6 +381,7 @@ func (h handler) parseResponses(w http.ResponseWriter, r *http.Request) (json.Ra
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "no configured provider supports responses")
 		return nil, request, nil, false
 	}
+	candidates = routing.Order(routing.StrategyFor(h.config, request.Model), candidates, h.latency, rand.IntN)
 	return body, request, candidates, true
 }
 
@@ -368,7 +389,7 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 	started := h.now()
 	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
 	stream, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
-		return h.provider.OpenStream(ctx, adapterRequest, c)
+		return h.openStreamWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
 		h.writeProviderError(w, r, started, "responses", alias, candidate, true, err)
@@ -408,6 +429,7 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 				_, _ = fmt.Fprintf(w, "event: error\ndata: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
 				flusher.Flush()
 			}
+			h.notifyOnError(r, "responses", alias, err)
 			h.chargeStreamEstimate(w, r, alias, body, emittedRunes)
 			errorType, streamOutcome, status := streamOutcomeFor(result.err, r.Context())
 			h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: alias, candidate: candidate, ttft: firstToken, streaming: true, status: status, errorType: errorType, streamOutcome: streamOutcome, attempts: attempts})
@@ -465,6 +487,146 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 	if idleFired() || maxFired() {
 		h.writeStreamTimeout(w, r, started, "responses", alias, candidate, firstToken, attempts, body, emittedRunes, idleFired, maxFired)
 	}
+}
+
+// doWithLatency runs one non-streaming provider attempt and folds a successful
+// duration into the routing latency tracker, feeding the least_latency
+// strategy. Failures are not recorded so a flaky provider's estimate reflects
+// healthy responses only.
+func (h handler) doWithLatency(ctx context.Context, request provider.Request, c routing.Candidate) (provider.Result, error) {
+	started := h.now()
+	res, err := h.provider.Do(ctx, request, c)
+	if err == nil && h.latency != nil {
+		h.latency.Record(c, h.now().Sub(started))
+	}
+	return res, err
+}
+
+// openStreamWithLatency mirrors doWithLatency for streams: a successful
+// connection records the connect latency (TTFT is not observable here, so the
+// signal is connection cost, which is still a useful routing bias).
+func (h handler) openStreamWithLatency(ctx context.Context, request provider.Request, c routing.Candidate) (provider.Stream, error) {
+	started := h.now()
+	s, err := h.provider.OpenStream(ctx, request, c)
+	if err == nil && h.latency != nil {
+		h.latency.Record(c, h.now().Sub(started))
+	}
+	return s, err
+}
+
+// runBeforePlugins executes the before_request plugin chain after the request
+// is parsed. On a rejection or a broken fail-closed plugin it writes the
+// response and returns ok=false; otherwise it returns the possibly-rewritten
+// body. A nil/empty manager passes through unchanged.
+func (h handler) runBeforePlugins(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, body []byte) ([]byte, bool) {
+	if h.plugins == nil || h.plugins.Len() == 0 {
+		return body, true
+	}
+	pctx := &plugin.Context{Endpoint: endpoint, Alias: alias, Body: body}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		pctx.APIKeyID = principal.APIKeyID
+	}
+	if err := h.plugins.RunBefore(pctx); err != nil {
+		h.writePluginError(w, r, started, endpoint, alias, err)
+		return nil, false
+	}
+	if pctx.Body != nil {
+		body = pctx.Body
+	}
+	return body, true
+}
+
+// runAfterPlugins executes the after_request chain before a successful response
+// is written, letting a transform plugin screen or rewrite it. Streaming
+// responses call this with an empty body (the stream was already forwarded).
+func (h handler) runAfterPlugins(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, usage provider.Usage, status int, body []byte) ([]byte, bool) {
+	if h.plugins == nil || h.plugins.Len() == 0 {
+		return body, true
+	}
+	pctx := &plugin.Context{Endpoint: endpoint, Alias: alias, Body: body, Usage: usage, Status: status}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		pctx.APIKeyID = principal.APIKeyID
+	}
+	if err := h.plugins.RunAfter(pctx); err != nil {
+		h.writePluginError(w, r, started, endpoint, alias, err)
+		return nil, false
+	}
+	if pctx.Body != nil {
+		body = pctx.Body
+	}
+	return body, true
+}
+
+// notifyOnError runs the on_error chain after a failed request. It never
+// changes the primary error response; a broken on_error plugin is logged.
+func (h handler) notifyOnError(r *http.Request, endpoint, alias string, err error) {
+	if h.plugins == nil || h.plugins.Len() == 0 {
+		return
+	}
+	pctx := &plugin.Context{Endpoint: endpoint, Alias: alias, Err: err}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		pctx.APIKeyID = principal.APIKeyID
+	}
+	if runErr := h.plugins.RunOnError(pctx); runErr != nil {
+		h.logger.Warn("on_error plugin failed", "endpoint", endpoint, "error", runErr)
+	}
+}
+
+// writePluginError converts a plugin-chain outcome into a client response and
+// audit/metrics entry: a RejectionError is a deliberate denial (4xx/429), a
+// FailureError is a broken fail-closed plugin (500).
+func (h handler) writePluginError(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, err error) {
+	var re *plugin.RejectionError
+	if errors.As(err, &re) {
+		status := re.Status()
+		code := re.Code
+		if code == "" {
+			code = "plugin_rejected"
+		}
+		etype := re.Type
+		if etype == "" {
+			etype = "invalid_request_error"
+		}
+		if re.RetryAfter > 0 {
+			sec := int(re.RetryAfter.Seconds())
+			if sec < 1 {
+				sec = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(sec))
+		}
+		h.recordUsage(r.Context(), usageRecord{
+			started: started, endpoint: endpoint, alias: alias,
+			candidate: routing.Candidate{Name: alias, Model: alias},
+			status:    status, errorType: code,
+		})
+		h.recordMetrics(r.Context(), metricsRecord{
+			started: started, endpoint: endpoint, alias: alias,
+			candidate: routing.Candidate{Name: alias, Model: alias},
+			status:    status, errorType: code,
+		})
+		h.logger.Info("request rejected by plugin", "request_id", requestID(r), "endpoint", endpoint, "alias", alias, "plugin", re.Plugin, "code", code)
+		apierr.Write(w, status, code, etype, re.Error())
+		return
+	}
+	var fe *plugin.FailureError
+	if errors.As(err, &fe) {
+		h.logger.Error("plugin failed", "request_id", requestID(r), "endpoint", endpoint, "alias", alias, "plugin", fe.Plugin, "stage", fe.Stage, "error", fe.Err)
+		h.recordUsage(r.Context(), usageRecord{
+			started: started, endpoint: endpoint, alias: alias,
+			candidate: routing.Candidate{Name: alias, Model: alias},
+			status:    http.StatusInternalServerError, errorType: "plugin_failure",
+		})
+		h.recordMetrics(r.Context(), metricsRecord{
+			started: started, endpoint: endpoint, alias: alias,
+			candidate: routing.Candidate{Name: alias, Model: alias},
+			status:    http.StatusInternalServerError, errorType: "plugin_failure",
+		})
+		apierr.Write(w, http.StatusInternalServerError, "plugin_failure", "server_error", "internal server error")
+		return
+	}
+	// Unknown chain error: fail closed rather than forward unvetted traffic.
+	h.logger.Error("plugin chain error", "request_id", requestID(r), "endpoint", endpoint, "alias", alias, "error", err)
+	apierr.Write(w, http.StatusInternalServerError, "plugin_failure", "server_error", "internal server error")
 }
 
 func (h handler) chargeQuota(w http.ResponseWriter, keyID, alias string, delta int64) {
@@ -525,7 +687,7 @@ func (h handler) checkAliasQuota(w http.ResponseWriter, r *http.Request, started
 func (h handler) parseChat(w http.ResponseWriter, r *http.Request) (json.RawMessage, chatRequest, []routing.Candidate, bool) {
 	started := h.now()
 	var request chatRequest
-	body, err := readBody(w, r)
+	body, err := readBody(w, r, h.config.Server.BodyLimit())
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, "", routing.Candidate{}, err.Error())
 		return nil, request, nil, false
@@ -553,6 +715,7 @@ func (h handler) parseChat(w http.ResponseWriter, r *http.Request) (json.RawMess
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "no configured provider supports chat.completions")
 		return nil, request, nil, false
 	}
+	candidates = routing.Order(routing.StrategyFor(h.config, request.Model), candidates, h.latency, rand.IntN)
 	return body, request, candidates, true
 }
 
@@ -560,7 +723,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	started := h.now()
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
 	stream, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
-		return h.provider.OpenStream(ctx, adapterRequest, c)
+		return h.openStreamWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
 		h.writeProviderError(w, r, started, "chat.completions", alias, candidate, true, err)
@@ -600,6 +763,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 				_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\n", upstreamErrorMessage)
 				flusher.Flush()
 			}
+			h.notifyOnError(r, "chat.completions", alias, err)
 			h.chargeStreamEstimate(w, r, alias, body, emittedRunes)
 			errorType, streamOutcome, status := streamOutcomeFor(result.err, r.Context())
 			h.recordUsage(r.Context(), usageRecord{
@@ -833,7 +997,7 @@ func streamOutcomeFor(streamErr error, reqCtx context.Context) (errorType, strea
 
 func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 	started := h.now()
-	body, err := readBody(w, r)
+	body, err := readBody(w, r, h.config.Server.BodyLimit())
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, "", routing.Candidate{}, err.Error())
 		return
@@ -861,14 +1025,19 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "no configured provider supports embeddings")
 		return
 	}
+	candidates = routing.Order(routing.StrategyFor(h.config, request.Model), candidates, h.latency, rand.IntN)
 	recordAccessAlias(r.Context(), request.Model)
+	body, ok := h.runBeforePlugins(w, r, started, "embeddings", request.Model, body)
+	if !ok {
+		return
+	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
 		if !h.checkAliasQuota(w, r, h.now(), principal, request.Model) {
 			return
 		}
 	}
 	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
-		return h.provider.Do(ctx, adapterRequest, c)
+		return h.doWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
 		h.writeProviderError(w, r, started, "embeddings", request.Model, candidate, false, err)
@@ -877,7 +1046,12 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.APIKeyID != "" {
 		h.chargeQuota(w, principal.APIKeyID, request.Model, h.chargeableTokens(int64(result.Usage.Total()), body))
 	}
-	writeRawJSON(w, http.StatusOK, replaceModel(result.Body, request.Model))
+	respBody := replaceModel(result.Body, request.Model)
+	respBody, ok = h.runAfterPlugins(w, r, started, "embeddings", request.Model, result.Usage, http.StatusOK, respBody)
+	if !ok {
+		return
+	}
+	writeRawJSON(w, http.StatusOK, respBody)
 	h.recordUsage(r.Context(), usageRecord{
 		started: started, endpoint: "embeddings", alias: request.Model, candidate: candidate,
 		usage:  result.Usage,
@@ -893,6 +1067,7 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 // audit/metrics entry. Provider RequestError → 400; ProviderError.Kind drives
 // the error_type/stream_outcome mapping; everything else falls back to 502.
 func (h handler) writeProviderError(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, candidate routing.Candidate, streaming bool, err error) {
+	h.notifyOnError(r, endpoint, alias, err)
 	var requestErr *provider.RequestError
 	if errors.As(err, &requestErr) {
 		h.recordUsage(r.Context(), usageRecord{
@@ -955,8 +1130,8 @@ func classifyProviderError(err error) (errorType, errorCode string, status int) 
 	return "upstream_error", "upstream_error", http.StatusBadGateway
 }
 
-func readBody(w http.ResponseWriter, r *http.Request) (json.RawMessage, error) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+func readBody(w http.ResponseWriter, r *http.Request, maxBytes int64) (json.RawMessage, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, err

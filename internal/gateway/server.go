@@ -27,9 +27,11 @@ import (
 	"github.com/nidjbs/go-ai-gateway/internal/dlp"
 	"github.com/nidjbs/go-ai-gateway/internal/guardrails"
 	"github.com/nidjbs/go-ai-gateway/internal/metrics"
+	"github.com/nidjbs/go-ai-gateway/internal/plugin"
 	"github.com/nidjbs/go-ai-gateway/internal/provider"
 	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
 	"github.com/nidjbs/go-ai-gateway/internal/revocation"
+	"github.com/nidjbs/go-ai-gateway/internal/routing"
 	"github.com/nidjbs/go-ai-gateway/internal/usage"
 	"github.com/nidjbs/go-ai-gateway/internal/version"
 )
@@ -76,21 +78,20 @@ func (r *readiness) readyz(w http.ResponseWriter, _ *http.Request) {
 }
 
 type Server struct {
-	HTTP                *http.Server
-	Ops                 http.Handler
-	ready               *readiness
-	config              *config.Config
-	logger              *slog.Logger
-	limiter             ratelimit.Limiter
-	quotaStore          ratelimit.QuotaStore
-	concurrency         *concurrency.Limiter
-	keyLock             sync.Mutex
-	keyLimits           map[string]*concurrency.Limiter
-	now                 func() time.Time
-	closer              io.Closer // optional sink/handle released on graceful shutdown
-	guardrailMiddleware func(next http.Handler) http.Handler
-	revoker             revocation.Store
-	dlpDetector         *dlp.Detector
+	HTTP        *http.Server
+	Ops         http.Handler
+	ready       *readiness
+	config      *config.Config
+	logger      *slog.Logger
+	limiter     ratelimit.Limiter
+	quotaStore  ratelimit.QuotaStore
+	concurrency *concurrency.Limiter
+	keyLock     sync.Mutex
+	keyLimits   map[string]*concurrency.Limiter
+	now         func() time.Time
+	closer      io.Closer // optional sink/handle released on graceful shutdown
+	revoker     revocation.Store
+	dlpDetector *dlp.Detector
 }
 
 // keyLimiter returns the per-key concurrency limiter for keyID, allocating
@@ -201,13 +202,19 @@ func New(deps Deps) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("guardrails tracker: %w", err)
 	}
-	guardrailMW := guardrails.NewMiddleware(guardrails.Config{
-		Enabled:   guardrailCfg.Enabled,
-		Mode:      guardrailCfg.Mode,
-		Threshold: guardrailCfg.Threshold,
-		Tracker:   trackerPolicy,
-		Allowlist: guardrailCfg.Allowlist,
+	// Guardrails run as a before_request plugin inside the request handlers
+	// (after parsing, before the provider call), replacing the previous HTTP
+	// middleware. The middleware form remains available for tests.
+	guardrailsPlugin := guardrails.NewPlugin(guardrails.Config{
+		Enabled:      guardrailCfg.Enabled,
+		Mode:         guardrailCfg.Mode,
+		Threshold:    guardrailCfg.Threshold,
+		Tracker:      trackerPolicy,
+		Allowlist:    guardrailCfg.Allowlist,
+		MaxBodyBytes: deps.Config.Server.BodyLimit(),
 	}, tracker, deps.Logger)
+	pluginManager := plugin.NewManager(deps.Logger)
+	pluginManager.Add(guardrailsPlugin)
 
 	// Admin surface (key revocation + usage queries); token required when enabled.
 	var revoker revocation.Store
@@ -234,17 +241,16 @@ func New(deps Deps) (*Server, error) {
 	}
 
 	server := &Server{
-		config:              deps.Config,
-		logger:              deps.Logger,
-		concurrency:         concurrency.New(deps.Config.Server.MaxConcurrentRequests),
-		keyLimits:           make(map[string]*concurrency.Limiter),
-		now:                 deps.Now,
-		closer:              sinkCloser(usageSink),
-		guardrailMiddleware: guardrailMW.Handle,
-		revoker:             revoker,
-		dlpDetector:         dlpDetector,
+		config:      deps.Config,
+		logger:      deps.Logger,
+		concurrency: concurrency.New(deps.Config.Server.MaxConcurrentRequests),
+		keyLimits:   make(map[string]*concurrency.Limiter),
+		now:         deps.Now,
+		closer:      sinkCloser(usageSink),
+		revoker:     revoker,
+		dlpDetector: dlpDetector,
 	}
-	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, breaker: deps.Breaker, keyConcurrency: server.keyLimiter, now: deps.Now, apiKeyLimits: deps.APIKeyLimits, idem: make(map[string]idemEntry), idemMu: &sync.Mutex{}, revoker: revoker, dlpDetector: dlpDetector}
+	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, breaker: deps.Breaker, keyConcurrency: server.keyLimiter, now: deps.Now, apiKeyLimits: deps.APIKeyLimits, idem: make(map[string]idemEntry), idemMu: &sync.Mutex{}, revoker: revoker, dlpDetector: dlpDetector, latency: routing.NewLatencyTracker(), plugins: pluginManager}
 	ops := chi.NewRouter()
 	if deps.Config.OpsTokenEnv != "" {
 		token := strings.TrimSpace(os.Getenv(deps.Config.OpsTokenEnv))
@@ -286,7 +292,6 @@ func New(deps Deps) (*Server, error) {
 	router.Group(func(r chi.Router) {
 		r.Use(server.concurrencyMiddleware)
 		r.Use(handlers.authenticate)
-		r.Use(server.guardrailMiddleware)
 		r.Get("/v1/models", handlers.models)
 		r.Post("/v1/chat/completions", handlers.chat)
 		r.Post("/v1/responses", handlers.responses)
