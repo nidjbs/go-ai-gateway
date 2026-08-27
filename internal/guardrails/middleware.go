@@ -33,6 +33,11 @@ type Config struct {
 	// Allowlist holds substrings that bypass scanning when present in the
 	// message content — an escape hatch for false-positive-prone payloads.
 	Allowlist []string
+	// MaxBodyBytes is the request-body size up to which scanning reads and
+	// restores the body. Larger bodies are forwarded untouched (scan skipped)
+	// so the middleware never silently truncates a payload; the gateway's
+	// own body limit rejects genuine over-limit requests downstream.
+	MaxBodyBytes int64
 }
 
 // DefaultConfig returns the default configuration.
@@ -80,18 +85,40 @@ func (m *Middleware) Handle(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/embeddings" {
+		if r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/responses" && r.URL.Path != "/v1/embeddings" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		body, err := readAndRestoreBody(r)
+		body, oversized, err := readAndRestoreBody(r, m.config.MaxBodyBytes)
 		if err != nil {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if oversized {
+			// Never silently truncate a payload: forward the body untouched
+			// (the gateway's body limit rejects over-limit requests) and skip
+			// the scan rather than scanning a corrupt prefix.
+			m.logger.Warn("guardrails: request body exceeds scan limit; skipping scan",
+				"path", r.URL.Path,
+				"limit_bytes", m.config.MaxBodyBytes,
+			)
+			next.ServeHTTP(w, r)
+			return
+		}
 
-		messages, ok := MessagesFromChatRequest(body)
+		var messages []Message
+		var ok bool
+		switch r.URL.Path {
+		case "/v1/chat/completions":
+			messages, ok = MessagesFromChatRequest(body)
+		case "/v1/responses":
+			messages, ok = MessagesFromResponsesRequest(body)
+		default:
+			// /v1/embeddings has no conversational messages to scan.
+			next.ServeHTTP(w, r)
+			return
+		}
 		if !ok || len(messages) == 0 {
 			next.ServeHTTP(w, r)
 			return
@@ -157,7 +184,13 @@ func (m *Middleware) Handle(next http.Handler) http.Handler {
 // reliably false-positive (benchmark suites, red-team exercises, structured
 // tool data) without disabling the whole layer.
 func (m *Middleware) allowlisted(messages []Message) bool {
-	if len(m.config.Allowlist) == 0 {
+	return allowlistedMessages(messages, m.config.Allowlist)
+}
+
+// allowlistedMessages is the shared allowlist check used by the middleware and
+// the plugin form.
+func allowlistedMessages(messages []Message, allowlist []string) bool {
+	if len(allowlist) == 0 {
 		return false
 	}
 	var buf strings.Builder
@@ -166,7 +199,7 @@ func (m *Middleware) allowlisted(messages []Message) bool {
 		buf.WriteByte('\n')
 	}
 	content := buf.String()
-	for _, entry := range m.config.Allowlist {
+	for _, entry := range allowlist {
 		if entry != "" && strings.Contains(content, entry) {
 			return true
 		}
@@ -199,17 +232,29 @@ func SetCanaryToContext(ctx context.Context, canary CanaryToken) context.Context
 	return context.WithValue(ctx, ctxKeyCanary, canary)
 }
 
-func readAndRestoreBody(r *http.Request) ([]byte, error) {
+// defaultScanBodyBytes is the scan/restore limit when Config.MaxBodyBytes is
+// unset (e.g. middleware constructed directly in tests).
+const defaultScanBodyBytes = 1 << 20
+
+// readAndRestoreBody reads up to limit+1 bytes so callers can distinguish a
+// body that fits (len(data) <= limit) from one that exceeds the limit
+// (oversized). The body stream is always restored — oversized or not — so the
+// downstream handler still enforces its own limit instead of receiving a
+// silently truncated payload.
+func readAndRestoreBody(r *http.Request, limit int64) (data []byte, oversized bool, err error) {
 	if r.Body == nil {
-		return nil, nil
+		return nil, false, nil
 	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB limit
+	if limit <= 0 {
+		limit = defaultScanBodyBytes
+	}
+	data, err = io.ReadAll(io.LimitReader(r.Body, limit+1))
 	r.Body.Close()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	r.Body = io.NopCloser(bytes.NewReader(data))
-	return data, nil
+	return data, int64(len(data)) > limit, nil
 }
 
 func formatRetryAfter(d time.Duration) string {
