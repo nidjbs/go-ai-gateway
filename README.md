@@ -83,12 +83,14 @@ The Compose setup is a distributed-mode smoke test. It runs two gateway replicas
 | Feature | Description |
 |---|---|
 | Model aliases | Route a client-visible model name to one or more upstream models |
+| Routing strategies | Per-alias `fallback` (priority), `loadbalance` (weighted random primary), `least_latency` (fastest observed provider first via EWMA) |
 | Retry and failover | Retry eligible errors and move to lower-priority providers |
 | Provider adapters | OpenAI-compatible upstreams and Anthropic Messages API |
+| Plugin framework | Staged `before_request` / `after_request` / `on_error` middleware with factory registration and a fail-open/fail-closed policy; guardrails run as the first plugin |
 | Authentication | Local unauthenticated mode, static Bearer token, or per-team API keys |
 | Limits and quotas | Per-key rate limits plus daily, monthly, and per-alias token quotas |
 | Distributed state | Redis-backed rate limits, quotas, and guardrail tracking across replicas |
-| Guardrails | Optional prompt-injection scanning and per-key penalty tracking |
+| Guardrails | Optional prompt-injection scanning and per-key penalty tracking (runs as a before-request plugin) |
 | Observability | Prometheus metrics, OpenTelemetry tracing, structured usage records, request-level access log |
 | Admin surface | Runtime API-key revocation + usage aggregation queries on the ops port |
 | Output DLP | Mask or reject PII/sensitive patterns (email, phone, cards, secrets) in responses, streaming-aware |
@@ -119,6 +121,24 @@ aliases:
     providers:
       - {name: primary, model: model-a, priority: 0}
       - {name: backup, model: model-b, priority: 1}
+```
+
+An alias with several providers can pick a routing strategy that reorders the
+chain per request. The first provider in the resulting order is the primary;
+the rest stay as fallbacks:
+
+- `fallback` — try providers in `priority` order (default).
+- `loadbalance` — pick a weighted-random primary each request via `weight`.
+- `least_latency` — try the fastest observed provider first (EWMA of success
+  latency, tracked per provider+model and fed by every routed attempt).
+
+```yaml
+aliases:
+  chat:
+    strategy: loadbalance
+    providers:
+      - {name: primary, model: model-a, priority: 0, weight: 3}
+      - {name: backup, model: model-b, priority: 1, weight: 1}
 ```
 
 For multiple replicas, configure the Redis drivers shown in `configs/config.docker.yaml`. With no driver configured, rate limits, quotas, and guardrail tracking use process-local memory.

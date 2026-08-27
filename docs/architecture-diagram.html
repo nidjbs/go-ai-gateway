@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go AI Gateway — Architecture</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #f5f5f5;
+    font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    padding: 48px 24px;
+  }
+  .container {
+    width: 100%;
+    max-width: 1100px;
+  }
+  h1 {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-size: 1.75rem;
+    font-weight: 400;
+    color: #2d3142;
+    margin-bottom: 32px;
+    letter-spacing: -0.01em;
+  }
+  svg { width: 100%; height: auto; display: block; }
+  .subtitle {
+    font-family: 'Geist Mono', monospace;
+    font-size: 8px;
+    font-weight: 500;
+    color: #7a8399;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    margin-bottom: 20px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <p class="subtitle">System overview</p>
+  <h1>Go AI Gateway — Architecture</h1>
+  <svg viewBox="0 0 1040 820" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+    <title id="title">Go AI Gateway Architecture</title>
+    <desc id="desc">End-to-end request flow: External clients connect to the Go AI Gateway, which applies authentication, rate limiting, circuit breaking, and retry logic before routing to OpenAI or Anthropic providers.</desc>
+
+    <defs>
+      <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+      </marker>
+      <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/>
+      </marker>
+      <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/>
+      </marker>
+      <marker id="arrow-muted" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#7a8399"/>
+      </marker>
+    </defs>
+
+    <!-- ══════════════════════════════════════════
+         ZONE 1 — External Clients (top band)
+         ══════════════════════════════════════════ -->
+    <rect x="24" y="16" width="992" height="110" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+    <rect x="44" y="4" width="90" height="16" rx="2" fill="#f5f5f5"/>
+    <text x="89" y="15" fill="#7a8399" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.18em">CLIENTS</text>
+
+    <!-- Web App -->
+    <rect x="60" y="38" width="128" height="68" rx="6" fill="#4f5d75" fill-opacity="0.10" stroke="#4f5d75" stroke-opacity="0.40" stroke-width="0.8"/>
+    <text x="124" y="70" text-anchor="middle" font-family="'Geist',sans-serif" font-size="12" font-weight="600" fill="#2d3142">Web App</text>
+    <text x="124" y="86" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="8" fill="#7a8399">React / Next.js</text>
+
+    <!-- Mobile App -->
+    <rect x="228" y="38" width="128" height="68" rx="6" fill="#4f5d75" fill-opacity="0.10" stroke="#4f5d75" stroke-opacity="0.40" stroke-width="0.8"/>
+    <text x="292" y="70" text-anchor="middle" font-family="'Geist',sans-serif" font-size="12" font-weight="600" fill="#2d3142">Mobile App</text>
+    <text x="292" y="86" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="8" fill="#7a8399">iOS / Android</text>
+
+    <!-- CLI Tool -->
+    <rect x="396" y="38" width="128" height="68" rx="6" fill="#4f5d75" fill-opacity="0.10" stroke="#4f5d75" stroke-opacity="0.40" stroke-width="0.8"/>
+    <text x="460" y="70" text-anchor="middle" font-family="'Geist',sans-serif" font-size="12" font-weight="600" fill="#2d3142">CLI Tool</text>
+    <text x="460" y="86" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="8" fill="#7a8399">curl / openai SDK</text>
+
+    <!-- SDK Client -->
+    <rect x="564" y="38" width="128" height="68" rx="6" fill="#4f5d75" fill-opacity="0.10" stroke="#4f5d75" stroke-opacity="0.40" stroke-width="0.8"/>
+    <text x="628" y="70" text-anchor="middle" font-family="'Geist',sans-serif" font-size="12" font-weight="600" fill="#2d3142">SDK Client</text>
+    <text x="628" y="86" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="8" fill="#7a8399">Python / Node.js</text>
+
+    <!-- Service Mesh -->
+    <rect x="732" y="38" width="128" height="68" rx="6" fill="#4f5d75" fill-opacity="0.10" stroke="#4f5d75" stroke-opacity="0.40" stroke-width="0.8"/>
+    <text x="796" y="70" text-anchor="middle" font-family="'Geist',sans-serif" font-size="12" font-weight="600" fill="#2d3142">Service Mesh</text>
+    <text x="796" y="86" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="8" fill="#7a8399">Internal services</text>
+
+    <!-- ══════════════════════════════════════════
+         ZONE 2 — Gateway (center)
+         ══════════════════════════════════════════ -->
+    <rect x="24" y="158" width="700" height="580" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+    <rect x="44" y="146" width="78" height="16" rx="2" fill="#f5f5f5"/>
+    <text x="83" y="157" fill="#7a8399" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.18em">GATEWAY</text>
+
+    <!-- ── Middleware stack ── -->
+    <rect x="48" y="174" width="652" height="118" rx="6" fill="rgba(235,108,54,0.04)" stroke="rgba(235,108,54,0.18)" stroke-width="0.8"/>
+    <text x="68" y="191" font-family="'Geist Mono',monospace" font-size="7" font-weight="500" fill="#eb6c36" letter-spacing="0.14em">MIDDLEWARE PIPELINE</text>
+
+    <!-- Concurrency -->
+    <rect x="68" y="200" width="112" height="72" rx="4" fill="#eb6c36" fill-opacity="0.08" stroke="#eb6c36" stroke-width="1"/>
+    <text x="124" y="223" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Concurrency</text>
+    <text x="124" y="237" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Semaphore cap</text>
+    <text x="124" y="250" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">TryAcquire / Release</text>
+
+    <!-- Auth -->
+    <rect x="200" y="200" width="112" height="72" rx="4" fill="#eb6c36" fill-opacity="0.08" stroke="#eb6c36" stroke-width="1"/>
+    <text x="256" y="223" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Auth</text>
+    <text x="256" y="237" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Bearer / API Key</text>
+    <text x="256" y="250" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Team + Key limits</text>
+
+    <!-- Rate Limit -->
+    <rect x="332" y="200" width="112" height="72" rx="4" fill="#eb6c36" fill-opacity="0.08" stroke="#eb6c36" stroke-width="1"/>
+    <text x="388" y="223" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Rate Limit</text>
+    <text x="388" y="237" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Token-bucket</text>
+    <text x="388" y="250" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">RPS + burst</text>
+
+    <!-- Circuit Breaker -->
+    <rect x="464" y="200" width="112" height="72" rx="4" fill="#eb6c36" fill-opacity="0.08" stroke="#eb6c36" stroke-width="1"/>
+    <text x="520" y="223" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Circuit Breaker</text>
+    <text x="520" y="237" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Closed / Open / Half-Open</text>
+    <text x="520" y="250" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Per-provider key</text>
+
+    <!-- Quota -->
+    <rect x="596" y="200" width="88" height="72" rx="4" fill="#eb6c36" fill-opacity="0.08" stroke="#eb6c36" stroke-width="1"/>
+    <text x="640" y="223" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Quota</text>
+    <text x="640" y="237" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Daily / Monthly</text>
+    <text x="640" y="250" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">token windows</text>
+
+    <!-- ── Request Handler ── -->
+    <rect x="48" y="312" width="652" height="100" rx="6" fill="rgba(46,90,168,0.04)" stroke="rgba(46,90,168,0.18)" stroke-width="0.8"/>
+    <text x="68" y="329" font-family="'Geist Mono',monospace" font-size="7" font-weight="500" fill="#2e5aa8" letter-spacing="0.14em">REQUEST HANDLER</text>
+
+    <!-- Routing -->
+    <rect x="68" y="338" width="150" height="64" rx="4" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+    <text x="143" y="361" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Routing</text>
+    <text x="143" y="376" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Alias → Candidate</text>
+    <text x="143" y="389" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">priority sort</text>
+
+    <!-- Retry + Failover -->
+    <rect x="242" y="338" width="180" height="64" rx="4" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+    <text x="332" y="361" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Retry + Failover</text>
+    <text x="332" y="376" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Exponential backoff</text>
+    <text x="332" y="389" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Max providers × attempts</text>
+
+    <!-- Stream Pump -->
+    <rect x="450" y="338" width="130" height="64" rx="4" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+    <text x="515" y="361" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Stream Pump</text>
+    <text x="515" y="376" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Bounded channel</text>
+    <text x="515" y="389" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">SSE backpressure</text>
+
+    <!-- ── Observability ── -->
+    <rect x="48" y="434" width="652" height="86" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.08)" stroke-width="0.8"/>
+    <text x="68" y="451" font-family="'Geist Mono',monospace" font-size="7" font-weight="500" fill="#7a8399" letter-spacing="0.14em">OBSERVABILITY</text>
+
+    <!-- Metrics -->
+    <rect x="68" y="460" width="130" height="48" rx="4" fill="#2d3142" fill-opacity="0.04" stroke="#2d3142" stroke-opacity="0.25" stroke-width="0.8"/>
+    <text x="133" y="481" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Metrics</text>
+    <text x="133" y="496" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Prometheus + OTel</text>
+    <text x="133" y="508" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">4 histograms</text>
+
+    <!-- Tracing -->
+    <rect x="222" y="460" width="130" height="48" rx="4" fill="#2d3142" fill-opacity="0.04" stroke="#2d3142" stroke-opacity="0.25" stroke-width="0.8"/>
+    <text x="287" y="481" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Tracing</text>
+    <text x="287" y="496" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">OTLP exporter</text>
+    <text x="287" y="508" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">W3C TraceContext</text>
+
+    <!-- Usage Sink -->
+    <rect x="376" y="460" width="130" height="48" rx="4" fill="#2d3142" fill-opacity="0.04" stroke="#2d3142" stroke-opacity="0.25" stroke-width="0.8"/>
+    <text x="441" y="481" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Usage Sink</text>
+    <text x="441" y="496" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Audit / SQLite</text>
+    <text x="441" y="508" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">usage_events table</text>
+
+    <!-- Headers -->
+    <rect x="530" y="460" width="150" height="48" rx="4" fill="#2d3142" fill-opacity="0.04" stroke="#2d3142" stroke-opacity="0.25" stroke-width="0.8"/>
+    <text x="605" y="481" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Response Headers</text>
+    <text x="605" y="496" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">RateLimit-* / Quota-*</text>
+    <text x="605" y="508" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Retry-After</text>
+
+    <!-- ── Config / Registry ── -->
+    <rect x="48" y="542" width="652" height="82" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.08)" stroke-width="0.8"/>
+    <text x="68" y="559" font-family="'Geist Mono',monospace" font-size="7" font-weight="500" fill="#7a8399" letter-spacing="0.14em">CONFIGURATION</text>
+
+    <rect x="68" y="570" width="158" height="44" rx="4" fill="#ffffff" stroke="#2d3142" stroke-opacity="0.20" stroke-width="0.8"/>
+    <text x="147" y="589" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Config</text>
+    <text x="147" y="603" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">YAML: providers, aliases</text>
+    <text x="147" y="615" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">retry, circuit-breaker …</text>
+
+    <rect x="248" y="570" width="158" height="44" rx="4" fill="#ffffff" stroke="#2d3142" stroke-opacity="0.20" stroke-width="0.8"/>
+    <text x="327" y="589" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Registry</text>
+    <text x="327" y="603" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Limiter / Quota / Sink</text>
+    <text x="327" y="615" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">driver registry</text>
+
+    <rect x="428" y="570" width="130" height="44" rx="4" fill="#ffffff" stroke="#2d3142" stroke-opacity="0.20" stroke-width="0.8"/>
+    <text x="493" y="589" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Health / Ops</text>
+    <text x="493" y="603" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">/healthz /livez /readyz</text>
+    <text x="493" y="615" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">/metrics</text>
+
+    <rect x="578" y="570" width="106" height="44" rx="4" fill="#ffffff" stroke="#2d3142" stroke-opacity="0.20" stroke-width="0.8"/>
+    <text x="631" y="589" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Keygen CLI</text>
+    <text x="631" y="603" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">cmd/keygen</text>
+    <text x="631" y="615" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">sk-* key generation</text>
+
+    <!-- ── API Endpoints ── -->
+    <rect x="48" y="646" width="652" height="82" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.08)" stroke-width="0.8"/>
+    <text x="68" y="663" font-family="'Geist Mono',monospace" font-size="7" font-weight="500" fill="#7a8399" letter-spacing="0.14em">API ENDPOINTS</text>
+
+    <rect x="68" y="674" width="130" height="42" rx="4" fill="#2e5aa8" fill-opacity="0.06" stroke="#2e5aa8" stroke-opacity="0.30" stroke-width="0.8"/>
+    <text x="133" y="693" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10" font-weight="600" fill="#2d3142">GET /v1/models</text>
+    <text x="133" y="707" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">list aliases</text>
+
+    <rect x="218" y="674" width="180" height="42" rx="4" fill="#2e5aa8" fill-opacity="0.06" stroke="#2e5aa8" stroke-opacity="0.30" stroke-width="0.8"/>
+    <text x="308" y="693" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10" font-weight="600" fill="#2d3142">POST /v1/chat/completions</text>
+    <text x="308" y="707" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">streaming + non-streaming</text>
+
+    <rect x="418" y="674" width="160" height="42" rx="4" fill="#2e5aa8" fill-opacity="0.06" stroke="#2e5aa8" stroke-opacity="0.30" stroke-width="0.8"/>
+    <text x="498" y="693" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10" font-weight="600" fill="#2d3142">POST /v1/embeddings</text>
+    <text x="498" y="707" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">OpenAI providers</text>
+
+    <!-- ══════════════════════════════════════════
+         ZONE 3 — Provider Adapters (right band)
+         ══════════════════════════════════════════ -->
+    <rect x="744" y="158" width="272" height="580" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+    <rect x="764" y="146" width="72" height="16" rx="2" fill="#f5f5f5"/>
+    <text x="800" y="157" fill="#7a8399" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.18em">PROVIDERS</text>
+
+    <!-- Adapter Interface -->
+    <rect x="764" y="174" width="232" height="56" rx="6" fill="#eb6c36" fill-opacity="0.10" stroke="#eb6c36" stroke-width="1.2"/>
+    <text x="880" y="196" text-anchor="middle" font-family="'Geist',sans-serif" font-size="11" font-weight="600" fill="#2d3142">Adapter Interface</text>
+    <text x="880" y="211" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Do() · OpenStream()</text>
+    <text x="880" y="224" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Validate() · Supports()</text>
+
+    <!-- OpenAI Adapter -->
+    <rect x="764" y="252" width="108" height="80" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+    <text x="818" y="277" text-anchor="middle" font-family="'Geist',sans-serif" font-size="11" font-weight="600" fill="#2d3142">OpenAI</text>
+    <text x="818" y="293" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Passthrough JSON</text>
+    <text x="818" y="306" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">SSE reader</text>
+    <text x="818" y="319" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">token parsing</text>
+
+    <!-- Anthropic Adapter -->
+    <rect x="888" y="252" width="108" height="80" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+    <text x="942" y="277" text-anchor="middle" font-family="'Geist',sans-serif" font-size="11" font-weight="600" fill="#2d3142">Anthropic</text>
+    <text x="942" y="293" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Wire translation</text>
+    <text x="942" y="306" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">OpenAI ↔ Messages</text>
+    <text x="942" y="319" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">SSE re-encode</text>
+
+    <!-- HTTP Client -->
+    <rect x="764" y="354" width="232" height="50" rx="6" fill="#2d3142" fill-opacity="0.04" stroke="#2d3142" stroke-opacity="0.25" stroke-width="0.8"/>
+    <text x="880" y="374" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">HTTP Client</text>
+    <text x="880" y="389" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">otelhttp transport</text>
+    <text x="880" y="401" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">traceparent injection</text>
+
+    <!-- ══════════════════════════════════════════
+         ZONE 4 — Upstream Providers (bottom)
+         ══════════════════════════════════════════ -->
+    <rect x="24" y="758" width="992" height="52" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+    <rect x="44" y="746" width="78" height="16" rx="2" fill="#f5f5f5"/>
+    <text x="83" y="757" fill="#7a8399" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing="0.18em">UPSTREAM</text>
+
+    <rect x="68" y="770" width="200" height="32" rx="4" fill="#2d3142" fill-opacity="0.06" stroke="#2d3142" stroke-opacity="0.25" stroke-width="0.8"/>
+    <text x="168" y="791" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">OpenAI API</text>
+    <text x="168" y="803" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">gpt-4o · gpt-4-turbo · …</text>
+
+    <rect x="304" y="770" width="200" height="32" rx="4" fill="#2d3142" fill-opacity="0.06" stroke="#2d3142" stroke-opacity="0.25" stroke-width="0.8"/>
+    <text x="404" y="791" text-anchor="middle" font-family="'Geist',sans-serif" font-size="10.5" font-weight="600" fill="#2d3142">Anthropic API</text>
+    <text x="404" y="803" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">claude-3.5-sonnet · …</text>
+
+    <!-- ══════════════════════════════════════════
+         ARROWS — Clients → Gateway
+         ══════════════════════════════════════════ -->
+
+    <!-- Web App → Gateway -->
+    <path d="M 124 106 V 158 H 210" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)" stroke-opacity="0.50"/>
+    <text x="144" y="140" font-family="'Geist Mono',monospace" font-size="7" fill="#7a8399" text-anchor="middle">POST /v1/chat</text>
+
+    <!-- Mobile App → Gateway -->
+    <path d="M 292 106 V 158 H 210" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)" stroke-opacity="0.50"/>
+    <text x="312" y="140" font-family="'Geist Mono',monospace" font-size="7" fill="#7a8399" text-anchor="middle">POST /v1/chat</text>
+
+    <!-- CLI Tool → Gateway -->
+    <path d="M 460 106 V 158 H 210" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)" stroke-opacity="0.50"/>
+    <text x="480" y="140" font-family="'Geist Mono',monospace" font-size="7" fill="#7a8399" text-anchor="middle">POST /v1/chat</text>
+
+    <!-- SDK Client → Gateway -->
+    <path d="M 628 106 V 158 H 210" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)" stroke-opacity="0.50"/>
+    <text x="648" y="140" font-family="'Geist Mono',monospace" font-size="7" fill="#7a8399" text-anchor="middle">POST /v1/chat</text>
+
+    <!-- ══════════════════════════════════════════
+         ARROWS — Gateway internal flow
+         ══════════════════════════════════════════ -->
+
+    <!-- Concurrency → Auth -->
+    <path d="M 180 236 H 200" fill="none" stroke="#eb6c36" stroke-width="1" marker-end="url(#arrow-accent)"/>
+
+    <!-- Auth → Rate Limit -->
+    <path d="M 312 236 H 332" fill="none" stroke="#eb6c36" stroke-width="1" marker-end="url(#arrow-accent)"/>
+
+    <!-- Rate Limit → Circuit Breaker -->
+    <path d="M 444 236 H 464" fill="none" stroke="#eb6c36" stroke-width="1" marker-end="url(#arrow-accent)"/>
+
+    <!-- Circuit Breaker → Quota -->
+    <path d="M 576 236 H 596" fill="none" stroke="#eb6c36" stroke-width="1" marker-end="url(#arrow-accent)"/>
+
+    <!-- Middleware → Routing (down arrow) -->
+    <path d="M 520 294 V 312 H 143" fill="none" stroke="#2d3142" stroke-width="1" marker-end="url(#arrow)"/>
+
+    <!-- Routing → Retry -->
+    <path d="M 218 370 H 242" fill="none" stroke="#2d3142" stroke-width="1" marker-end="url(#arrow)"/>
+
+    <!-- Retry → Stream Pump -->
+    <path d="M 422 370 H 450" fill="none" stroke="#2d3142" stroke-width="1" marker-end="url(#arrow)"/>
+
+    <!-- ══════════════════════════════════════════
+         ARROWS — Gateway → Providers
+         ══════════════════════════════════════════ -->
+
+    <!-- Adapter Interface → OpenAI Adapter -->
+    <path d="M 818 230 V 252" fill="none" stroke="#2d3142" stroke-width="0.8" marker-end="url(#arrow-muted)"/>
+
+    <!-- Adapter Interface → Anthropic Adapter -->
+    <path d="M 942 230 V 252" fill="none" stroke="#2d3142" stroke-width="0.8" marker-end="url(#arrow-muted)"/>
+
+    <!-- OpenAI Adapter → HTTP Client -->
+    <path d="M 818 334 V 354 H 880" fill="none" stroke="#2d3142" stroke-width="0.8" marker-end="url(#arrow-muted)"/>
+
+    <!-- Anthropic Adapter → HTTP Client -->
+    <path d="M 942 334 V 354 H 880" fill="none" stroke="#2d3142" stroke-width="0.8" marker-end="url(#arrow-muted)"/>
+
+    <!-- Gateway → OpenAI API -->
+    <path d="M 168 744 V 770 H 168" fill="none" stroke="#2e5aa8" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-link)"/>
+    <text x="185" y="762" font-family="'Geist Mono',monospace" font-size="7" fill="#2e5aa8">POST /v1/chat</text>
+
+    <!-- Gateway → Anthropic API -->
+    <path d="M 404 744 V 770 H 404" fill="none" stroke="#2e5aa8" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-link)"/>
+    <text x="421" y="762" font-family="'Geist Mono',monospace" font-size="7" fill="#2e5aa8">POST /v1/messages</text>
+
+    <!-- HTTP Client → OpenAI API (bridge across the band) -->
+    <path d="M 916 404 V 434 H 936 V 746 H 168 V 770 H 168"
+          fill="none" stroke="#2e5aa8" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-link)" stroke-opacity="0.55"/>
+
+    <!-- HTTP Client → Anthropic API (bridge across the band) -->
+    <path d="M 880 404 V 434 H 880 V 746 H 404 V 770 H 404"
+          fill="none" stroke="#2e5aa8" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-link)" stroke-opacity="0.55"/>
+
+    <!-- ══════════════════════════════════════════
+         LEGEND
+         ══════════════════════════════════════════ -->
+    <rect x="744" y="580" width="272" height="168" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.08)" stroke-width="0.8"/>
+    <text x="764" y="598" font-family="'Geist Mono',monospace" font-size="7" font-weight="500" fill="#7a8399" letter-spacing="0.14em">LEGEND</text>
+
+    <!-- Solid arrow -->
+    <line x1="764" y1="616" x2="802" y2="616" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+    <text x="812" y="620" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Request flow</text>
+
+    <!-- Accent arrow -->
+    <line x1="764" y1="638" x2="802" y2="638" stroke="#eb6c36" stroke-width="1" marker-end="url(#arrow-accent)"/>
+    <text x="812" y="642" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Middleware chain</text>
+
+    <!-- Link arrow (dashed) -->
+    <line x1="764" y1="660" x2="802" y2="660" stroke="#2e5aa8" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-link)"/>
+    <text x="812" y="664" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">External / upstream</text>
+
+    <!-- Muted arrow -->
+    <line x1="764" y1="682" x2="802" y2="682" stroke="#7a8399" stroke-width="1" marker-end="url(#arrow-muted)"/>
+    <text x="812" y="686" font-family="'Geist Mono',monospace" font-size="7.5" fill="#7a8399">Internal routing</text>
+
+    <!-- Zone box example -->
+    <rect x="764" y="700" width="232" height="32" rx="4" fill="rgba(235,108,54,0.04)" stroke="rgba(235,108,54,0.18)" stroke-width="0.8"/>
+    <text x="880" y="720" text-anchor="middle" font-family="'Geist Mono',monospace" font-size="7" fill="#eb6c36">Middleware / Pipeline zone</text>
+
+  </svg>
+</div>
+</body>
+</html>
