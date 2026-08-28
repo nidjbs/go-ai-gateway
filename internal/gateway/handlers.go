@@ -24,14 +24,12 @@ import (
 	"github.com/nidjbs/go-ai-gateway/internal/auth"
 	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
 	"github.com/nidjbs/go-ai-gateway/internal/concurrency"
-	"github.com/nidjbs/go-ai-gateway/internal/config"
 	"github.com/nidjbs/go-ai-gateway/internal/dlp"
 	"github.com/nidjbs/go-ai-gateway/internal/metrics"
 	"github.com/nidjbs/go-ai-gateway/internal/plugin"
 	"github.com/nidjbs/go-ai-gateway/internal/provider"
 	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
 	"github.com/nidjbs/go-ai-gateway/internal/retry"
-	"github.com/nidjbs/go-ai-gateway/internal/revocation"
 	"github.com/nidjbs/go-ai-gateway/internal/routing"
 	"github.com/nidjbs/go-ai-gateway/internal/usage"
 )
@@ -41,22 +39,16 @@ const (
 )
 
 type handler struct {
-	config         *config.Config
+	rtPtr          *atomic.Pointer[runtime] // hot-reloadable state snapshot
 	logger         *slog.Logger
-	authenticator  auth.Authenticator
 	usageSink      usage.Sink
-	provider       *provider.Client
 	metrics        *metrics.Recorder
 	limiter        ratelimit.Limiter
 	quotaStore     ratelimit.QuotaStore
-	breaker        circuitbreaker.Breaker
 	keyConcurrency func(keyID string) *concurrency.Limiter
 	now            func() time.Time
-	apiKeyLimits   map[string]config.KeyLimits
 	idemMu         *sync.Mutex
 	idem           map[string]idemEntry
-	revoker        revocation.Store
-	dlpDetector    *dlp.Detector
 	latency        *routing.LatencyTracker
 	plugins        *plugin.Manager
 }
@@ -98,7 +90,7 @@ type metricsRecord struct {
 func (h handler) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := h.now()
-		principal, err := h.authenticator.Authenticate(r.Context(), r)
+		principal, err := h.rt().authenticator.Authenticate(r.Context(), r)
 		if err != nil {
 			if errors.Is(err, auth.ErrUnauthorized) {
 				h.recordUsage(r.Context(), usageRecord{
@@ -118,7 +110,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 		ctx := auth.ContextWithPrincipal(r.Context(), principal)
 		recordAccessPrincipal(r.Context(), principal)
 		if principal.APIKeyID != "" {
-			if h.revoker != nil && h.revoker.IsRevoked(principal.APIKeyID) {
+			if h.rt().revoker != nil && h.rt().revoker.IsRevoked(principal.APIKeyID) {
 				h.recordUsage(r.Context(), usageRecord{
 					started: started, endpoint: requestEndpoint(r),
 					candidate: routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID},
@@ -143,7 +135,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 					defer kl.Release()
 				}
 			}
-			limits := h.apiKeyLimits[principal.APIKeyID]
+			limits := h.rt().apiKeyLimits[principal.APIKeyID]
 			if h.limiter != nil {
 				decision := h.limiter.Allow(principal.APIKeyID, limits, h.now())
 				writeRateLimitHeaders(w, limits, decision)
@@ -201,7 +193,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 }
 
 func (h handler) models(w http.ResponseWriter, _ *http.Request) {
-	names := h.config.AliasNames()
+	names := h.rt().config.AliasNames()
 	type model struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
@@ -261,7 +253,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
-	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
+	result, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
 		return h.doWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
@@ -325,7 +317,7 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
-	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
+	result, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
 		return h.doWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
@@ -353,7 +345,7 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 func (h handler) parseResponses(w http.ResponseWriter, r *http.Request) (json.RawMessage, responsesRequest, []routing.Candidate, bool) {
 	started := h.now()
 	var request responsesRequest
-	body, err := readBody(w, r, h.config.Server.BodyLimit())
+	body, err := readBody(w, r, h.rt().config.Server.BodyLimit())
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, "", routing.Candidate{}, err.Error())
 		return nil, request, nil, false
@@ -366,13 +358,13 @@ func (h handler) parseResponses(w http.ResponseWriter, r *http.Request) (json.Ra
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "model and input are required")
 		return nil, request, nil, false
 	}
-	candidates, err := routing.Resolve(h.config, request.Model)
+	candidates, err := routing.Resolve(h.rt().config, request.Model)
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
 		return nil, request, nil, false
 	}
 	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
-	candidates, err = h.provider.Filter(candidates, adapterRequest)
+	candidates, err = h.rt().provider.Filter(candidates, adapterRequest)
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
 		return nil, request, nil, false
@@ -381,14 +373,14 @@ func (h handler) parseResponses(w http.ResponseWriter, r *http.Request) (json.Ra
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "no configured provider supports responses")
 		return nil, request, nil, false
 	}
-	candidates = routing.Order(routing.StrategyFor(h.config, request.Model), candidates, h.latency, rand.IntN)
+	candidates = routing.Order(routing.StrategyFor(h.rt().config, request.Model), candidates, h.latency, rand.IntN)
 	return body, request, candidates, true
 }
 
 func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body json.RawMessage, alias string, candidates []routing.Candidate) {
 	started := h.now()
 	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
-	stream, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
+	stream, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
 		return h.openStreamWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
@@ -407,12 +399,12 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 	flusher.Flush()
 	streamCtx, cancelStream := context.WithCancel(r.Context())
 	defer cancelStream()
-	idleFired, maxFired, resetIdle, stopWatchdogs := startStreamWatchdogs(h.config.Server.StreamIdleTimeout, h.config.Server.StreamMaxDuration, cancelStream)
+	idleFired, maxFired, resetIdle, stopWatchdogs := startStreamWatchdogs(h.rt().config.Server.StreamIdleTimeout, h.rt().config.Server.StreamMaxDuration, cancelStream)
 	defer stopWatchdogs()
 
 	var streamMasker *dlp.StreamMasker
-	if h.dlpDetector != nil && h.dlpDetector.Enabled() {
-		streamMasker = h.dlpDetector.NewStreamMasker()
+	if h.rt().dlpDetector != nil && h.rt().dlpDetector.Enabled() {
+		streamMasker = h.rt().dlpDetector.NewStreamMasker()
 	}
 	seen := false
 	var firstToken time.Time
@@ -440,7 +432,7 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 		if len(event.Data) > 0 {
 			data := event.Data
 			if streamMasker != nil {
-				if h.dlpDetector.RejectMode() {
+				if h.rt().dlpDetector.RejectMode() {
 					if hits := streamMasker.Reject(data); len(hits) > 0 {
 						h.writeDLPRejectStream(w, r, started, "responses", alias, candidate, firstToken, attempts, body, emittedRunes, hits)
 						return
@@ -464,7 +456,7 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 		if event.Done {
 			if streamMasker != nil {
 				if tail := streamMasker.Flush(); len(tail) > 0 {
-					if h.dlpDetector.MaskMode() {
+					if h.rt().dlpDetector.MaskMode() {
 						_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(tail, alias))
 						flusher.Flush()
 					}
@@ -479,7 +471,7 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 		}
 	}
 	if streamMasker != nil {
-		if tail := streamMasker.Flush(); len(tail) > 0 && h.dlpDetector.MaskMode() {
+		if tail := streamMasker.Flush(); len(tail) > 0 && h.rt().dlpDetector.MaskMode() {
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(tail, alias))
 			flusher.Flush()
 		}
@@ -495,7 +487,7 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 // healthy responses only.
 func (h handler) doWithLatency(ctx context.Context, request provider.Request, c routing.Candidate) (provider.Result, error) {
 	started := h.now()
-	res, err := h.provider.Do(ctx, request, c)
+	res, err := h.rt().provider.Do(ctx, request, c)
 	if err == nil && h.latency != nil {
 		h.latency.Record(c, h.now().Sub(started))
 	}
@@ -507,7 +499,7 @@ func (h handler) doWithLatency(ctx context.Context, request provider.Request, c 
 // signal is connection cost, which is still a useful routing bias).
 func (h handler) openStreamWithLatency(ctx context.Context, request provider.Request, c routing.Candidate) (provider.Stream, error) {
 	started := h.now()
-	s, err := h.provider.OpenStream(ctx, request, c)
+	s, err := h.rt().provider.OpenStream(ctx, request, c)
 	if err == nil && h.latency != nil {
 		h.latency.Record(c, h.now().Sub(started))
 	}
@@ -633,7 +625,7 @@ func (h handler) chargeQuota(w http.ResponseWriter, keyID, alias string, delta i
 	if delta <= 0 {
 		return
 	}
-	limits, ok := h.apiKeyLimits[keyID]
+	limits, ok := h.rt().apiKeyLimits[keyID]
 	if !ok {
 		return
 	}
@@ -661,7 +653,7 @@ func (h handler) checkAliasQuota(w http.ResponseWriter, r *http.Request, started
 	if principal.APIKeyID == "" || h.quotaStore == nil {
 		return true
 	}
-	limits, ok := h.apiKeyLimits[principal.APIKeyID]
+	limits, ok := h.rt().apiKeyLimits[principal.APIKeyID]
 	if !ok {
 		return true
 	}
@@ -687,7 +679,7 @@ func (h handler) checkAliasQuota(w http.ResponseWriter, r *http.Request, started
 func (h handler) parseChat(w http.ResponseWriter, r *http.Request) (json.RawMessage, chatRequest, []routing.Candidate, bool) {
 	started := h.now()
 	var request chatRequest
-	body, err := readBody(w, r, h.config.Server.BodyLimit())
+	body, err := readBody(w, r, h.rt().config.Server.BodyLimit())
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, "", routing.Candidate{}, err.Error())
 		return nil, request, nil, false
@@ -700,13 +692,13 @@ func (h handler) parseChat(w http.ResponseWriter, r *http.Request) (json.RawMess
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "model and messages are required")
 		return nil, request, nil, false
 	}
-	candidates, err := routing.Resolve(h.config, request.Model)
+	candidates, err := routing.Resolve(h.rt().config, request.Model)
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
 		return nil, request, nil, false
 	}
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
-	candidates, err = h.provider.Filter(candidates, adapterRequest)
+	candidates, err = h.rt().provider.Filter(candidates, adapterRequest)
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
 		return nil, request, nil, false
@@ -715,14 +707,14 @@ func (h handler) parseChat(w http.ResponseWriter, r *http.Request) (json.RawMess
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "no configured provider supports chat.completions")
 		return nil, request, nil, false
 	}
-	candidates = routing.Order(routing.StrategyFor(h.config, request.Model), candidates, h.latency, rand.IntN)
+	candidates = routing.Order(routing.StrategyFor(h.rt().config, request.Model), candidates, h.latency, rand.IntN)
 	return body, request, candidates, true
 }
 
 func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.RawMessage, alias string, candidates []routing.Candidate) {
 	started := h.now()
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
-	stream, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
+	stream, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
 		return h.openStreamWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
@@ -741,14 +733,14 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	flusher.Flush()
 	streamCtx, cancelStream := context.WithCancel(r.Context())
 	defer cancelStream()
-	idleFired, maxFired, resetIdle, stopWatchdogs := startStreamWatchdogs(h.config.Server.StreamIdleTimeout, h.config.Server.StreamMaxDuration, cancelStream)
+	idleFired, maxFired, resetIdle, stopWatchdogs := startStreamWatchdogs(h.rt().config.Server.StreamIdleTimeout, h.rt().config.Server.StreamMaxDuration, cancelStream)
 	defer stopWatchdogs()
 
 	var firstToken time.Time
 	var emittedRunes int64
 	var streamMasker *dlp.StreamMasker
-	if h.dlpDetector != nil && h.dlpDetector.Enabled() {
-		streamMasker = h.dlpDetector.NewStreamMasker()
+	if h.rt().dlpDetector != nil && h.rt().dlpDetector.Enabled() {
+		streamMasker = h.rt().dlpDetector.NewStreamMasker()
 	}
 	// pumpStream pushes events over a bounded channel, applying backpressure on slow clients.
 	for result := range pumpStream(streamCtx, stream) {
@@ -779,7 +771,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 		}
 		event := result.event
 		if event.Done {
-			if streamMasker != nil && h.dlpDetector.MaskMode() {
+			if streamMasker != nil && h.rt().dlpDetector.MaskMode() {
 				if tail := streamMasker.Flush(); len(tail) > 0 {
 					_, _ = fmt.Fprintf(w, "data: %s\n\n", replaceModel(tail, alias))
 					flusher.Flush()
@@ -805,7 +797,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 		}
 		data := event.Data
 		if streamMasker != nil && len(data) > 0 {
-			if h.dlpDetector.RejectMode() {
+			if h.rt().dlpDetector.RejectMode() {
 				if hits := streamMasker.Reject(data); len(hits) > 0 {
 					h.writeDLPRejectStream(w, r, started, "chat.completions", alias, candidate, firstToken, attempts, body, emittedRunes, hits)
 					return
@@ -997,7 +989,7 @@ func streamOutcomeFor(streamErr error, reqCtx context.Context) (errorType, strea
 
 func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 	started := h.now()
-	body, err := readBody(w, r, h.config.Server.BodyLimit())
+	body, err := readBody(w, r, h.rt().config.Server.BodyLimit())
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, "", routing.Candidate{}, err.Error())
 		return
@@ -1010,13 +1002,13 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "model and a non-empty input are required")
 		return
 	}
-	candidates, err := routing.Resolve(h.config, request.Model)
+	candidates, err := routing.Resolve(h.rt().config, request.Model)
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
 		return
 	}
 	adapterRequest := provider.Request{Operation: provider.Embeddings, Body: body}
-	candidates, err = h.provider.Filter(candidates, adapterRequest)
+	candidates, err = h.rt().provider.Filter(candidates, adapterRequest)
 	if err != nil {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, err.Error())
 		return
@@ -1025,7 +1017,7 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		h.writeInvalidRequest(w, r, started, request.Model, routing.Candidate{Name: request.Model, Model: request.Model}, "no configured provider supports embeddings")
 		return
 	}
-	candidates = routing.Order(routing.StrategyFor(h.config, request.Model), candidates, h.latency, rand.IntN)
+	candidates = routing.Order(routing.StrategyFor(h.rt().config, request.Model), candidates, h.latency, rand.IntN)
 	recordAccessAlias(r.Context(), request.Model)
 	body, ok := h.runBeforePlugins(w, r, started, "embeddings", request.Model, body)
 	if !ok {
@@ -1036,7 +1028,7 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	result, candidate, attempts, err := retry.Execute(r.Context(), h.config.Retry, h.config.Failover, h.breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
+	result, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
 		return h.doWithLatency(ctx, adapterRequest, c)
 	})
 	if err != nil {
@@ -1199,7 +1191,7 @@ func estimateTokens(body []byte) int64 {
 // request can never burn more than its budget even if the upstream honors a
 // larger value.
 func (h handler) capRequestTokens(principal auth.Principal, body []byte) []byte {
-	limits, ok := h.apiKeyLimits[principal.APIKeyID]
+	limits, ok := h.rt().apiKeyLimits[principal.APIKeyID]
 	if !ok || limits.MaxTokensPerRequest <= 0 {
 		return body
 	}
@@ -1247,13 +1239,13 @@ func runesToTokenEstimate(runes int64) int64 {
 }
 
 // idempotencyEnabled reports whether the Idempotency-Key replay cache is on.
-func (h handler) idempotencyEnabled() bool { return h.config.Server.IdempotencyEnabled }
+func (h handler) idempotencyEnabled() bool { return h.rt().config.Server.IdempotencyEnabled }
 
 // idemTTL returns the replay-cache TTL, defaulting to one hour for servers
 // constructed without the config loader's defaults.
 func (h handler) idemTTL() time.Duration {
-	if h.config.Server.IdempotencyTTL > 0 {
-		return h.config.Server.IdempotencyTTL
+	if h.rt().config.Server.IdempotencyTTL > 0 {
+		return h.rt().config.Server.IdempotencyTTL
 	}
 	return time.Hour
 }

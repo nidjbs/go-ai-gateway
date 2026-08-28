@@ -3,6 +3,8 @@ package gateway
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,7 +33,9 @@ func BenchmarkReplaceModel(b *testing.B) {
 }
 
 func BenchmarkIdemCacheLookupMiss(b *testing.B) {
-	h := handler{config: &config.Config{Server: config.ServerConfig{IdempotencyEnabled: true}}, idem: make(map[string]idemEntry)}
+	rtPtr := &atomic.Pointer[runtime]{}
+	rtPtr.Store(&runtime{config: &config.Config{Server: config.ServerConfig{IdempotencyEnabled: true}}})
+	h := handler{rtPtr: rtPtr, idemMu: &sync.Mutex{}, idem: make(map[string]idemEntry)}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.Header.Set("Idempotency-Key", "bench-key")
 	rec := httptest.NewRecorder()

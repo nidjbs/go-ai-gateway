@@ -1,0 +1,27 @@
+# 示例:本地 Ollama 上游,模型 deepseek-r1
+# 用法:  gw up cli/gw.example.yaml  (或复制到 ~/gw.yaml 后 gw up ~/gw.yaml)
+# 前提:  Ollama 已启动,且已 pull 模型:
+#         ollama pull deepseek-r1
+#
+# 注意:admin 配置(gw reload 需要)由 gw up 自动注入,无需手写。
+
+listen: 127.0.0.1:8080
+healthz: 127.0.0.1:8081
+auth:
+  mode: none
+
+providers:
+  ollama:
+    type: openai                 # Ollama 提供 OpenAI 兼容 API
+    base_url: http://localhost:11434/v1
+    # Ollama 默认不校验 API key,无需 api_key_env;
+    # 若你的 Ollama 需要鉴权,取消下面注释并设置环境变量:
+    # api_key_env: OLLAMA_API_KEY
+
+aliases:
+  chat:
+    provider: ollama
+    model: deepseek-r1
+  r1:
+    provider: ollama
+    model: deepseek-r1

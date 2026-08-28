@@ -24,13 +24,11 @@ import (
 	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
 	"github.com/nidjbs/go-ai-gateway/internal/concurrency"
 	"github.com/nidjbs/go-ai-gateway/internal/config"
-	"github.com/nidjbs/go-ai-gateway/internal/dlp"
 	"github.com/nidjbs/go-ai-gateway/internal/guardrails"
 	"github.com/nidjbs/go-ai-gateway/internal/metrics"
 	"github.com/nidjbs/go-ai-gateway/internal/plugin"
 	"github.com/nidjbs/go-ai-gateway/internal/provider"
 	"github.com/nidjbs/go-ai-gateway/internal/ratelimit"
-	"github.com/nidjbs/go-ai-gateway/internal/revocation"
 	"github.com/nidjbs/go-ai-gateway/internal/routing"
 	"github.com/nidjbs/go-ai-gateway/internal/usage"
 	"github.com/nidjbs/go-ai-gateway/internal/version"
@@ -42,6 +40,7 @@ const maxPerKeyLimiters = 10_000
 
 type Deps struct {
 	Config        *config.Config
+	ConfigPath    string // config file path, used by POST /admin/reload
 	Logger        *slog.Logger
 	Authenticator auth.Authenticator
 	UsageSink     usage.Sink
@@ -81,7 +80,7 @@ type Server struct {
 	HTTP        *http.Server
 	Ops         http.Handler
 	ready       *readiness
-	config      *config.Config
+	rt          *atomic.Pointer[runtime] // hot-reloadable config snapshot
 	logger      *slog.Logger
 	limiter     ratelimit.Limiter
 	quotaStore  ratelimit.QuotaStore
@@ -90,22 +89,20 @@ type Server struct {
 	keyLimits   map[string]*concurrency.Limiter
 	now         func() time.Time
 	closer      io.Closer // optional sink/handle released on graceful shutdown
-	revoker     revocation.Store
-	dlpDetector *dlp.Detector
 }
 
 // keyLimiter returns the per-key concurrency limiter for keyID, allocating
 // one on first use. Returns nil when the configured per-key cap is zero.
 // The map is bounded; excess entries are evicted crudely (arbitrary).
 func (s *Server) keyLimiter(keyID string) *concurrency.Limiter {
-	if s.config.Server.MaxConcurrentPerKey <= 0 {
+	if s.rt.Load().config.Server.MaxConcurrentPerKey <= 0 {
 		return nil
 	}
 	s.keyLock.Lock()
 	defer s.keyLock.Unlock()
 	l, ok := s.keyLimits[keyID]
 	if !ok {
-		l = concurrency.New(s.config.Server.MaxConcurrentPerKey)
+		l = concurrency.New(s.rt.Load().config.Server.MaxConcurrentPerKey)
 		s.keyLimits[keyID] = l
 		if len(s.keyLimits) > maxPerKeyLimiters {
 			for victim := range s.keyLimits {
@@ -139,18 +136,6 @@ func New(deps Deps) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	if deps.Provider == nil {
-		deps.Provider = provider.NewClient()
-	}
-	if deps.Config.Tracing.Enabled {
-		for _, ptype := range deps.Provider.RegisteredTypes() {
-			existing := deps.Provider.HTTPClient(ptype)
-			deps.Provider.SetHTTPClient(ptype, &http.Client{
-				Transport: otelhttp.NewTransport(existing.Transport),
-				Timeout:   existing.Timeout,
-			})
-		}
-	}
 	if deps.Metrics == nil {
 		var mErr error
 		deps.Metrics, mErr = metrics.New()
@@ -161,22 +146,6 @@ func New(deps Deps) (*Server, error) {
 	if deps.Now == nil {
 		deps.Now = func() time.Time { return time.Now().UTC() }
 	}
-	if deps.APIKeyLimits == nil {
-		deps.APIKeyLimits = map[string]config.KeyLimits{}
-	}
-	if deps.Breaker == nil {
-		if deps.Config.CircuitBreaker.Enabled {
-			deps.Breaker = circuitbreaker.New(circuitbreaker.Config{
-				FailureThreshold:         deps.Config.CircuitBreaker.FailureThreshold,
-				OpenDuration:             deps.Config.CircuitBreaker.OpenDuration,
-				HalfOpenMaxRequests:      deps.Config.CircuitBreaker.HalfOpenMaxRequests,
-				HalfOpenSuccessThreshold: deps.Config.CircuitBreaker.HalfOpenSuccessThreshold,
-			})
-		} else {
-			deps.Breaker = circuitbreaker.Noop{}
-		}
-	}
-
 	ready := &readiness{startedAt: deps.Now(), waitTime: deps.Config.ReadyzWaitTime}
 	for _, driver := range []config.StorageDriver{deps.Config.RateLimit, deps.Config.Quota} {
 		if driver.Driver != "redis" {
@@ -216,41 +185,21 @@ func New(deps Deps) (*Server, error) {
 	pluginManager := plugin.NewManager(deps.Logger)
 	pluginManager.Add(guardrailsPlugin)
 
-	// Admin surface (key revocation + usage queries); token required when enabled.
-	var revoker revocation.Store
-	if deps.Config.Admin.Enabled {
-		token := strings.TrimSpace(os.Getenv(deps.Config.Admin.TokenEnv))
-		if token == "" {
-			return nil, fmt.Errorf("admin.token_env %q is unset or empty", deps.Config.Admin.TokenEnv)
-		}
-		revoker, err = revocation.New(deps.Config.Admin.Revocation, deps.Config.Admin.CacheTTL, deps.Config.Admin.RevokeTTL, deps.Logger)
-		if err != nil {
-			return nil, fmt.Errorf("admin revocation: %w", err)
-		}
-	}
-
-	dlpDetector, err := dlp.New(dlp.Config{
-		Enabled:   deps.Config.DLP.Enabled,
-		Mode:      deps.Config.DLP.Mode,
-		MaskText:  deps.Config.DLP.MaskText,
-		Patterns:  deps.Config.DLP.Patterns,
-		CarrySize: deps.Config.DLP.CarrySize,
-	})
+	rt := &atomic.Pointer[runtime]{}
+	current, err := buildRuntime(deps.ConfigPath, deps.Config, deps)
 	if err != nil {
-		return nil, fmt.Errorf("dlp: %w", err)
+		return nil, err
 	}
-
+	rt.Store(current)
 	server := &Server{
-		config:      deps.Config,
+		rt:          rt,
 		logger:      deps.Logger,
 		concurrency: concurrency.New(deps.Config.Server.MaxConcurrentRequests),
 		keyLimits:   make(map[string]*concurrency.Limiter),
 		now:         deps.Now,
 		closer:      sinkCloser(usageSink),
-		revoker:     revoker,
-		dlpDetector: dlpDetector,
 	}
-	handlers := handler{config: deps.Config, logger: deps.Logger, authenticator: deps.Authenticator, usageSink: usageSink, provider: deps.Provider, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, breaker: deps.Breaker, keyConcurrency: server.keyLimiter, now: deps.Now, apiKeyLimits: deps.APIKeyLimits, idem: make(map[string]idemEntry), idemMu: &sync.Mutex{}, revoker: revoker, dlpDetector: dlpDetector, latency: routing.NewLatencyTracker(), plugins: pluginManager}
+	handlers := handler{rtPtr: rt, logger: deps.Logger, usageSink: usageSink, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, keyConcurrency: server.keyLimiter, now: deps.Now, idem: make(map[string]idemEntry), idemMu: &sync.Mutex{}, latency: routing.NewLatencyTracker(), plugins: pluginManager}
 	ops := chi.NewRouter()
 	if deps.Config.OpsTokenEnv != "" {
 		token := strings.TrimSpace(os.Getenv(deps.Config.OpsTokenEnv))
@@ -272,6 +221,7 @@ func New(deps Deps) (*Server, error) {
 			r.Get("/admin/keys/revoked", handlers.listRevoked)
 			r.Get("/admin/usage/summary", handlers.usageSummary)
 			r.Get("/admin/usage/series", handlers.usageSeries)
+			r.Post("/admin/reload", handlers.reloadConfig)
 		})
 	}
 
@@ -424,18 +374,8 @@ func pickGuardrailTracker(driver config.StorageDriver, policy guardrails.Tracker
 	return tracker, nil
 }
 
-func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
-	authenticator, err := auth.New(cfg.Auth, cfg.Teams)
-	if err != nil {
-		return err
-	}
-	limits := make(map[string]config.KeyLimits, len(cfg.Teams))
-	for _, team := range cfg.Teams {
-		for _, key := range team.APIKeys {
-			limits[key.ID] = key.Limits
-		}
-	}
-	server, err := New(Deps{Config: cfg, Logger: logger, Authenticator: authenticator, APIKeyLimits: limits})
+func Run(ctx context.Context, cfg *config.Config, configPath string, logger *slog.Logger) error {
+	server, err := New(Deps{Config: cfg, ConfigPath: configPath, Logger: logger})
 	if err != nil {
 		return err
 	}
