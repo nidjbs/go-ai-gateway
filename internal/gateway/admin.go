@@ -36,7 +36,7 @@ type revokeRequest struct {
 // revokeKey cuts off an API key at runtime; replicas honor it within the
 // lookup cache TTL.
 func (h handler) revokeKey(w http.ResponseWriter, r *http.Request) {
-	if h.revoker == nil {
+	if h.rt().revoker == nil {
 		apierr.Write(w, http.StatusNotFound, "admin_disabled", "server_error", "Admin surface is not enabled")
 		return
 	}
@@ -45,7 +45,7 @@ func (h handler) revokeKey(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", "key_id is required")
 		return
 	}
-	if err := h.revoker.Revoke(r.Context(), req.KeyID); err != nil {
+	if err := h.rt().revoker.Revoke(r.Context(), req.KeyID); err != nil {
 		h.logger.Error("admin: revoke failed", "key_id", req.KeyID, "error", err)
 		apierr.Write(w, http.StatusInternalServerError, "revocation_failed", "server_error", "Failed to revoke key")
 		return
@@ -57,12 +57,12 @@ func (h handler) revokeKey(w http.ResponseWriter, r *http.Request) {
 
 // listRevoked returns the currently-revoked key IDs.
 func (h handler) listRevoked(w http.ResponseWriter, r *http.Request) {
-	if h.revoker == nil {
+	if h.rt().revoker == nil {
 		apierr.Write(w, http.StatusNotFound, "admin_disabled", "server_error", "Admin surface is not enabled")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"keys": h.revoker.RevokedKeys()})
+	_ = json.NewEncoder(w).Encode(map[string]any{"keys": h.rt().revoker.RevokedKeys()})
 }
 
 // usageSummary aggregates usage by team_id/key_id/alias/from/to. Requires

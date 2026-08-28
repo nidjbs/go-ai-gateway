@@ -74,6 +74,22 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 The API listens on `http://127.0.0.1:8080`; operational endpoints listen on `http://127.0.0.1:8081`. Set `auth.mode` to `static` or `api-key` before exposing the gateway outside a trusted network.
 
+### Option C: CLI for personal use (one command)
+
+Install the `gw` CLI once, then bring up a gateway from just a providers/aliases config — no manual build, admin config, or CLI config needed:
+
+```bash
+cli/install.sh                # build gw + gateway → /usr/local/bin via sudo (works in every shell)
+# GW_NO_SUDO=1 cli/install.sh → ~/.local/bin instead
+export OPENAI_API_KEY=sk-...
+gw up ~/gw.yaml               # build+start gateway, inject admin, write CLI config
+gw trans "hello world"        # ready to use
+gw reload                     # hot-reload after config edits (no restart)
+gw down                       # stop the local gateway
+```
+
+See [`cli/README.md`](cli/README.md) for details.
+
 ## Docker
 
 The Compose setup is a distributed-mode smoke test. It runs two gateway replicas with shared Redis-backed rate-limit and quota state. Gateway 1 exposes API/operational ports `8080`/`8081`; gateway 2 exposes `8082`/`8083`. See Option A above for the complete verification flow.

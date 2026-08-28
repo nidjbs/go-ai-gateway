@@ -40,7 +40,7 @@ func main() {
 		}()
 	}
 
-	if err := gateway.Run(ctx, cfg, logger); err != nil {
+	if err := gateway.Run(ctx, cfg, *configPath, logger); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -100,15 +100,15 @@ func TestDistributedQuotaChargesAcrossReplicas(t *testing.T) {
 	// see used=9 and reject (or succeed only if we stretch the budget).
 	const limit int64 = 10
 	cfg := distributedTestConfig(upstream.URL, apiKey, limit)
-	gwA.config.RateLimit = config.StorageDriver{}
-	gwA.config.Quota = config.StorageDriver{Driver: "redis", Options: map[string]any{
+	gwA.rt.Load().config.RateLimit = config.StorageDriver{}
+	gwA.rt.Load().config.Quota = config.StorageDriver{Driver: "redis", Options: map[string]any{
 		"addr": s.Addr(),
 	}}
-	gwB.config.Quota = config.StorageDriver{Driver: "redis", Options: map[string]any{
+	gwB.rt.Load().config.Quota = config.StorageDriver{Driver: "redis", Options: map[string]any{
 		"addr": s.Addr(),
 	}}
-	gwA.config.Retry = cfg.Retry
-	gwB.config.Retry = cfg.Retry
+	gwA.rt.Load().config.Retry = cfg.Retry
+	gwB.rt.Load().config.Retry = cfg.Retry
 
 	// Re-key the limit map because Deps.APIKeyLimits was injected at
 	// construction time. The simplest path is to rebuild — these are

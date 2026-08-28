@@ -92,14 +92,14 @@ func dlpWalkValue(v any, d *dlp.Detector) (any, []dlp.Hit, bool) {
 // returns the masked body, reject mode writes the rejection and returns
 // proceed=false.
 func (h handler) dlpResponseBody(w http.ResponseWriter, r *http.Request, started time.Time, endpoint, alias string, candidate routing.Candidate, respBody []byte) ([]byte, bool) {
-	if h.dlpDetector == nil || !h.dlpDetector.Enabled() || len(respBody) == 0 {
+	if h.rt().dlpDetector == nil || !h.rt().dlpDetector.Enabled() || len(respBody) == 0 {
 		return respBody, true
 	}
-	masked, hits := dlpApplyNonStreaming(respBody, h.dlpDetector)
+	masked, hits := dlpApplyNonStreaming(respBody, h.rt().dlpDetector)
 	if len(hits) == 0 {
 		return respBody, true
 	}
-	if h.dlpDetector.RejectMode() {
+	if h.rt().dlpDetector.RejectMode() {
 		h.writeDLPRejectNonStreaming(w, r, started, endpoint, alias, candidate, hits)
 		return respBody, false
 	}

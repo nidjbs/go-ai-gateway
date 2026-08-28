@@ -137,7 +137,7 @@ func TestIdempotencyReplaysCachedResponse(t *testing.T) {
 
 	const apiKey = "sk-idem"
 	server := newAPIKeyTestServer(t, upstream.URL, apiKey, config.KeyLimits{PredayTokens: 100000})
-	server.config.Server.IdempotencyEnabled = true
+	server.rt.Load().config.Server.IdempotencyEnabled = true
 
 	call := func() string {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat","messages":[{"role":"user","content":"hi"}]}`))
