@@ -101,7 +101,7 @@ func cmdTrans(args []string) int {
 	}
 	fs := flag.NewFlagSet("trans", flag.ContinueOnError)
 	alias := modelFlags(fs, cfg)
-	to := fs.String("t", "", "target language (default: 简体中文)")
+	to := fs.String("t", "", "target language (default: auto-detect, 中文↔English)")
 	noStream := fs.Bool("no-stream", false, "non-streaming output")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -110,9 +110,12 @@ func cmdTrans(args []string) int {
 		fmt.Fprintln(os.Stderr, "gw: trans requires text to translate")
 		return 2
 	}
+	// no -t: auto-detect source; 中文→English, otherwise 简体中文
 	lang := *to
 	if lang == "" {
-		lang = "简体中文"
+		lang = "根据输入语言自动互译:如果输入是中文则翻译成英文,否则翻译成简体中文,"
+	} else {
+		lang = "把用户输入翻译成" + lang + ","
 	}
 	system := builtinPrompt("trans", lang)
 	return runChat(cfg, alias, system, strings.Join(fs.Args(), " "), *noStream)
