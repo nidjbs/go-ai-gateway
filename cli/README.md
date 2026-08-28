@@ -1,29 +1,36 @@
 # gw — go-ai-gateway CLI
 
-`gw` 是 [go-ai-gateway](../README.md) 的命令行客户端,面向个人电脑使用场景。它通过 HTTP 请求本地常驻的 gateway(复用其别名路由、限流、日志),快速调用 LLM。
+`gw` is the command-line client for [go-ai-gateway](../README.md), aimed at personal/desktop use. It calls a local gateway process over HTTP (reusing the gateway's alias routing, rate limits, and logging) for quick LLM interactions.
 
 ```
-$ gw trans "hello world"        # 翻译
+$ gw trans "hello world"        # translate
 你好,世界▌
-$ gw summarize diff.txt         # 总结
-$ gw commit                     # 生成 Git 提交信息
-$ gw reload                     # 改完配置后热更,无需重启 gateway
+$ gw summarize diff.txt         # summarize
+$ gw commit                     # generate a Git commit message
+$ gw reload                     # hot-reload the config without restarting the gateway
 ```
 
-## 安装
+## Installation
 
 ```sh
 cli/install.sh
-# 默认用 sudo 装到 /usr/local/bin(macOS 系统 PATH,任何 shell 都能直接用 gw)
-# 会提示输入 sudo 密码一次
-# 不想用 sudo(装到 ~/.local/bin,需重启终端): GW_NO_SUDO=1 cli/install.sh
 ```
 
-也可手动: `cd cli && go build -o ~/.local/bin/gw .`
+Installs to `/usr/local/bin` with sudo by default (on the macOS system PATH, so `gw` works in every shell). To skip sudo (installs to `~/.local/bin`, restart the terminal):
 
-## 快速开始(一键)
+```sh
+GW_NO_SUDO=1 cli/install.sh
+```
 
-1. 准备一份 gateway 配置——**只需写 `providers` 和 `aliases`**(`admin` 会自动注入):
+Or manually:
+
+```sh
+cd cli && go build -o ~/.local/bin/gw .
+```
+
+## Quick start (one command)
+
+1. Prepare a gateway config — only `providers` and `aliases` are needed (`admin` is injected automatically):
 
 ```yaml
 # ~/gw.yaml
@@ -40,67 +47,67 @@ aliases:
     model: gpt-4o
 ```
 
-2. 一条命令拉起全部:
+2. Bring everything up with one command:
 
 ```sh
 export OPENAI_API_KEY=sk-...
-gw up ~/gw.yaml     # 构建并后台启动 gateway、注入 admin、自动写好 CLI 配置
-gw models           # 立即可用
+gw up ~/gw.yaml     # build + start the gateway in the background, inject admin, write the CLI config
+gw models           # ready to use
 gw trans "hello world"
-gw reload           # 改完配置后热更,无需重启
-gw down             # 停止本地 gateway
+gw reload           # hot-reload after config edits, no restart
+gw down             # stop the local gateway
 ```
 
-`gw up` 自动完成:注入 admin 配置(供 `gw reload`)、构建并启动 gateway、等待就绪、生成 `~/.config/gw/config.yaml`。之后无需再配任何东西。
+`gw up` automatically: injects the admin block (for `gw reload`), builds and starts the gateway, waits until ready, and writes `~/.config/gw/config.yaml`. Nothing else to configure afterwards.
 
-> gateway 二进制来源:`GW_GATEWAY_BIN` 指定预装二进制;否则在源码仓库里运行 `gw` 时会自动 `go build ./cmd/gateway`。
+> Gateway binary resolution: `GW_GATEWAY_BIN` picks a prebuilt binary; otherwise, running `gw` from the source repo auto-builds via `go build ./cmd/gateway`.
 
-## 配置
+## Configuration
 
-`gw up` 会自动生成 `~/.config/gw/config.yaml`;也可以手动写(缺省则用默认值):
+`gw up` writes `~/.config/gw/config.yaml` automatically; you can also create it by hand (missing keys fall back to defaults):
 
 ```yaml
 gateway_url: http://127.0.0.1:8080
-admin_url: http://127.0.0.1:8081    # ops/healthz 端口,reload/usage 走这里;缺省 = gateway_url
-api_key: sk-...          # gateway 认证(static 或 api-key 的 key)
-admin_token: ""          # reload / usage 需要
-default_alias: chat      # 默认别名
+admin_url: http://127.0.0.1:8081    # ops/healthz port; reload/usage go here; defaults to gateway_url
+api_key: sk-...          # gateway auth (static or api-key)
+admin_token: ""          # needed for reload / usage
+default_alias: chat      # default alias
 ```
 
-环境变量覆盖:`GW_GATEWAY_URL` `GW_ADMIN_URL` `GW_API_KEY` `GW_ADMIN_TOKEN` `GW_ALIAS` `GW_CONFIG`。
+Environment variable overrides: `GW_GATEWAY_URL` `GW_ADMIN_URL` `GW_API_KEY` `GW_ADMIN_TOKEN` `GW_ALIAS` `GW_CONFIG`.
 
-## 命令
+## Commands
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `gw models` | 列出 gateway 可用别名 |
-| `gw ask [-m 别名] [-p prompt] "问题"` | 通用对话;`-p`/`--prompt` 可指定 prompt |
-| `gw trans [-m 别名] [-t 语言] "文本"` | 翻译(内置 prompt) |
-| `gw summarize [-m 别名] [-f file\|-]` | 总结(文件/stdin/参数) |
-| `gw explain [-m 别名] [-f file\|-] "内容"` | 解释 |
-| `gw commit [-m 别名] [-f file\|-]` | 生成 Conventional Commits 提交信息(默认取 `git diff`) |
-| `gw reload [--path 文件]` | 触发 gateway 配置热更 |
-| `gw status` | gateway 健康检查 |
-| `gw usage [--alias a] [--from t] [--to t]` | 用量查询(需 admin_token) |
+| `gw models` | List available aliases |
+| `gw ask [-m alias] [-p prompt] "question"` | General chat; `-p`/`--prompt` sets a prompt |
+| `gw trans [-m alias] [-t lang] "text"` | Translate (built-in prompt; auto-detects 中文↔English) |
+| `gw summarize [-m alias] [-f file\|-]` | Summarize (file / stdin / argument) |
+| `gw explain [-m alias] [-f file\|-] "content"` | Explain |
+| `gw commit [-m alias] [-f file\|-]` | Generate a Conventional Commits message (defaults to `git diff`) |
+| `gw reload [--path file]` | Hot-reload the gateway config |
+| `gw status` | Gateway health check |
+| `gw usage [--alias a] [--from t] [--to t]` | Usage query (requires admin_token) |
 
-通用选项:`-m/--model <别名>` 指定本次调用的模型名(必须是 gateway 配置的别名,`gw models` 可查看;默认取 `default_alias`),`--no-stream` 关闭流式输出。
+Common flags: `-m/--model <alias>` picks the model for this call (must be a configured alias, see `gw models`; defaults to `default_alias`); `--no-stream` disables streaming output.
 
 ```sh
-$ gw models                 # 查看可选别名
-$ gw trans -m chat "hello"  # 指定用 chat 别名调用
-$ gw ask -m flash "问题"     # 指定用 flash 别名调用
+$ gw models                 # list aliases
+$ gw trans -m chat "hello"  # call with the chat alias
+$ gw ask -m flash "question"  # call with the flash alias
 ```
 
-## 自定义 prompt
+## Custom prompts
 
-- 内置模板:`trans`、`summarize`、`explain`、`commit`。
-- 自定义:`~/.config/gw/prompts/<name>.md`,整个文件内容作为 system prompt:
+- Built-in templates: `trans`, `summarize`, `explain`, `commit`.
+- Custom: `~/.config/gw/prompts/<name>.md` — the whole file content is used as the system prompt:
 
 ```sh
 $ cat > ~/.config/gw/prompts/code-review.md <<'EOF'
-你是一位资深 Go 代码审查者,请指出潜在 bug 与可改进处。
+You are a senior Go code reviewer. Point out potential bugs and improvements.
 EOF
-$ gw ask --prompt code-review "审查这段代码: ..."
+$ gw ask --prompt code-review "review this code: ..."
 ```
 
-- `gw ask --prompt <文本>` 直接以文本作为 prompt。
+- `gw ask --prompt <text>` uses the text directly as the prompt.

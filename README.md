@@ -112,6 +112,28 @@ The Compose setup is a distributed-mode smoke test. It runs two gateway replicas
 | Output DLP | Mask or reject PII/sensitive patterns (email, phone, cards, secrets) in responses, streaming-aware |
 | Redis failover | Sentinel / Cluster connection support for every Redis-backed layer |
 
+## CLI (`gw`)
+
+`gw` is the personal-use command-line client for this gateway. It talks to a local gateway process over HTTP, reusing the same alias routing, limits, and logging — no manual `curl` needed. Install once (`cli/install.sh`), then:
+
+| Command | What it does |
+|---|---|
+| `gw up [config.yaml]` | Start a local gateway from a `providers`/`aliases` config and wire the CLI config |
+| `gw models` | List available aliases |
+| `gw ask "question"` | General chat (`-p/--prompt` selects a prompt) |
+| `gw trans "text"` | Translate (built-in prompt; `-t` sets the target language) |
+| `gw summarize [-f file]` | Summarize a file, argument, or stdin |
+| `gw explain "content"` | Explain content |
+| `gw commit` | Generate a Conventional Commits message from `git diff` |
+| `gw reload` | Hot-reload the gateway config, no restart |
+| `gw status` | Gateway health check |
+| `gw usage` | Query usage (requires admin token) |
+| `gw down` | Stop the local gateway |
+
+Every call accepts `-m <alias>` to pick a configured alias (`gw models` lists them; defaults to `default_alias`), and `--no-stream` for non-streaming output. Custom prompts live in `~/.config/gw/prompts/<name>.md`.
+
+See [`cli/README.md`](cli/README.md) for installation, CLI configuration, and custom-prompt details.
+
 ## Configuration
 
 Start with `configs/config.example.yaml`. The essential fields are:
