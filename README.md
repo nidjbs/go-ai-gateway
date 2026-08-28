@@ -231,6 +231,7 @@ See [Operations guide](docs/operations.md) for the multi-replica runbook, load t
 - [Architecture](docs/architecture.md): request pipeline, provider behavior, Redis distributed state, guardrails, and observability.
 - [Extending](docs/extending.md): custom authentication, usage sinks, and storage drivers.
 - [Operations](docs/operations.md): multi-replica production runbook, probes, scaling, secrets, and alerting.
+- [Benchmarks](docs/benchmark.md): measured overhead of the gateway middle layer (micro, end-to-end, streaming).
 - [Configuration example](configs/config.example.yaml): all supported built-in settings.
 - [Security policy](SECURITY.md): vulnerability reporting process.
 - [Contributing](CONTRIBUTING.md): local contribution workflow.
