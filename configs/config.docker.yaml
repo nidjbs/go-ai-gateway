@@ -46,16 +46,19 @@ failover:
 
 circuit_breaker:
   enabled: true
-  failure_threshold: 5
+  failure_threshold: 10
   open_duration: 30s
   half_open_max_requests: 1
   half_open_success_threshold: 1
+  error_rate: 0.5
+  window: 60s
+  min_samples: 10
 
 server:
   max_concurrent_requests: 0
   max_concurrent_per_key: 0
-  stream_idle_timeout: 0
-  stream_max_duration: 0
+  stream_idle_timeout: 0s
+  stream_max_duration: 0s
 
 tracing:
   enabled: false

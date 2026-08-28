@@ -53,8 +53,11 @@ data:
 
     circuit_breaker:
       enabled: true
-      failure_threshold: 5
+      failure_threshold: 10
       open_duration: 30s
+      error_rate: 0.5
+      window: 60s
+      min_samples: 10
 
     server:
       max_concurrent_requests: 0

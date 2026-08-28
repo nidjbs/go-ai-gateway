@@ -112,6 +112,11 @@ failover candidate. With a single provider, an open breaker makes requests
 fail fast (502) instead of hammering a dead upstream — pair it with alerting
 on `upstream_error` / `upstream_unavailable` error types in metrics.
 
+The breaker combines a fast consecutive-failure path (`failure_threshold`)
+with a sliding-window error-rate path (`error_rate` over `window`, gated by
+`min_samples`); either trips it open. Client-caused errors (4xx, 429, invalid
+request, canceled) never count toward either path.
+
 ## Secrets and key rotation
 
 - Upstream API keys: `api_key_env` reads from the environment/Secret —

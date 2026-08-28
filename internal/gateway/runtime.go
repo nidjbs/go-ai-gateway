@@ -82,6 +82,9 @@ func buildRuntime(configPath string, cfg *config.Config, deps Deps) (*runtime, e
 			OpenDuration:             cfg.CircuitBreaker.OpenDuration,
 			HalfOpenMaxRequests:      cfg.CircuitBreaker.HalfOpenMaxRequests,
 			HalfOpenSuccessThreshold: cfg.CircuitBreaker.HalfOpenSuccessThreshold,
+			ErrorRate:                cfg.CircuitBreaker.ErrorRate,
+			Window:                   cfg.CircuitBreaker.Window,
+			MinSamples:               cfg.CircuitBreaker.MinSamples,
 		})
 	} else {
 		breaker = circuitbreaker.Noop{}

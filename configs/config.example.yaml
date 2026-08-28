@@ -80,15 +80,18 @@ failover:
   enabled: true
   max_providers: 0
 
-# Per-(provider, base_url) circuit breaker. When enabled, consecutive upstream
-# failures trip the breaker; further requests skip the upstream until the
-# open duration elapses, after which a small probe batch is permitted.
+# Per-(provider, base_url) circuit breaker. Trips on consecutive upstream
+# failures OR a sustained error rate over the sliding window; further requests
+# skip the upstream until the open duration elapses, then a probe batch runs.
 circuit_breaker:
   enabled: true
-  failure_threshold: 5         # consecutive failures to open
+  failure_threshold: 10         # consecutive failures to open (fast path)
   open_duration: 30s            # how long the breaker stays open
   half_open_max_requests: 1     # probe requests allowed in half-open
   half_open_success_threshold: 1  # consecutive probe successes to close
+  error_rate: 0.5               # failure ratio over window that trips (0,1]
+  window: 60s                   # sliding window for error rate
+  min_samples: 10               # min samples in window before error rate applies
 
 # In-flight concurrency caps. Both default to 0 (= unlimited). When set, the
 # gateway returns 503 + server_overloaded / key_overloaded when the cap is

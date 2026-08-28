@@ -164,6 +164,10 @@ type CircuitBreakerConfig struct {
 	OpenDuration             time.Duration `yaml:"open_duration"`
 	HalfOpenMaxRequests      int           `yaml:"half_open_max_requests"`
 	HalfOpenSuccessThreshold int           `yaml:"half_open_success_threshold"`
+	// ErrorRate is the failure ratio over Window that trips the breaker; Window is the sliding window; MinSamples is the minimum sample count before error rate applies.
+	ErrorRate  float64       `yaml:"error_rate"`
+	Window     time.Duration `yaml:"window"`
+	MinSamples int           `yaml:"min_samples"`
 }
 
 // TracingConfig configures the OpenTelemetry tracing pipeline. When Enabled is false the gateway skips the OTLP exporter entirely.
@@ -346,7 +350,7 @@ func (c *Config) applyDefaults() {
 	}
 	if c.CircuitBreaker.Enabled {
 		if c.CircuitBreaker.FailureThreshold <= 0 {
-			c.CircuitBreaker.FailureThreshold = 5
+			c.CircuitBreaker.FailureThreshold = 10
 		}
 		if c.CircuitBreaker.OpenDuration <= 0 {
 			c.CircuitBreaker.OpenDuration = 30 * time.Second
@@ -356,6 +360,15 @@ func (c *Config) applyDefaults() {
 		}
 		if c.CircuitBreaker.HalfOpenSuccessThreshold <= 0 {
 			c.CircuitBreaker.HalfOpenSuccessThreshold = 1
+		}
+		if c.CircuitBreaker.ErrorRate <= 0 {
+			c.CircuitBreaker.ErrorRate = 0.5
+		}
+		if c.CircuitBreaker.Window <= 0 {
+			c.CircuitBreaker.Window = 60 * time.Second
+		}
+		if c.CircuitBreaker.MinSamples <= 0 {
+			c.CircuitBreaker.MinSamples = 10
 		}
 	}
 	if c.Server.MaxConcurrentRequests < 0 {
@@ -462,6 +475,17 @@ func (c *Config) Validate() error {
 	}
 	if c.Retry.Jitter < 0 || c.Retry.Jitter >= 1 {
 		return errors.New("retry.jitter must be greater than or equal to zero and less than one")
+	}
+	if c.CircuitBreaker.Enabled {
+		if c.CircuitBreaker.ErrorRate <= 0 || c.CircuitBreaker.ErrorRate > 1 {
+			return fmt.Errorf("circuit_breaker.error_rate must be in (0,1], got %v", c.CircuitBreaker.ErrorRate)
+		}
+		if c.CircuitBreaker.Window <= 0 {
+			return fmt.Errorf("circuit_breaker.window must be greater than zero, got %s", c.CircuitBreaker.Window)
+		}
+		if c.CircuitBreaker.MinSamples < 1 {
+			return fmt.Errorf("circuit_breaker.min_samples must be at least 1, got %d", c.CircuitBreaker.MinSamples)
+		}
 	}
 	if len(c.Providers) == 0 {
 		return errors.New("at least one provider is required")

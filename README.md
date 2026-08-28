@@ -233,7 +233,7 @@ Rotation is a config change + restart: add the new digest, restart, remove the o
 - **Ops auth** — `ops_token_env` protects `/metrics`, `/readyz`, `/version`.
 - **Hashed API keys** — `go run ./cmd/keygen -sha256` for digest-based key config and clean rotation.
 - **Guardrails escape hatch** — `guardrails.allowlist` bypasses scanning for false-positive-prone payloads in block mode.
-- **Circuit breaker** — enabled in the example configs; trips on consecutive upstream failures.
+- **Circuit breaker** — enabled in the example configs; trips on consecutive upstream failures or a sustained error rate over a sliding window.
 - **Runtime key revocation** — `POST /admin/keys/revoke` cuts off a leaked key in seconds (Redis-backed across replicas, within the lookup cache TTL) without a config change or restart.
 - **Usage queries** — `GET /admin/usage/summary` / `/series` answer "who spent what" from the SQLite sink.
 - **Access log** — opt-in structured request log (sampled, metadata only — request/response bodies are never logged).

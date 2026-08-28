@@ -47,15 +47,25 @@ type Config struct {
 	// HalfOpenSuccessThreshold is the number of consecutive probe successes
 	// required to close the breaker. Must be ≥ 1.
 	HalfOpenSuccessThreshold int
+	// ErrorRate is the minimum failure ratio over the sliding Window that trips
+	// the breaker, once at least MinSamples samples exist. Must be in (0,1].
+	ErrorRate float64
+	// Window is the sliding window over which error rate is measured. Must be > 0.
+	Window time.Duration
+	// MinSamples is the minimum sample count in Window before error rate may trip. Must be ≥ 1.
+	MinSamples int
 }
 
 // NewConfig returns Config populated with sensible defaults.
 func NewConfig() Config {
 	return Config{
-		FailureThreshold:         5,
+		FailureThreshold:         10,
 		OpenDuration:             30 * time.Second,
 		HalfOpenMaxRequests:      1,
 		HalfOpenSuccessThreshold: 1,
+		ErrorRate:                0.5,
+		Window:                   60 * time.Second,
+		MinSamples:               10,
 	}
 }
 
@@ -67,6 +77,12 @@ type Breaker interface {
 	Record(key string, now time.Time, err error)
 }
 
+// sample is one recorded outcome inside the sliding error-rate window.
+type sample struct {
+	at     time.Time
+	failed bool
+}
+
 // entry holds the state for a single key.
 type entry struct {
 	mu sync.Mutex
@@ -76,12 +92,13 @@ type entry struct {
 	openedAt     time.Time
 	halfOpenBusy int
 	halfOpenSucc int
+	samples      []sample // ascending by at; pruned on every Record
 }
 
 // New returns an in-process Breaker. State is held in memory only.
 func New(cfg Config) Breaker {
 	if cfg.FailureThreshold < 1 {
-		cfg.FailureThreshold = 5
+		cfg.FailureThreshold = 10
 	}
 	if cfg.OpenDuration <= 0 {
 		cfg.OpenDuration = 30 * time.Second
@@ -92,6 +109,15 @@ func New(cfg Config) Breaker {
 	if cfg.HalfOpenSuccessThreshold < 1 {
 		cfg.HalfOpenSuccessThreshold = 1
 	}
+	if cfg.ErrorRate <= 0 || cfg.ErrorRate > 1 {
+		cfg.ErrorRate = 0.5
+	}
+	if cfg.Window <= 0 {
+		cfg.Window = 60 * time.Second
+	}
+	if cfg.MinSamples < 1 {
+		cfg.MinSamples = 10
+	}
 	return &memoryBreaker{cfg: cfg, entries: make(map[string]*entry)}
 }
 
@@ -99,7 +125,6 @@ type memoryBreaker struct {
 	cfg     Config
 	mu      sync.Mutex
 	entries map[string]*entry
-	now     func() time.Time
 }
 
 func (b *memoryBreaker) entryFor(key string) *entry {
@@ -147,29 +172,28 @@ func (b *memoryBreaker) Record(key string, now time.Time, err error) {
 	success := err == nil
 	switch e.state {
 	case StateClosed:
+		// Record every outcome so the window stays current even on success.
+		e.samples = append(e.samples, sample{at: now, failed: !success})
+		e.prune(now, b.cfg.Window)
 		if success {
 			e.failures = 0
 			return
 		}
 		e.failures++
-		if e.failures >= b.cfg.FailureThreshold {
-			e.state = StateOpen
-			e.openedAt = now
-			e.failures = 0
+		if e.failures >= b.cfg.FailureThreshold || e.rateTripped(b.cfg.MinSamples, b.cfg.ErrorRate) {
+			e.tripOpen(now)
 		}
 	case StateHalfOpen:
 		e.halfOpenBusy--
 		if !success {
-			e.state = StateOpen
-			e.openedAt = now
-			e.halfOpenBusy = 0
-			e.halfOpenSucc = 0
+			e.tripOpen(now)
 			return
 		}
 		e.halfOpenSucc++
 		if e.halfOpenSucc >= b.cfg.HalfOpenSuccessThreshold {
 			e.state = StateClosed
 			e.failures = 0
+			e.samples = e.samples[:0]
 			e.halfOpenBusy = 0
 			e.halfOpenSucc = 0
 		}
@@ -178,4 +202,40 @@ func (b *memoryBreaker) Record(key string, now time.Time, err error) {
 		// permitted by Allow, so it should not have been attempted. This
 		// guards against double-counting after a failed failover.
 	}
+}
+
+// tripOpen transitions to Open and resets counters so Half-Open starts clean.
+func (e *entry) tripOpen(now time.Time) {
+	e.state = StateOpen
+	e.openedAt = now
+	e.failures = 0
+	e.samples = e.samples[:0]
+	e.halfOpenBusy = 0
+	e.halfOpenSucc = 0
+}
+
+// prune drops samples older than window. Samples exactly window old are kept.
+func (e *entry) prune(now time.Time, window time.Duration) {
+	i := 0
+	for i < len(e.samples) && now.Sub(e.samples[i].at) > window {
+		i++
+	}
+	if i > 0 {
+		e.samples = e.samples[i:]
+	}
+}
+
+// rateTripped reports whether the window failure ratio meets errRate with
+// at least minSamples samples. Inclusive boundary: ratio >= errRate trips.
+func (e *entry) rateTripped(minSamples int, errRate float64) bool {
+	if len(e.samples) < minSamples {
+		return false
+	}
+	failed := 0
+	for _, s := range e.samples {
+		if s.failed {
+			failed++
+		}
+	}
+	return float64(failed)/float64(len(e.samples)) >= errRate
 }
