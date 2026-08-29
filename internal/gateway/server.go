@@ -121,9 +121,8 @@ func New(deps Deps) (*Server, error) {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
 	}
-	if deps.Authenticator == nil {
-		deps.Authenticator = auth.NoopAuthenticator{}
-	}
+	// Leave deps.Authenticator nil so buildRuntime derives it from cfg.Auth
+	// (auth.mode static/api-key); defaulting to Noop here would shadow config.
 	limiter, err := pickLimiter(deps)
 	if err != nil {
 		return nil, err
