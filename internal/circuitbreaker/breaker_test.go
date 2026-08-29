@@ -150,7 +150,7 @@ func TestHalfOpenRecovery(t *testing.T) {
 	record(b, t0.Add(1*time.Millisecond), true)
 	record(b, t0.Add(2*time.Millisecond), true)
 	assertOpen(t, b, t0.Add(2*time.Millisecond), true)
-	assertOpen(t, b, t0.Add(2*time.Millisecond), true) // still open, no probe yet
+	assertOpen(t, b, t0.Add(2*time.Millisecond), true)   // still open, no probe yet
 	assertOpen(t, b, t0.Add(13*time.Millisecond), false) // -> half-open, probe allowed
 	assertOpen(t, b, t0.Add(13*time.Millisecond), true)  // probe busy cap reached
 	record(b, t0.Add(13*time.Millisecond), false)
@@ -168,7 +168,7 @@ func TestHalfOpenProbeFailureReopens(t *testing.T) {
 	record(b, t0.Add(2*time.Millisecond), true)
 	assertOpen(t, b, t0.Add(13*time.Millisecond), false) // half-open probe allowed
 	record(b, t0.Add(13*time.Millisecond), true)
-	assertOpen(t, b, t0.Add(13*time.Millisecond), true) // probe failure -> open again
+	assertOpen(t, b, t0.Add(13*time.Millisecond), true)  // probe failure -> open again
 	assertOpen(t, b, t0.Add(24*time.Millisecond), false) // 11ms later, half-open again
 }
 
@@ -181,8 +181,8 @@ func TestOpenStateRecordsIgnored(t *testing.T) {
 	record(b, t0, true)
 	record(b, t0.Add(1*time.Millisecond), true)
 	record(b, t0.Add(2*time.Millisecond), true)
-	record(b, t0.Add(5*time.Millisecond), true) // must be ignored: no state change, no openedAt reset
-	assertOpen(t, b, t0.Add(5*time.Millisecond), true)  // still open
+	record(b, t0.Add(5*time.Millisecond), true)          // must be ignored: no state change, no openedAt reset
+	assertOpen(t, b, t0.Add(5*time.Millisecond), true)   // still open
 	assertOpen(t, b, t0.Add(12*time.Millisecond), false) // 10ms since original trip (2ms), not 5ms
 }
 
