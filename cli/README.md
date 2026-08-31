@@ -1,39 +1,41 @@
-# gw — go-ai-gateway CLI
+# gw — 你的个人简单重复任务 CLI
 
-`gw` is the command-line client for [go-ai-gateway](../README.md), aimed at personal/desktop use. It calls a local gateway process over HTTP (reusing the gateway's alias routing, rate limits, and logging) for quick LLM interactions.
+> **一切皆为 CLI**：对话、命令、定时任务，全在终端里完成。
 
-```
-$ gw trans "hello world"        # translate
-你好,世界▌
-$ gw summarize diff.txt         # summarize
-$ gw commit                     # generate a Git commit message
-$ gw reload                     # hot-reload the config without restarting the gateway
-```
+`gw` 是 [go-ai-gateway](../README.md) 的个人命令行客户端，定位是**个人简单重复任务**——把日常"让模型做点小事"的操作收敛到终端：
 
-## Installation
+- **简单任务** → 一条命令搞定（`gw trans`、`gw ask`…）
+- **重复任务** → 对话沉淀成命令（`/save`），随时 `gw run`
+- **周期任务** → 命令挂上调度（`gw schedule`），定时自动执行
 
-```sh
-cli/install.sh
-```
+它调用本地 gateway（复用其别名路由、限流、日志与事件），不直连任何模型厂商。所有 agent 行为都会写入会话日志，可随时回溯。
 
-Installs to `/usr/local/bin` with sudo by default (on the macOS system PATH, so `gw` works in every shell). To skip sudo (installs to `~/.local/bin`, restart the terminal):
+## 一切皆为 CLI 的工作流
 
 ```sh
-GW_NO_SUDO=1 cli/install.sh
+# ① 对话 —— agent 会话，可读写文件（流式输出）
+gw repl -m common
+
+# ② 沉淀 —— 把一段成功的对话蒸馏成一个可复用命令
+gw> /save weekly-report
+saved command → ~/.config/gw/prompts/weekly-report.md
+
+# ③ 执行 —— 随时以 agent 方式运行，命令声明的工具自动可用
+gw run weekly-report "汇总本周提交"
+
+# ④ 定时 —— 让它在每周一早上 9 点自动跑
+gw schedule set weekly-report "0 9 * * 1"
+gw schedule                        # 查看下次执行时间 / 守护进程状态
+gw schedule start                  # 启动后台调度器
 ```
 
-Or manually:
+从一次对话，到一个命令，再到一个定时任务——**每一步都是 CLI**。
+
+## 快速开始
 
 ```sh
-cd cli && go build -o ~/.local/bin/gw .
-```
-
-## Quick start (one command)
-
-1. Prepare a gateway config — only `providers` and `aliases` are needed (`admin` is injected automatically):
-
-```yaml
-# ~/gw.yaml
+# 1. 准备 gateway 配置(只需 providers + aliases,admin 自动注入)
+cat > ~/gw.yaml <<'EOF'
 auth:
   mode: none
 providers:
@@ -45,45 +47,92 @@ aliases:
   chat:
     provider: openai
     model: gpt-4o
+EOF
+
+# 2. 一条命令拉起本地 gateway 并配置好 CLI
+export OPENAI_API_KEY=sk-...
+gw up ~/gw.yaml      # 构建 + 后台启动 gateway + 注入 admin + 写 CLI 配置
+gw models            # 就绪
+gw trans "hello world"
 ```
 
-2. Bring everything up with one command:
+`gw up` 自动：注入 admin 块（供 `gw reload`）、构建并启动 gateway、等待就绪、写 `~/.config/gw/config.yaml`。
+
+> `GW_GATEWAY_BIN` 指定 gateway 可执行文件；否则从源码仓库自动 `go build ./cmd/gateway`。
+
+## 日常随手用（开箱即用）
+
+`gw up` 之后就绪，这些命令立刻能用：
 
 ```sh
-export OPENAI_API_KEY=sk-...
-gw up ~/gw.yaml     # build + start the gateway in the background, inject admin, write the CLI config
-gw models           # ready to use
-gw trans "hello world"
-gw reload           # hot-reload after config edits, no restart
-gw down             # stop the local gateway
+# 翻译 —— 自动识别中文↔英文; -t 指定目标语言
+gw trans "hello world"                 # → 你好，世界
+gw trans "今天天气不错"
+gw trans -t 日语 "把这段翻译成日语"
+
+# 总结 —— 文件 / stdin / 参数
+gw summarize README.md
+gw summarize -f diff.txt
+cat long.txt | gw summarize -
+
+# 解释一段内容
+gw explain "什么是幂等性？"
+
+# 生成 Git 提交信息 —— 自动取 git diff
+gw commit
+
+# 单轮问答
+gw ask "golang 的 defer 有什么作用"
+
+# 多轮 agent 对话 —— 可读写文件、流式输出
+gw repl
+
+# 查看当前可用的模型别名
+gw models
 ```
 
-`gw up` automatically: injects the admin block (for `gw reload`), builds and starts the gateway, waits until ready, and writes `~/.config/gw/config.yaml`. Nothing else to configure afterwards.
+所有命令都支持 `-m <别名>` 指定模型（默认 `default_alias`）、`--no-stream` 关闭流式。
 
-> Gateway binary resolution: `GW_GATEWAY_BIN` picks a prebuilt binary; otherwise, running `gw` from the source repo auto-builds via `go build ./cmd/gateway`.
+## 配置
 
-## Configuration
-
-`gw up` writes `~/.config/gw/config.yaml` automatically; you can also create it by hand (missing keys fall back to defaults):
+`gw up` 自动写 `~/.config/gw/config.yaml`；也可以手写（缺省用默认值）：
 
 ```yaml
 gateway_url: http://127.0.0.1:8080
-admin_url: http://127.0.0.1:8081    # ops/healthz port; reload/usage go here; defaults to gateway_url
-api_key: sk-...          # gateway auth (static or api-key)
-admin_token: ""          # needed for reload / usage
-default_alias: chat      # default alias
+admin_url: http://127.0.0.1:8081    # ops/healthz 端口; reload/usage 走这里; 缺省同 gateway_url
+api_key: sk-...          # gateway 鉴权(static 或 api-key)
+admin_token: ""          # reload/usage 需要
+default_alias: chat      # 默认别名
 ```
 
-Environment variable overrides: `GW_GATEWAY_URL` `GW_ADMIN_URL` `GW_API_KEY` `GW_ADMIN_TOKEN` `GW_ALIAS` `GW_CONFIG`.
+环境变量覆盖：`GW_GATEWAY_URL` `GW_ADMIN_URL` `GW_API_KEY` `GW_ADMIN_TOKEN` `GW_ALIAS` `GW_CONFIG` `GW_FILE_ROOTS` `GW_SESSION_DIR`。
 
-## Agent REPL and session logs
+## 对话：`gw repl`
 
-`gw repl` runs an agentic loop: the model can call `read_file` / `write_file` / `list_dir` tools, and results are fed back automatically (bounded to 8 tool rounds per user turn).
+agent 会话：模型可调用文件工具，结果自动回填，继续对话（每轮最多 8 次工具往返）。助手文本**流式输出**；`--no-stream` 关闭流式。
 
-### File tool permissions
+```sh
+gw repl -m common                     # 默认别名可省略 -m
+gw repl --system "你是周报助手"         # 指定系统提示(名字/文件/原文)
+gw repl -f notes.txt                  # 用文件内容作为首条消息
+```
 
-- `file_roots` (config, default = the working directory at session start) allowlists directories `read_file`/`write_file` may touch. Paths are canonicalized (symlinks and `..` resolved) before any check; anything outside a root is denied.
-- Reads inside a root are allowed without prompting. Writes are confirmed on a TTY unless `write_confirm` is `never` (skip) or `always` (prompt even on non-TTY, which then fails). Non-interactive sessions deny writes by default.
+会话内命令：`/save <name>` 沉淀命令，`/exit` 退出。
+
+### 工具集（文件/目录增删改查）
+
+| 工具 | 作用 |
+|---|---|
+| `read_file` / `write_file` | 读 / 写文件（写会自动建父目录） |
+| `list_dir` | 列出目录条目（d/f 前缀 + 名称 + 大小 + 时间） |
+| `mkdir` / `delete_dir` | 建目录 / 删目录（`recursive: true` 连内容删） |
+| `delete_file` | 删文件 |
+| `rename` | 移动 / 重命名文件或目录 |
+
+### 权限模型
+
+- `file_roots`（配置，默认 = 会话启动时的工作目录）白名单允许访问的目录。路径先规范化（解析符号链接与 `..`）再校验，白名单外一律拒绝。
+- 白名单内读取免确认；所有**变更操作**（写/建目录/移动/删除）按 `write_confirm` 处理：`auto`（默认，TTY 交互确认，非 TTY 拒绝）`always`（总是提示，非 TTY 失败）`never`（白名单内跳过确认）。
 
 ```yaml
 file_roots:
@@ -91,26 +140,9 @@ file_roots:
 write_confirm: auto      # auto | always | never
 ```
 
-Env overrides: `GW_FILE_ROOTS` (path-list), `GW_SESSION_DIR`.
+## 沉淀：`/save <name>`
 
-### Session log
-
-Every REPL session appends one JSON line per agent event to `~/.config/gw/sessions/<id>.jsonl` (`0600`; override with `GW_SESSION_DIR`):
-
-| type | when |
-|---|---|
-| `session.started` / `session.ended` | session open / close |
-| `user.message` | a user line |
-| `model.request` | one model round-trip (tokens, duration_ms) |
-| `assistant.message` | model reply text |
-| `tool.call` / `tool.result` | a file tool invocation (path, allowed, content) |
-| `agent.error` | a failed request or the tool-round cap |
-
-Each event carries `session_id`, `event_id`, `occurred_at`, and a `request_id` also forwarded to the gateway as `X-Request-Id`, so gateway-side events (`request.started` etc.) correlate with the session log. The flat snake_case schema mirrors `internal/events.Event` and is the stable source future context engineering will map from.
-
-## Saved commands
-
-`/save <name>` distills a REPL session into a reusable command at `~/.config/gw/prompts/<name>.md`. The file is YAML frontmatter + a markdown body (the system prompt); old frontmatter-free prompts still work.
+把一段成功的对话蒸馏成一个可复用命令，存为 `~/.config/gw/prompts/<name>.md`（YAML frontmatter + 正文）。模型会根据对话中实际用到的工具，自动声明 `tools`。
 
 ```markdown
 ---
@@ -123,59 +155,79 @@ schedule: "0 9 * * 1"
 你是周报助手。汇总本周提交并生成周报...
 ```
 
-- `tools` — tools the command may call (`read_file`, `write_file`, `list_dir`, `delete_file`, `mkdir`, `delete_dir`, `rename`). Run with `gw run <name> "输入"` to execute agentically; `gw ask --prompt <name>` stays single-turn without tools. Mutations (write/mkdir/rename/delete) follow `write_confirm`.
-- `schedule` — a cron expression (`0 9 * * 1`) or `@every 24h` / `@daily` for periodic execution.
+- `tools` — 命令可调用的工具（`read_file` `write_file` `list_dir` `delete_file` `mkdir` `delete_dir` `rename`）。
+- `schedule` — cron 表达式（`0 9 * * 1`）或 `@every 24h` / `@daily`，用于定时执行。
+- 旧的无 frontmatter 的 `.md` 提示文件仍然兼容。
 
-### Scheduler
+## 执行：`gw run <command> [input]`
 
-`gw schedule` manages a built-in background daemon (pid + log under `~/.config/gw/`):
+以 agent 方式运行保存的命令：正文作为系统提示，声明的 `tools` 自动可用，无输入时自主执行。
 
 ```sh
-gw schedule set weekly-report "0 9 * * 1"   # set or re-set the cron expression
-gw schedule unset weekly-report             # clear it
-gw schedule                                 # list commands, next run, daemon status
-gw schedule run                             # run due commands once (manual/OS-cron hook)
-gw schedule start                           # start the background daemon
-gw schedule stop                            # stop it
+gw run weekly-report                    # 自主执行(命令正文指导行为)
+gw run weekly-report "只汇总 cli/ 的提交"
 ```
 
-The daemon executes each scheduled command agentically and records last-run times in `scheduler-state.json` (so a manual `gw schedule run` never double-runs what the daemon already did).
+## 定时：`gw schedule`
 
-## Commands
+内置后台调度器（pid/日志在 `~/.config/gw/` 下），按 cron 触发执行已保存命令：
 
-| Command | What it does |
+```sh
+gw schedule set weekly-report "0 9 * * 1"   # 设定/重设 cron
+gw schedule unset weekly-report             # 清除
+gw schedule                                 # 列表:下次执行时间 + 守护进程状态
+gw schedule run                             # 立即执行一次到期命令(可挂 OS cron)
+gw schedule start                           # 启动后台守护进程
+gw schedule stop                            # 停止
+```
+
+守护进程按 `scheduler-state.json` 记录上次执行时间，避免手动 `gw schedule run` 与守护进程重复执行。变更 schedule 后需 `gw schedule stop && start` 重载（v1 未做热加载）。
+
+## 会话日志
+
+每次 REPL / `gw run` / 调度执行都会向 `~/.config/gw/sessions/<id>.jsonl` 追加一行一个结构化事件（0600）：
+
+| 类型 | 时机 |
 |---|---|
-| `gw models` | List available aliases |
-| `gw ask [-m alias] [-p prompt] "question"` | General chat; `-p`/`--prompt` sets a prompt |
-| `gw repl [-m alias] [--system p] [-f file]` | Multi-turn **agent** chat (can call `read_file`/`write_file` tools); `/save <name>` distills the session into a reusable command |
-| `gw run <command> [input]` | Run a saved command agentically; declared `tools` are available |
-| `gw schedule [set/unset/run/start/stop]` | Manage the built-in scheduler (list, set cron, run due, start/stop the daemon) |
-| `gw trans [-m alias] [-t lang] "text"` | Translate (built-in prompt; auto-detects 中文↔English) |
-| `gw summarize [-m alias] [-f file\|-]` | Summarize (file / stdin / argument) |
-| `gw explain [-m alias] [-f file\|-] "content"` | Explain |
-| `gw commit [-m alias] [-f file\|-]` | Generate a Conventional Commits message (defaults to `git diff`) |
-| `gw reload [--path file]` | Hot-reload the gateway config |
-| `gw status` | Gateway health check |
-| `gw usage [--alias a] [--from t] [--to t]` | Usage query (requires admin_token) |
+| `session.started` / `session.ended` | 会话开 / 关 |
+| `user.message` | 用户输入 |
+| `model.request` | 一次模型往返（tokens、duration_ms） |
+| `assistant.message` | 模型回复文本 |
+| `tool.call` / `tool.result` | 一次工具调用（path、allowed、content） |
+| `agent.error` | 请求失败或超过工具轮数上限 |
 
-Common flags: `-m/--model <alias>` picks the model for this call (must be a configured alias, see `gw models`; defaults to `default_alias`); `--no-stream` disables streaming output.
+每个事件携带 `session_id`、`event_id`、`occurred_at`、`request_id`（同时作为 `X-Request-Id` 转发给 gateway），与 gateway 侧事件（`request.started` 等）对齐，跨层可回溯。扁平 snake_case schema 与 `internal/events.Event` 一致，是未来上下文工程映射的稳定来源。
+
+## 命令速查
+
+| 命令 | 作用 |
+|---|---|
+| `gw up [config.yaml]` / `gw down` | 启动 / 停止本地 gateway |
+| `gw models` | 列出可用别名 |
+| `gw repl [-m alias] [--system p] [-f file]` | 多轮 agent 会话（可读写文件、流式输出）；`/save <name>` 沉淀命令 |
+| `gw run <command> [input]` | 以 agent 方式运行保存的命令（声明 tools 自动可用） |
+| `gw schedule [set/unset/run/start/stop]` | 管理内置调度器 |
+| `gw ask [-m alias] [-p prompt] "问题"` | 单轮对话（无工具） |
+| `gw trans [-m alias] [-t lang] "文本"` | 翻译 |
+| `gw summarize [-m alias] [-f file\|-]` | 总结 |
+| `gw explain [-m alias] [-f file\|-] "内容"` | 解释 |
+| `gw commit [-m alias] [-f file\|-]` | 生成 Git 提交信息（默认取 `git diff`） |
+| `gw reload [--path file]` | 热更 gateway 配置 |
+| `gw status` | gateway 健康检查 |
+| `gw usage [--alias a] [--from t] [--to t]` | 用量查询（需 admin_token） |
+
+通用选项：`-m/--model <别名>` 指定本次调用别名（默认 `default_alias`）；`--no-stream` 关闭流式。
+
+## 自定义 prompt
+
+- 内置模板：`trans`、`summarize`、`explain`、`commit`。
+- 自定义：`~/.config/gw/prompts/<name>.md`（正文即系统提示，frontmatter 会被剥离）：
 
 ```sh
-$ gw models                 # list aliases
-$ gw trans -m chat "hello"  # call with the chat alias
-$ gw ask -m flash "question"  # call with the flash alias
-```
-
-## Custom prompts
-
-- Built-in templates: `trans`, `summarize`, `explain`, `commit`.
-- Custom: `~/.config/gw/prompts/<name>.md` — the file body (frontmatter stripped) is used as the system prompt:
-
-```sh
-$ cat > ~/.config/gw/prompts/code-review.md <<'EOF'
+cat > ~/.config/gw/prompts/code-review.md <<'EOF'
 You are a senior Go code reviewer. Point out potential bugs and improvements.
 EOF
-$ gw ask --prompt code-review "review this code: ..."
+gw ask --prompt code-review "review this code: ..."
 ```
 
-- `gw ask --prompt <text>` uses the text directly as the prompt.
+- `gw ask --prompt <text>` 直接把文本作为提示。

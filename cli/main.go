@@ -54,7 +54,7 @@ func run(args []string) int {
 }
 
 func usage() {
-	fmt.Print(`gw - go-ai-gateway CLI
+	fmt.Print(`gw - 个人简单重复任务 CLI(一切皆为 CLI: 对话→命令→定时任务)
 
 用法:
   gw models                     列出 gateway 可用别名

@@ -148,13 +148,33 @@ The Compose setup is a distributed-mode smoke test. It runs two gateway replicas
 
 ## CLI (`gw`)
 
-`gw` is the personal-use command-line client for this gateway. It talks to a local gateway process over HTTP, reusing the same alias routing, limits, and logging — no manual `curl` needed. Install once (`cli/install.sh`), then:
+`gw` is the personal command-line client for **simple, repetitive tasks** — *everything is CLI*: talk to it, distill the conversation into a reusable command, run it on demand, or schedule it. It talks to a local gateway process over HTTP, reusing the same alias routing, limits, and logging — no manual `curl` needed. Install once (`cli/install.sh`), then:
+
+```sh
+gw repl                          # agent session: chat with file tools, streaming
+  /save weekly-report            #   distill the conversation into a command
+gw run weekly-report             # run that command agentically, tools available
+gw schedule set weekly-report "0 9 * * 1"   # run it every Monday 09:00
+```
+
+Everyday one-liners after `gw up`:
+
+```sh
+gw trans "hello world"      # translate (auto zh↔en; -t sets target language)
+gw summarize README.md      # summarize a file / stdin / argument
+gw explain "什么是幂等性？"   # explain anything
+gw commit                   # Git commit message from `git diff`
+gw ask "golang defer 有什么用"  # one-shot chat
+```
 
 | Command | What it does |
 |---|---|
-| `gw up [config.yaml]` | Start a local gateway from a `providers`/`aliases` config and wire the CLI config |
+| `gw up [config.yaml]` / `gw down` | Start / stop a local gateway from a `providers`/`aliases` config |
 | `gw models` | List available aliases |
-| `gw ask "question"` | General chat (`-p/--prompt` selects a prompt) |
+| `gw repl` | Multi-turn agent session (file CRUD tools, streaming output); `/save <name>` distills it into a command |
+| `gw run <command> [input]` | Run a saved command agentically (declared `tools` available) |
+| `gw schedule [set/unset/run/start/stop]` | Manage the built-in cron scheduler |
+| `gw ask "question"` | One-shot chat (`-p/--prompt` selects a prompt) |
 | `gw trans "text"` | Translate (built-in prompt; `-t` sets the target language) |
 | `gw summarize [-f file]` | Summarize a file, argument, or stdin |
 | `gw explain "content"` | Explain content |
@@ -162,11 +182,10 @@ The Compose setup is a distributed-mode smoke test. It runs two gateway replicas
 | `gw reload` | Hot-reload the gateway config, no restart |
 | `gw status` | Gateway health check |
 | `gw usage` | Query usage (requires admin token) |
-| `gw down` | Stop the local gateway |
 
-Every call accepts `-m <alias>` to pick a configured alias (`gw models` lists them; defaults to `default_alias`), and `--no-stream` for non-streaming output. Custom prompts live in `~/.config/gw/prompts/<name>.md`.
+Every call accepts `-m <alias>` to pick a configured alias (`gw models` lists them; defaults to `default_alias`), and `--no-stream` for non-streaming output. File tools (`read_file`/`write_file`/`list_dir`/`mkdir`/`delete_file`/`delete_dir`/`rename`) are sandboxed to `file_roots`; every agent event lands in a JSONL session log.
 
-See [`cli/README.md`](cli/README.md) for installation, CLI configuration, and custom-prompt details.
+See [`cli/README.md`](cli/README.md) for installation, CLI configuration, file permissions, and the session log schema.
 
 ## Configuration
 
