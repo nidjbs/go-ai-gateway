@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
@@ -23,6 +24,12 @@ type Config struct {
 	// WriteConfirm controls write confirmation: auto (TTY prompt, non-TTY deny),
 	// always (prompt, fail on non-TTY), never (skip confirmation inside roots).
 	WriteConfirm string `yaml:"write_confirm"`
+	// ContextWindow is the repl sliding-window size in messages; older ones
+	// slide out of the model context. nil = 20 (default), 0 = keep everything.
+	ContextWindow *int `yaml:"context_window"`
+	// ContextTrigger is the remaining-window percentage below which compression
+	// kicks in (trim large tool results + slide out the oldest). nil = 20.
+	ContextTrigger *int `yaml:"context_trigger"`
 }
 
 // gwStateDir returns the CLI's state directory: config, prompts, and the
@@ -95,6 +102,16 @@ func loadConfig() (*Config, error) {
 	}
 	if v := os.Getenv("GW_FILE_ROOTS"); v != "" {
 		cfg.FileRoots = filepath.SplitList(v)
+	}
+	if v := os.Getenv("GW_CONTEXT_WINDOW"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.ContextWindow = &n
+		}
+	}
+	if v := os.Getenv("GW_CONTEXT_TRIGGER"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.ContextTrigger = &n
+		}
 	}
 	return cfg, nil
 }

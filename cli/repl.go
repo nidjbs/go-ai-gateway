@@ -96,6 +96,18 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 	if seed != "" {
 		emit(log, SessionEvent{Type: evUserMessage, Content: seed})
 	}
+	window := 20
+	if cfg.ContextWindow != nil {
+		window = *cfg.ContextWindow
+	}
+	trigger := 20
+	if cfg.ContextTrigger != nil {
+		trigger = *cfg.ContextTrigger
+	}
+	comp := newContextCompressor(system, window, trigger)
+	if seed != "" {
+		comp.add(Message{Role: "user", Content: seed})
+	}
 	endSession := func() { emit(log, SessionEvent{Type: evSessionEnded, Model: alias}) }
 
 	fmt.Fprintln(os.Stderr, "多轮 agent 会话已开始(可读写文件)。/exit 退出,/save <name> 沉淀为可复用命令。")
@@ -125,12 +137,20 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 			if !noStream {
 				out = os.Stdout
 			}
-			next, reply, err := agentReply(cfg, alias, history, policy, log, agentTools(), out)
+			comp.add(Message{Role: "user", Content: line})
+			reqMsgs := comp.requestMessages()
+			next, reply, err := agentReply(cfg, alias, reqMsgs, policy, log, agentTools(), out)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "gw:", err)
 				continue
 			}
-			history = next
+			// Feed the agent loop's new messages back into the full transcript
+			// (for /save) and the sliding window.
+			if len(next) > len(reqMsgs) {
+				newMsgs := next[len(reqMsgs):]
+				history = append(history, newMsgs...)
+				comp.add(newMsgs...)
+			}
 			if reply != "" {
 				if noStream {
 					fmt.Println(reply)

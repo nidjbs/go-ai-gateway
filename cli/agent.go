@@ -10,7 +10,7 @@ import (
 )
 
 // maxAgentTurns caps tool-calling loops to bound runaway chains.
-const maxAgentTurns = 8
+const maxAgentTurns = 20
 
 // agentReply runs the tool-calling loop until the model stops: send a turn,
 // execute any requested tools, feed results back, repeat. It appends assistant
@@ -61,6 +61,8 @@ func agentReply(cfg *Config, alias string, history []Message, policy *FilePolicy
 				ToolName: call.Function.Name, ToolCallID: call.ID, Path: path,
 				Allowed: terr == nil, Content: result,
 			})
+			// Tool results stay full here; the window compressor trims them only
+			// when the context is nearly full.
 			msgs = append(msgs, Message{Role: "tool", ToolCallID: call.ID, Content: result})
 		}
 	}
