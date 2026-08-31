@@ -27,18 +27,34 @@ type Attempts struct {
 	Failovers int
 }
 
-// Execute runs request against the candidate list with per-provider retries and provider-level failover. breaker may be nil (treated as Noop).
-func Execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, breaker circuitbreaker.Breaker, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error)) (T, routing.Candidate, Attempts, error) {
+// AttemptInfo describes one upstream attempt for an onAttempt observer.
+type AttemptInfo struct {
+	Candidate routing.Candidate
+	Attempt   int // 1-based per-provider attempt index
+	Retry     bool
+	Failover  bool
+}
+
+// OnAttemptFunc observes each upstream attempt (including retries and
+// failovers); err is the attempt's outcome (nil on success). Optional.
+type OnAttemptFunc func(ctx context.Context, info AttemptInfo, err error)
+
+// Execute runs request against the candidate list with per-provider retries and provider-level failover. breaker may be nil (treated as Noop). onAttempt is an optional per-attempt observer.
+func Execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, breaker circuitbreaker.Breaker, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error), onAttempt ...OnAttemptFunc) (T, routing.Candidate, Attempts, error) {
 	if breaker == nil {
 		breaker = circuitbreaker.Noop{}
 	}
-	return execute(ctx, retryCfg, failoverCfg, breaker, candidates, attempt, sleep, rand.Float64)
+	return execute(ctx, retryCfg, failoverCfg, breaker, candidates, attempt, sleep, rand.Float64, onAttempt...)
 }
 
-func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, breaker circuitbreaker.Breaker, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error), sleepFn func(context.Context, time.Duration) error, random func() float64) (T, routing.Candidate, Attempts, error) {
+func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCfg config.FailoverConfig, breaker circuitbreaker.Breaker, candidates []routing.Candidate, attempt func(context.Context, routing.Candidate) (T, error), sleepFn func(context.Context, time.Duration) error, random func() float64, onAttempt ...OnAttemptFunc) (T, routing.Candidate, Attempts, error) {
 	var zero T
 	var lastCandidate routing.Candidate
 	var lastErr error
+	var notify OnAttemptFunc
+	if len(onAttempt) > 0 {
+		notify = onAttempt[0]
+	}
 	attempts := Attempts{}
 	limit := len(candidates)
 	if failoverCfg.MaxProviders > 0 && int(failoverCfg.MaxProviders) < limit {
@@ -88,6 +104,9 @@ func execute[T any](ctx context.Context, retryCfg config.RetryConfig, failoverCf
 				attemptSpan.SetStatus(codes.Error, err.Error())
 			}
 			attemptSpan.End()
+			if notify != nil {
+				notify(attemptCtx, AttemptInfo{Candidate: candidate, Attempt: int(n) + 1, Retry: n > 0, Failover: i > 0}, err)
+			}
 			// Client-caused errors (4xx, 429, canceled, invalid request) must
 			// not trip the provider breaker: a misbehaving client could
 			// otherwise cut off every other tenant. They count as "healthy"

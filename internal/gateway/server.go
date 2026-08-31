@@ -24,6 +24,7 @@ import (
 	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
 	"github.com/nidjbs/go-ai-gateway/internal/concurrency"
 	"github.com/nidjbs/go-ai-gateway/internal/config"
+	"github.com/nidjbs/go-ai-gateway/internal/events"
 	"github.com/nidjbs/go-ai-gateway/internal/guardrails"
 	"github.com/nidjbs/go-ai-gateway/internal/metrics"
 	"github.com/nidjbs/go-ai-gateway/internal/plugin"
@@ -51,6 +52,7 @@ type Deps struct {
 	Breaker       circuitbreaker.Breaker
 	Now           func() time.Time
 	APIKeyLimits  map[string]config.KeyLimits
+	Events        *events.Hub // optional; built from Config.Events when nil
 }
 
 type readiness struct {
@@ -145,6 +147,10 @@ func New(deps Deps) (*Server, error) {
 	if deps.Now == nil {
 		deps.Now = func() time.Time { return time.Now().UTC() }
 	}
+	eventsHub, err := pickEventsHub(deps)
+	if err != nil {
+		return nil, err
+	}
 	ready := &readiness{startedAt: deps.Now(), waitTime: deps.Config.ReadyzWaitTime}
 	for _, driver := range []config.StorageDriver{deps.Config.RateLimit, deps.Config.Quota} {
 		if driver.Driver != "redis" {
@@ -190,15 +196,27 @@ func New(deps Deps) (*Server, error) {
 		return nil, err
 	}
 	rt.Store(current)
+	closer := sinkCloser(usageSink)
+	if eventsHub != nil {
+		hub := eventsHub
+		sink := closer
+		closer = closerFunc(func() error {
+			hub.Close()
+			if sink != nil {
+				return sink.Close()
+			}
+			return nil
+		})
+	}
 	server := &Server{
 		rt:          rt,
 		logger:      deps.Logger,
 		concurrency: concurrency.New(deps.Config.Server.MaxConcurrentRequests),
 		keyLimits:   make(map[string]*concurrency.Limiter),
 		now:         deps.Now,
-		closer:      sinkCloser(usageSink),
+		closer:      closer,
 	}
-	handlers := handler{rtPtr: rt, logger: deps.Logger, usageSink: usageSink, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, keyConcurrency: server.keyLimiter, now: deps.Now, idem: make(map[string]idemEntry), idemMu: &sync.Mutex{}, latency: routing.NewLatencyTracker(), plugins: pluginManager}
+	handlers := handler{rtPtr: rt, logger: deps.Logger, usageSink: usageSink, metrics: deps.Metrics, limiter: limiter, quotaStore: quotaStore, keyConcurrency: server.keyLimiter, now: deps.Now, idem: make(map[string]idemEntry), idemMu: &sync.Mutex{}, latency: routing.NewLatencyTracker(), plugins: pluginManager, events: eventsHub}
 	ops := chi.NewRouter()
 	if deps.Config.OpsTokenEnv != "" {
 		token := strings.TrimSpace(os.Getenv(deps.Config.OpsTokenEnv))
@@ -319,6 +337,34 @@ func sinkCloser(sink usage.Sink) io.Closer {
 		return c
 	}
 	return nil
+}
+
+// closerFunc adapts a function to io.Closer.
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
+// pickEventsHub resolves the events hub: Deps injection, else built from
+// Config.Events. Returns nil when no events are configured.
+func pickEventsHub(deps Deps) (*events.Hub, error) {
+	if deps.Events != nil {
+		return deps.Events, nil
+	}
+	if len(deps.Config.Events.Webhooks) == 0 {
+		return nil, nil
+	}
+	cfgs := make([]events.WebhookConfig, 0, len(deps.Config.Events.Webhooks))
+	for _, w := range deps.Config.Events.Webhooks {
+		types := make([]events.EventType, 0, len(w.Events))
+		for _, t := range w.Events {
+			types = append(types, events.EventType(t))
+		}
+		cfgs = append(cfgs, events.WebhookConfig{
+			Name: w.Name, URL: w.URL, Headers: w.Headers, Events: types,
+			Queue: w.Queue, Timeout: w.Timeout, Retries: w.Retries,
+		})
+	}
+	return events.NewHub(cfgs, deps.Logger, deps.Metrics)
 }
 
 // pickLimiter resolves the Limiter: Deps injection, then config driver, then memory.

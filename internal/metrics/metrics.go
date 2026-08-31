@@ -45,12 +45,16 @@ type Result struct {
 }
 
 type Recorder struct {
-	handler            http.Handler
-	requestDuration    apimetric.Float64Histogram
-	timeToFirstToken   apimetric.Float64Histogram
-	timePerOutputToken apimetric.Float64Histogram
-	tokenUsage         apimetric.Int64Histogram
-	dlpDetections      apimetric.Int64Counter
+	handler             http.Handler
+	requestDuration     apimetric.Float64Histogram
+	timeToFirstToken    apimetric.Float64Histogram
+	timePerOutputToken  apimetric.Float64Histogram
+	tokenUsage          apimetric.Int64Histogram
+	dlpDetections       apimetric.Int64Counter
+	eventsEmitted       apimetric.Int64Counter
+	eventsWebhookDeliv  apimetric.Int64Counter
+	eventsWebhookFailed apimetric.Int64Counter
+	eventsWebhookDrop   apimetric.Int64Counter
 }
 
 func New() (*Recorder, error) {
@@ -110,13 +114,35 @@ func (r *Recorder) Record(ctx context.Context, request Request, result Result) {
 
 func newRecorder(meter apimetric.Meter, handler http.Handler) *Recorder {
 	return &Recorder{
-		handler:            handler,
-		requestDuration:    must(meter.Float64Histogram("ai_gateway.llm.request.duration", apimetric.WithUnit("s"), apimetric.WithExplicitBucketBoundaries(llmRequestDurationBuckets...))),
-		timeToFirstToken:   must(meter.Float64Histogram("ai_gateway.llm.time_to_first_token", apimetric.WithUnit("s"), apimetric.WithExplicitBucketBoundaries(ttftBuckets...))),
-		timePerOutputToken: must(meter.Float64Histogram("ai_gateway.llm.time_per_output_token", apimetric.WithUnit("s"), apimetric.WithExplicitBucketBoundaries(llmTimePerOutputTokenBuckets...))),
-		tokenUsage:         must(meter.Int64Histogram("ai_gateway.llm.token.usage", apimetric.WithUnit("token"), apimetric.WithExplicitBucketBoundaries(tokenUsageBuckets...))),
-		dlpDetections:      must(meter.Int64Counter("ai_gateway.dlp.detections")),
+		handler:             handler,
+		requestDuration:     must(meter.Float64Histogram("ai_gateway.llm.request.duration", apimetric.WithUnit("s"), apimetric.WithExplicitBucketBoundaries(llmRequestDurationBuckets...))),
+		timeToFirstToken:    must(meter.Float64Histogram("ai_gateway.llm.time_to_first_token", apimetric.WithUnit("s"), apimetric.WithExplicitBucketBoundaries(ttftBuckets...))),
+		timePerOutputToken:  must(meter.Float64Histogram("ai_gateway.llm.time_per_output_token", apimetric.WithUnit("s"), apimetric.WithExplicitBucketBoundaries(llmTimePerOutputTokenBuckets...))),
+		tokenUsage:          must(meter.Int64Histogram("ai_gateway.llm.token.usage", apimetric.WithUnit("token"), apimetric.WithExplicitBucketBoundaries(tokenUsageBuckets...))),
+		dlpDetections:       must(meter.Int64Counter("ai_gateway.dlp.detections")),
+		eventsEmitted:       must(meter.Int64Counter("ai_gateway.events.emitted")),
+		eventsWebhookDeliv:  must(meter.Int64Counter("ai_gateway.events.webhook.delivered")),
+		eventsWebhookFailed: must(meter.Int64Counter("ai_gateway.events.webhook.failed")),
+		eventsWebhookDrop:   must(meter.Int64Counter("ai_gateway.events.webhook.dropped")),
 	}
+}
+
+// EventEmitted counts one emitted event, labelled by type.
+func (r *Recorder) EventEmitted(ctx context.Context, eventType string) {
+	r.eventsEmitted.Add(ctx, 1, apimetric.WithAttributes(attribute.String("type", eventType)))
+}
+
+// EventWebhookDelivered/Failed/Dropped count webhook delivery outcomes.
+func (r *Recorder) EventWebhookDelivered(ctx context.Context, webhook string) {
+	r.eventsWebhookDeliv.Add(ctx, 1, apimetric.WithAttributes(attribute.String("webhook", webhook)))
+}
+
+func (r *Recorder) EventWebhookFailed(ctx context.Context, webhook string) {
+	r.eventsWebhookFailed.Add(ctx, 1, apimetric.WithAttributes(attribute.String("webhook", webhook)))
+}
+
+func (r *Recorder) EventWebhookDropped(ctx context.Context, webhook string) {
+	r.eventsWebhookDrop.Add(ctx, 1, apimetric.WithAttributes(attribute.String("webhook", webhook)))
 }
 
 func llmAttributes(request Request, result Result, success bool) []attribute.KeyValue {

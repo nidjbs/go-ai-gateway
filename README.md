@@ -279,6 +279,25 @@ Rotation is a config change + restart: add the new digest, restart, remove the o
 
 `/healthz` and `/livez` return `200`. `/readyz` returns `503` during the startup window or while a dependency probe fails, then `204`: 5 seconds in `configs/config.docker.yaml` and 10 seconds in `configs/config.example.yaml`. Set `ops_token_env` to require a bearer token on operational endpoints.
 
+## Events
+
+The gateway emits structured lifecycle events and delivers them asynchronously to configured webhooks (and in-process Go subscribers via the `internal/events` package). Emission never blocks the request path: slow or unreachable webhooks drop events, never requests.
+
+```yaml
+events:
+  webhooks:
+    - name: agent-observability
+      url: https://example.com/events
+      headers:
+        Authorization: Bearer <token>
+      events: [request.started, request.completed, request.failed, request.rejected]
+      # queue: 4096     # per-webhook bounded queue; overflow drops events
+      # timeout: 5s     # POST timeout
+      # retries: 2      # bounded retries before dropping
+```
+
+Event types (an empty `events` list subscribes to all): `request.started`, `request.rejected` (rate limit / quota / plugin / invalid / DLP), `provider.attempt` (per upstream attempt, exposing retry/failover), `request.completed`, `request.failed`, `dlp.hit`. Every event carries `request_id` for correlation; webhook delivery is tracked by `ai_gateway.events.*` metrics.
+
 ## Production hardening
 
 - **Dependency-aware readiness & fail-fast startup** — a replica whose Redis is unreachable reports 503, and the process refuses to start with a misconfigured backend.

@@ -25,6 +25,7 @@ import (
 	"github.com/nidjbs/go-ai-gateway/internal/circuitbreaker"
 	"github.com/nidjbs/go-ai-gateway/internal/concurrency"
 	"github.com/nidjbs/go-ai-gateway/internal/dlp"
+	"github.com/nidjbs/go-ai-gateway/internal/events"
 	"github.com/nidjbs/go-ai-gateway/internal/metrics"
 	"github.com/nidjbs/go-ai-gateway/internal/plugin"
 	"github.com/nidjbs/go-ai-gateway/internal/provider"
@@ -51,6 +52,7 @@ type handler struct {
 	idem           map[string]idemEntry
 	latency        *routing.LatencyTracker
 	plugins        *plugin.Manager
+	events         *events.Hub
 }
 
 // idemEntry is one cached successful response keyed by (api key, Idempotency-Key).
@@ -116,6 +118,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 					candidate: routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID},
 					status:    http.StatusUnauthorized, errorType: "revoked_api_key",
 				})
+				h.emitRejected(ctx, requestEndpoint(r), "", http.StatusUnauthorized, "revoked_api_key", "API key has been revoked")
 				apierr.Write(w, http.StatusUnauthorized, "revoked_api_key", "invalid_request_error", "API key has been revoked")
 				return
 			}
@@ -127,6 +130,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 						candidate: routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID},
 						status:    http.StatusServiceUnavailable, errorType: "key_overloaded",
 					})
+					h.emitRejected(ctx, requestEndpoint(r), "", http.StatusServiceUnavailable, "key_overloaded", "API key concurrency limit exceeded")
 					w.Header().Set("Retry-After", "1")
 					apierr.Write(w, http.StatusServiceUnavailable, "key_overloaded", "server_error", "API key concurrency limit exceeded")
 					return
@@ -145,6 +149,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 						candidate: routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID},
 						status:    http.StatusTooManyRequests, errorType: "rate_limit_exceeded",
 					})
+					h.emitRejected(ctx, requestEndpoint(r), "", http.StatusTooManyRequests, "rate_limit_exceeded", "API key rate limit exceeded")
 					apierr.Write(w, http.StatusTooManyRequests, "rate_limit_exceeded", "rate_limit_error", "API key rate limit exceeded")
 					return
 				}
@@ -157,6 +162,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 						candidate: routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID},
 						status:    http.StatusTooManyRequests, errorType: "quota_exceeded_requests",
 					})
+					h.emitRejected(ctx, requestEndpoint(r), "", http.StatusTooManyRequests, "quota_exceeded_requests", "API key daily request quota exceeded")
 					apierr.Write(w, http.StatusTooManyRequests, "quota_exceeded_requests", "rate_limit_error", "API key daily request quota exceeded")
 					return
 				}
@@ -170,6 +176,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 						candidate: routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID},
 						status:    http.StatusTooManyRequests, errorType: "quota_exceeded",
 					})
+					h.emitRejected(ctx, requestEndpoint(r), "", http.StatusTooManyRequests, "quota_exceeded", "API key daily quota exceeded")
 					apierr.Write(w, http.StatusTooManyRequests, "quota_exceeded", "rate_limit_error", "API key daily quota exceeded")
 					return
 				}
@@ -183,6 +190,7 @@ func (h handler) authenticate(next http.Handler) http.Handler {
 						candidate: routing.Candidate{Name: principal.APIKeyID, Model: principal.APIKeyID},
 						status:    http.StatusTooManyRequests, errorType: "quota_exceeded_monthly",
 					})
+					h.emitRejected(ctx, requestEndpoint(r), "", http.StatusTooManyRequests, "quota_exceeded_monthly", "API key monthly quota exceeded")
 					apierr.Write(w, http.StatusTooManyRequests, "quota_exceeded_monthly", "rate_limit_error", "API key monthly quota exceeded")
 					return
 				}
@@ -225,6 +233,7 @@ func (h handler) recordBadRequest(ctx context.Context, started time.Time, endpoi
 
 func (h handler) writeInvalidRequest(w http.ResponseWriter, r *http.Request, started time.Time, alias string, candidate routing.Candidate, message string) {
 	h.recordBadRequest(r.Context(), started, requestEndpoint(r), alias, candidate)
+	h.emitRejected(r.Context(), requestEndpoint(r), alias, http.StatusBadRequest, "invalid_request", message)
 	apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", message)
 }
 
@@ -234,6 +243,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	recordAccessAlias(r.Context(), request.Model)
+	h.emit(r.Context(), h.baseEvent(r.Context(), events.TypeRequestStarted, "chat.completions", request.Model))
 	started := h.now()
 	body, ok = h.runBeforePlugins(w, r, started, "chat.completions", request.Model, body)
 	if !ok {
@@ -255,7 +265,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
 	result, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
 		return h.doWithLatency(ctx, adapterRequest, c)
-	})
+	}, h.attemptEmitter("chat.completions", request.Model))
 	if err != nil {
 		h.writeProviderError(w, r, started, "chat.completions", request.Model, candidate, false, err)
 		return
@@ -273,6 +283,13 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeRawJSON(w, http.StatusOK, respBody)
+	ev := h.baseEvent(r.Context(), events.TypeRequestCompleted, "chat.completions", request.Model)
+	ev.Provider, ev.Model = candidate.Name, candidate.Model
+	ev.StatusCode = http.StatusOK
+	ev.InputTokens, ev.OutputTokens, ev.TotalTokens = result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.Total()
+	ev.CacheReadTokens, ev.CacheCreationTokens = result.Usage.CacheReadTokens, result.Usage.CacheCreationTokens
+	ev.DurationMS = h.now().Sub(started).Milliseconds()
+	h.emit(r.Context(), ev)
 	h.recordUsage(r.Context(), usageRecord{
 		started: started, endpoint: "chat.completions", alias: request.Model, candidate: candidate,
 		usage:  result.Usage,
@@ -298,6 +315,7 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	recordAccessAlias(r.Context(), request.Model)
+	h.emit(r.Context(), h.baseEvent(r.Context(), events.TypeRequestStarted, "responses", request.Model))
 	started := h.now()
 	body, ok = h.runBeforePlugins(w, r, started, "responses", request.Model, body)
 	if !ok {
@@ -319,7 +337,7 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
 	result, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
 		return h.doWithLatency(ctx, adapterRequest, c)
-	})
+	}, h.attemptEmitter("responses", request.Model))
 	if err != nil {
 		h.writeProviderError(w, r, started, "responses", request.Model, candidate, false, err)
 		return
@@ -337,6 +355,13 @@ func (h handler) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeRawJSON(w, http.StatusOK, respBody)
+	ev := h.baseEvent(r.Context(), events.TypeRequestCompleted, "responses", request.Model)
+	ev.Provider, ev.Model = candidate.Name, candidate.Model
+	ev.StatusCode = http.StatusOK
+	ev.InputTokens, ev.OutputTokens, ev.TotalTokens = result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.Total()
+	ev.CacheReadTokens, ev.CacheCreationTokens = result.Usage.CacheReadTokens, result.Usage.CacheCreationTokens
+	ev.DurationMS = h.now().Sub(started).Milliseconds()
+	h.emit(r.Context(), ev)
 	h.recordUsage(r.Context(), usageRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK, attempts: attempts})
 	h.recordMetrics(r.Context(), metricsRecord{started: started, endpoint: "responses", alias: request.Model, candidate: candidate, usage: result.Usage, status: http.StatusOK})
 	h.storeIdempotent(r, http.StatusOK, respBody)
@@ -382,7 +407,7 @@ func (h handler) responsesStream(w http.ResponseWriter, r *http.Request, body js
 	adapterRequest := provider.Request{Operation: provider.Responses, Body: body}
 	stream, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
 		return h.openStreamWithLatency(ctx, adapterRequest, c)
-	})
+	}, h.attemptEmitter("responses", alias))
 	if err != nil {
 		h.writeProviderError(w, r, started, "responses", alias, candidate, true, err)
 		return
@@ -597,6 +622,7 @@ func (h handler) writePluginError(w http.ResponseWriter, r *http.Request, starte
 			status:    status, errorType: code,
 		})
 		h.logger.Info("request rejected by plugin", "request_id", requestID(r), "endpoint", endpoint, "alias", alias, "plugin", re.Plugin, "code", code)
+		h.emitRejected(r.Context(), endpoint, alias, status, code, re.Error())
 		apierr.Write(w, status, code, etype, re.Error())
 		return
 	}
@@ -670,6 +696,7 @@ func (h handler) checkAliasQuota(w http.ResponseWriter, r *http.Request, started
 			candidate: routing.Candidate{Name: alias, Model: alias},
 			status:    http.StatusTooManyRequests, errorType: "quota_exceeded_alias",
 		})
+		h.emitRejected(r.Context(), requestEndpoint(r), alias, http.StatusTooManyRequests, "quota_exceeded_alias", "Alias daily quota exceeded")
 		apierr.Write(w, http.StatusTooManyRequests, "quota_exceeded_alias", "rate_limit_error", "Alias daily quota exceeded")
 		return false
 	}
@@ -716,7 +743,7 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 	adapterRequest := provider.Request{Operation: provider.ChatCompletions, Body: body}
 	stream, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Stream, error) {
 		return h.openStreamWithLatency(ctx, adapterRequest, c)
-	})
+	}, h.attemptEmitter("chat.completions", alias))
 	if err != nil {
 		h.writeProviderError(w, r, started, "chat.completions", alias, candidate, true, err)
 		return
@@ -758,6 +785,11 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 			h.notifyOnError(r, "chat.completions", alias, err)
 			h.chargeStreamEstimate(w, r, alias, body, emittedRunes)
 			errorType, streamOutcome, status := streamOutcomeFor(result.err, r.Context())
+			ev := h.baseEvent(r.Context(), events.TypeRequestFailed, "chat.completions", alias)
+			ev.Provider, ev.Model = candidate.Name, candidate.Model
+			ev.StatusCode, ev.ErrorType, ev.StreamOutcome = status, errorType, streamOutcome
+			ev.Message = result.err.Error()
+			h.emit(r.Context(), ev)
 			h.recordUsage(r.Context(), usageRecord{
 				started: started, endpoint: "chat.completions", alias: alias, candidate: candidate,
 				ttft: firstToken, streaming: true,
@@ -782,6 +814,13 @@ func (h handler) chatStream(w http.ResponseWriter, r *http.Request, body json.Ra
 			if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
 				h.chargeQuota(w, principal.APIKeyID, alias, int64(event.Usage.Total()))
 			}
+			ev := h.baseEvent(r.Context(), events.TypeRequestCompleted, "chat.completions", alias)
+			ev.Provider, ev.Model = candidate.Name, candidate.Model
+			ev.StatusCode, ev.StreamOutcome = http.StatusOK, "completed"
+			ev.InputTokens, ev.OutputTokens, ev.TotalTokens = event.Usage.InputTokens, event.Usage.OutputTokens, event.Usage.Total()
+			ev.CacheReadTokens, ev.CacheCreationTokens = event.Usage.CacheReadTokens, event.Usage.CacheCreationTokens
+			ev.DurationMS = h.now().Sub(started).Milliseconds()
+			h.emit(r.Context(), ev)
 			h.recordUsage(r.Context(), usageRecord{
 				started: started, endpoint: "chat.completions", alias: alias, candidate: candidate,
 				usage: event.Usage,
@@ -904,6 +943,11 @@ func (h handler) writeStreamTimeout(w http.ResponseWriter, r *http.Request, star
 		flusher.Flush()
 	}
 	h.logger.Warn("stream terminated by timeout", "request_id", requestID(r), "endpoint", endpoint, "alias", alias, "error_type", code)
+	ev := h.baseEvent(r.Context(), events.TypeRequestFailed, endpoint, alias)
+	ev.Provider, ev.Model = candidate.Name, candidate.Model
+	ev.StatusCode, ev.ErrorType, ev.StreamOutcome = http.StatusBadGateway, code, "stream_timeout"
+	ev.Message = message
+	h.emit(r.Context(), ev)
 	h.recordUsage(r.Context(), usageRecord{
 		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
 		ttft: firstToken, streaming: true, status: http.StatusBadGateway, errorType: code, streamOutcome: "stream_timeout", attempts: attempts,
@@ -925,6 +969,7 @@ func (h handler) writeDLPRejectNonStreaming(w http.ResponseWriter, r *http.Reque
 		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
 		status: http.StatusBadRequest, errorType: "dlp_rejected",
 	})
+	h.emitRejected(r.Context(), endpoint, alias, http.StatusBadRequest, "dlp_rejected", "Response blocked by data-loss prevention policy")
 	apierr.Write(w, http.StatusBadRequest, "dlp_rejected", "content_policy_error", "Response blocked by data-loss prevention policy")
 }
 
@@ -941,6 +986,7 @@ func (h handler) writeDLPRejectStream(w http.ResponseWriter, r *http.Request, st
 	if flusher != nil {
 		flusher.Flush()
 	}
+	h.emitRejected(r.Context(), endpoint, alias, http.StatusBadRequest, "dlp_rejected", "Response blocked by data-loss prevention policy")
 	h.recordUsage(r.Context(), usageRecord{
 		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
 		ttft: firstToken, streaming: true, status: http.StatusBadRequest, errorType: "dlp_rejected", streamOutcome: "dlp_rejected", attempts: attempts,
@@ -960,6 +1006,10 @@ func (h handler) logDLPHits(ctx context.Context, endpoint, alias string, hits []
 			h.metrics.RecordDLP(ctx, p, mode)
 		}
 	}
+	ev := h.baseEvent(ctx, events.TypeDLPHit, endpoint, alias)
+	ev.Message = "dlp " + mode
+	ev.Payload = map[string]any{"patterns": patterns, "mode": mode}
+	h.emit(ctx, ev)
 }
 
 // streamOutcomeFor classifies a stream error into (errorType, streamOutcome, status).
@@ -1019,6 +1069,7 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	candidates = routing.Order(routing.StrategyFor(h.rt().config, request.Model), candidates, h.latency, rand.IntN)
 	recordAccessAlias(r.Context(), request.Model)
+	h.emit(r.Context(), h.baseEvent(r.Context(), events.TypeRequestStarted, "embeddings", request.Model))
 	body, ok := h.runBeforePlugins(w, r, started, "embeddings", request.Model, body)
 	if !ok {
 		return
@@ -1030,7 +1081,7 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	result, candidate, attempts, err := retry.Execute(r.Context(), h.rt().config.Retry, h.rt().config.Failover, h.rt().breaker, candidates, func(ctx context.Context, c routing.Candidate) (provider.Result, error) {
 		return h.doWithLatency(ctx, adapterRequest, c)
-	})
+	}, h.attemptEmitter("embeddings", request.Model))
 	if err != nil {
 		h.writeProviderError(w, r, started, "embeddings", request.Model, candidate, false, err)
 		return
@@ -1044,6 +1095,13 @@ func (h handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeRawJSON(w, http.StatusOK, respBody)
+	ev := h.baseEvent(r.Context(), events.TypeRequestCompleted, "embeddings", request.Model)
+	ev.Provider, ev.Model = candidate.Name, candidate.Model
+	ev.StatusCode = http.StatusOK
+	ev.InputTokens, ev.OutputTokens, ev.TotalTokens = result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.Total()
+	ev.CacheReadTokens, ev.CacheCreationTokens = result.Usage.CacheReadTokens, result.Usage.CacheCreationTokens
+	ev.DurationMS = h.now().Sub(started).Milliseconds()
+	h.emit(r.Context(), ev)
 	h.recordUsage(r.Context(), usageRecord{
 		started: started, endpoint: "embeddings", alias: request.Model, candidate: candidate,
 		usage:  result.Usage,
@@ -1070,6 +1128,7 @@ func (h handler) writeProviderError(w http.ResponseWriter, r *http.Request, star
 			started: started, endpoint: endpoint, alias: alias, candidate: candidate,
 			status: http.StatusBadRequest, errorType: "invalid_request",
 		})
+		h.emitFailed(r.Context(), endpoint, alias, candidate, http.StatusBadRequest, "invalid_request", requestErr.Error())
 		apierr.Write(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", requestErr.Error())
 		return
 	}
@@ -1078,6 +1137,7 @@ func (h handler) writeProviderError(w http.ResponseWriter, r *http.Request, star
 		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
 		streaming: streaming, status: status, errorType: errorType, attempts: retry.Attempts{},
 	})
+	h.emitFailed(r.Context(), endpoint, alias, candidate, status, errorType, upstreamErrorMessage)
 	h.recordMetrics(r.Context(), metricsRecord{
 		started: started, endpoint: endpoint, alias: alias, candidate: candidate,
 		status: status, errorType: errorType,
@@ -1346,6 +1406,59 @@ func requestID(r *http.Request) string {
 		return id
 	}
 	return "unknown"
+}
+
+// emit routes one event to the events hub; a nil hub makes it a no-op.
+func (h handler) emit(ctx context.Context, ev events.Event) {
+	if h.events == nil {
+		return
+	}
+	if ev.RequestID == "" {
+		ev.RequestID = middleware.GetReqID(ctx)
+	}
+	h.events.Emit(ctx, ev)
+}
+
+// baseEvent builds an event carrying the request's identity fields.
+func (h handler) baseEvent(ctx context.Context, typ events.EventType, endpoint, alias string) events.Event {
+	ev := events.Event{Type: typ, Endpoint: endpoint, Alias: alias}
+	if p, ok := auth.PrincipalFromContext(ctx); ok {
+		ev.APIKeyID, ev.TeamID = p.APIKeyID, p.TeamID
+	}
+	return ev
+}
+
+// emitRejected emits a request.rejected event.
+func (h handler) emitRejected(ctx context.Context, endpoint, alias string, status int, code, msg string) {
+	ev := h.baseEvent(ctx, events.TypeRequestRejected, endpoint, alias)
+	ev.StatusCode, ev.ErrorType, ev.Message = status, code, msg
+	h.emit(ctx, ev)
+}
+
+// emitFailed emits a request.failed event.
+func (h handler) emitFailed(ctx context.Context, endpoint, alias string, candidate routing.Candidate, status int, errorType, msg string) {
+	ev := h.baseEvent(ctx, events.TypeRequestFailed, endpoint, alias)
+	ev.Provider, ev.Model = candidate.Name, candidate.Model
+	ev.StatusCode, ev.ErrorType, ev.Message = status, errorType, msg
+	h.emit(ctx, ev)
+}
+
+// attemptEmitter returns a retry.OnAttemptFunc emitting a provider.attempt
+// event per upstream attempt, exposing retry/failover visibility.
+func (h handler) attemptEmitter(endpoint, alias string) retry.OnAttemptFunc {
+	return func(ctx context.Context, info retry.AttemptInfo, err error) {
+		ev := h.baseEvent(ctx, events.TypeProviderAttempt, endpoint, alias)
+		ev.Provider, ev.Model = info.Candidate.Name, info.Candidate.Model
+		ev.UpstreamModel = info.Candidate.Model
+		ev.Attempt, ev.Retry, ev.Failover = info.Attempt, info.Retry, info.Failover
+		if err != nil {
+			ev.ErrorType, _, _ = classifyProviderError(err)
+			ev.Message = err.Error()
+		} else {
+			ev.StatusCode = http.StatusOK
+		}
+		h.emit(ctx, ev)
+	}
 }
 
 func (h handler) recordMetrics(ctx context.Context, rec metricsRecord) {

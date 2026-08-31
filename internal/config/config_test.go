@@ -360,3 +360,22 @@ tracing:
 		t.Fatal("expected error for tracing.sample_ratio > 1")
 	}
 }
+
+func TestValidateEvents(t *testing.T) {
+	cfg := Config{}
+	if err := cfg.validateEvents(); err != nil {
+		t.Fatalf("empty events should validate: %v", err)
+	}
+	cfg.Events = EventsConfig{Webhooks: []WebhookConfig{{URL: "https://x.com"}}}
+	if err := cfg.validateEvents(); err == nil {
+		t.Fatal("missing webhook name must fail")
+	}
+	cfg.Events = EventsConfig{Webhooks: []WebhookConfig{{Name: "t", URL: "not-a-url"}}}
+	if err := cfg.validateEvents(); err == nil {
+		t.Fatal("bad webhook url must fail")
+	}
+	cfg.Events = EventsConfig{Webhooks: []WebhookConfig{{Name: "t", URL: "ftp://x.com"}}}
+	if err := cfg.validateEvents(); err == nil {
+		t.Fatal("non-http scheme must fail")
+	}
+}

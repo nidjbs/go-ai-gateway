@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -32,7 +33,26 @@ type Config struct {
 	Guardrails        GuardrailsConfig     `yaml:"guardrails,omitempty"`
 	Admin             AdminConfig          `yaml:"admin,omitempty"`
 	DLP               DLPConfig            `yaml:"dlp,omitempty"`
+	Events            EventsConfig         `yaml:"events,omitempty"`
 	readyzWaitTimeSet bool
+}
+
+// EventsConfig configures async lifecycle-event delivery to webhook targets.
+// In-process subscribers are registered in code; YAML only expresses webhooks.
+type EventsConfig struct {
+	Webhooks []WebhookConfig `yaml:"webhooks,omitempty"`
+}
+
+// WebhookConfig is one event delivery target. An empty events list subscribes
+// to every event type; queue/timeout/retries fall back to runtime defaults.
+type WebhookConfig struct {
+	Name    string            `yaml:"name"`
+	URL     string            `yaml:"url"`
+	Headers map[string]string `yaml:"headers,omitempty"`
+	Events  []string          `yaml:"events"`
+	Queue   int               `yaml:"queue,omitempty"`
+	Timeout time.Duration     `yaml:"timeout,omitempty"`
+	Retries int               `yaml:"retries,omitempty"`
 }
 
 // StorageDriver selects a named driver from the ratelimit/usage registries; an empty Driver falls back to the in-tree default.
@@ -470,6 +490,9 @@ func (c *Config) Validate() error {
 			return err
 		}
 	}
+	if err := c.validateEvents(); err != nil {
+		return err
+	}
 	if c.Retry.Multiplier <= 0 {
 		return errors.New("retry.multiplier must be greater than zero")
 	}
@@ -573,6 +596,24 @@ func (c *Config) AliasNames() []string {
 
 func (c *Config) TeamsEnabled() bool {
 	return c.Auth.Mode == "api-key"
+}
+
+// validateEvents checks webhook targets structurally; event-type names are
+// validated by the events package at startup (single source of truth).
+func (c *Config) validateEvents() error {
+	for _, w := range c.Events.Webhooks {
+		if strings.TrimSpace(w.Name) == "" {
+			return errors.New("events.webhooks: name is required")
+		}
+		if strings.TrimSpace(w.URL) == "" {
+			return fmt.Errorf("events.webhooks[%s]: url is required", w.Name)
+		}
+		u, err := url.Parse(w.URL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("events.webhooks[%s]: invalid url %q", w.Name, w.URL)
+		}
+	}
+	return nil
 }
 
 func (c *Config) validateTeams() error {
