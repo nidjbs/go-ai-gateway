@@ -106,7 +106,7 @@ func runCommand(cfg *Config, alias string, cmd *Command, userContent string) int
 		history = append(history, Message{Role: "user", Content: userContent})
 		emit(log, SessionEvent{Type: evUserMessage, Content: userContent})
 	}
-	_, reply, err := agentReply(cfg, alias, history, policy, log, selectTools(cmd.Tools))
+	_, reply, err := agentReply(cfg, alias, history, policy, log, selectTools(cmd.Tools), nil)
 	emit(log, SessionEvent{Type: evSessionEnded, Model: alias})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gw:", err)

@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -246,6 +248,126 @@ func (c *Client) AgentTurn(ctx context.Context, reqID, model string, messages []
 		InputTokens:  out.Usage.PromptTokens,
 		OutputTokens: out.Usage.CompletionTokens,
 	}, nil
+}
+
+// AgentTurnStream runs a streaming chat turn with tools, writing content deltas
+// to w as they arrive and accumulating tool_calls (fragments merged by index).
+// Returns the full turn result for session logging.
+func (c *Client) AgentTurnStream(ctx context.Context, reqID, model string, messages []Message, tools []ToolSpec, w io.Writer) (*AgentResult, error) {
+	payload := map[string]any{"model": model, "messages": messages, "stream": true}
+	if len(tools) > 0 {
+		payload["tools"] = tools
+	}
+	resp, err := c.doURL(ctx, http.MethodPost, c.baseURL, "/v1/chat/completions", c.apiKey, payload, reqID)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiError(resp)
+	}
+	if w == nil {
+		w = io.Discard
+	}
+	res := &AgentResult{}
+	type streamTool struct {
+		id   string
+		name string
+		args strings.Builder
+	}
+	toolsByIndex := map[int]*streamTool{}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var ev struct {
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			continue
+		}
+		if ev.Error != nil && ev.Error.Message != "" {
+			return nil, fmt.Errorf("stream error: %s", ev.Error.Message)
+		}
+		if ev.Usage.PromptTokens > 0 || ev.Usage.CompletionTokens > 0 {
+			res.InputTokens = ev.Usage.PromptTokens
+			res.OutputTokens = ev.Usage.CompletionTokens
+		}
+		if len(ev.Choices) == 0 {
+			continue
+		}
+		ch := ev.Choices[0]
+		if ch.Delta.Content != "" {
+			if _, err := io.WriteString(w, ch.Delta.Content); err != nil {
+				return nil, err
+			}
+			res.Content += ch.Delta.Content
+		}
+		for _, tc := range ch.Delta.ToolCalls {
+			slot, ok := toolsByIndex[tc.Index]
+			if !ok {
+				slot = &streamTool{}
+				toolsByIndex[tc.Index] = slot
+			}
+			if tc.ID != "" {
+				slot.id = tc.ID
+			}
+			if tc.Function.Name != "" {
+				slot.name = tc.Function.Name
+			}
+			slot.args.WriteString(tc.Function.Arguments)
+		}
+		if ch.FinishReason != "" {
+			res.FinishReason = ch.FinishReason
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	indices := make([]int, 0, len(toolsByIndex))
+	for i := range toolsByIndex {
+		indices = append(indices, i)
+	}
+	sort.Ints(indices)
+	for _, i := range indices {
+		slot := toolsByIndex[i]
+		res.ToolCalls = append(res.ToolCalls, ToolCall{
+			ID:   slot.id,
+			Type: "function",
+			Function: ToolFunction{
+				Name:      slot.name,
+				Arguments: slot.args.String(),
+			},
+		})
+	}
+	return res, nil
 }
 
 // Reload triggers the gateway's config hot-reload; path optionally overrides

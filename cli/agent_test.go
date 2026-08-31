@@ -60,7 +60,7 @@ func TestAgentLoopToolThenReply(t *testing.T) {
 	}
 	defer log.Close()
 
-	got, reply, err := agentReply(cfg, "chat", []Message{{Role: "user", Content: "read f.txt"}}, p, log, agentTools())
+	got, reply, err := agentReply(cfg, "chat", []Message{{Role: "user", Content: "read f.txt"}}, p, log, agentTools(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestAgentLoopMaxTurns(t *testing.T) {
 	}
 	defer log.Close()
 
-	if _, _, err := agentReply(cfg, "chat", []Message{{Role: "user", Content: "x"}}, p, log, agentTools()); err == nil {
+	if _, _, err := agentReply(cfg, "chat", []Message{{Role: "user", Content: "x"}}, p, log, agentTools(), nil); err == nil {
 		t.Fatal("expected max-turns error")
 	}
 	if call != maxAgentTurns {

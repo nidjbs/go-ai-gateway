@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -15,15 +16,23 @@ const maxAgentTurns = 8
 // execute any requested tools, feed results back, repeat. It appends assistant
 // and tool messages to a copy of history and returns the full updated history
 // plus the final assistant text. Session events are emitted as it goes. tools
-// controls which tools the model may call (empty = none).
-func agentReply(cfg *Config, alias string, history []Message, policy *FilePolicy, log *Session, tools []ToolSpec) ([]Message, string, error) {
+// controls which tools the model may call (empty = none). When w is non-nil,
+// assistant text is streamed to w as it arrives (REPL); otherwise the caller
+// prints the returned text itself.
+func agentReply(cfg *Config, alias string, history []Message, policy *FilePolicy, log *Session, tools []ToolSpec, w io.Writer) ([]Message, string, error) {
 	msgs := append([]Message(nil), history...)
 	ctx := context.Background()
 	client := NewClient(cfg)
 	for turn := 1; turn <= maxAgentTurns; turn++ {
 		reqID := newEventID()
 		start := time.Now()
-		res, err := client.AgentTurn(ctx, reqID, alias, msgs, tools)
+		var res *AgentResult
+		var err error
+		if w != nil {
+			res, err = client.AgentTurnStream(ctx, reqID, alias, msgs, tools, w)
+		} else {
+			res, err = client.AgentTurn(ctx, reqID, alias, msgs, tools)
+		}
 		if err != nil {
 			emit(log, SessionEvent{Type: evAgentError, Turn: turn, RequestID: reqID, Model: alias, Message: err.Error()})
 			return msgs, "", err

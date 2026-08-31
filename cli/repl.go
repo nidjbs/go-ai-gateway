@@ -70,8 +70,8 @@ func cmdRepl(args []string) int {
 }
 
 // replLoop runs the interactive session; in is parameterized for tests. The
-// loop is agentic: every user line may trigger read_file/write_file tool calls.
-// noStream is accepted for CLI compat; agent turns are non-streaming in v1.
+// loop is agentic: every user line may trigger file tool calls. Assistant text
+// streams to stdout unless noStream is set.
 func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Reader) int {
 	history := make([]Message, 0, 8)
 	if strings.TrimSpace(system) != "" {
@@ -121,14 +121,22 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 		default:
 			history = append(history, Message{Role: "user", Content: line})
 			emit(log, SessionEvent{Type: evUserMessage, Content: line})
-			next, reply, err := agentReply(cfg, alias, history, policy, log, agentTools())
+			var out io.Writer
+			if !noStream {
+				out = os.Stdout
+			}
+			next, reply, err := agentReply(cfg, alias, history, policy, log, agentTools(), out)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "gw:", err)
 				continue
 			}
 			history = next
 			if reply != "" {
-				fmt.Println(reply)
+				if noStream {
+					fmt.Println(reply)
+				} else {
+					fmt.Println() // newline after streamed content
+				}
 			}
 		}
 	}

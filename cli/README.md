@@ -78,7 +78,7 @@ Environment variable overrides: `GW_GATEWAY_URL` `GW_ADMIN_URL` `GW_API_KEY` `GW
 
 ## Agent REPL and session logs
 
-`gw repl` runs an agentic loop: the model can call `read_file` / `write_file` tools, and results are fed back automatically (bounded to 8 tool rounds per user turn).
+`gw repl` runs an agentic loop: the model can call `read_file` / `write_file` / `list_dir` tools, and results are fed back automatically (bounded to 8 tool rounds per user turn).
 
 ### File tool permissions
 
@@ -123,7 +123,7 @@ schedule: "0 9 * * 1"
 你是周报助手。汇总本周提交并生成周报...
 ```
 
-- `tools` — tools the command may call (only `read_file`/`write_file` exist). Run with `gw run <name> "输入"` to execute agentically; `gw ask --prompt <name>` stays single-turn without tools.
+- `tools` — tools the command may call (`read_file`, `write_file`, `list_dir`, `delete_file`, `mkdir`, `delete_dir`, `rename`). Run with `gw run <name> "输入"` to execute agentically; `gw ask --prompt <name>` stays single-turn without tools. Mutations (write/mkdir/rename/delete) follow `write_confirm`.
 - `schedule` — a cron expression (`0 9 * * 1`) or `@every 24h` / `@daily` for periodic execution.
 
 ### Scheduler
