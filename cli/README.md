@@ -105,7 +105,7 @@ admin_token: ""          # reload/usage 需要
 default_alias: chat      # 默认别名
 ```
 
-环境变量覆盖：`GW_GATEWAY_URL` `GW_ADMIN_URL` `GW_API_KEY` `GW_ADMIN_TOKEN` `GW_ALIAS` `GW_CONFIG` `GW_FILE_ROOTS` `GW_SESSION_DIR`。
+环境变量覆盖：`GW_GATEWAY_URL` `GW_ADMIN_URL` `GW_API_KEY` `GW_ADMIN_TOKEN` `GW_ALIAS` `GW_CONFIG` `GW_FILE_ROOTS` `GW_SESSION_DIR` `GW_CONTEXT_WINDOW` `GW_CONTEXT_TRIGGER`。
 
 ## 对话：`gw repl`
 
@@ -118,6 +118,17 @@ gw repl -f notes.txt                  # 用文件内容作为首条消息
 ```
 
 会话内命令：`/save <name>` 沉淀命令，`/exit` 退出。
+
+### 上下文窗口（滑动压缩）
+
+repl 用滑动窗口控制模型上下文：默认保留最近 **20** 条消息，工具结果先进窗存完整。**窗口用到近满（剩余 < 20%）才触发压缩**——裁剪窗内大工具响应（>4KB 保留开头 + 标记）并把最旧消息滑出到约 60% 低水位，随后继续积累。完整历史仍保留（`/save` 与 sessionlog 不受影响）。
+
+```yaml
+context_window: 20      # 窗口容量(消息条数); 0 = 不压缩
+context_trigger: 20     # 剩余容量低于该百分比时触发压缩
+```
+
+环境变量：`GW_CONTEXT_WINDOW` `GW_CONTEXT_TRIGGER`。
 
 ### 工具集（文件/目录增删改查）
 
