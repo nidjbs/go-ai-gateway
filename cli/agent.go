@@ -43,26 +43,28 @@ func agentReply(cfg *Config, alias string, history []Message, policy *FilePolicy
 			DurationMS: time.Since(start).Milliseconds(),
 		})
 		msgs = append(msgs, Message{Role: "assistant", Content: res.Content, ToolCalls: res.ToolCalls})
-		emit(log, SessionEvent{Type: evAssistantMessage, Turn: turn, RequestID: reqID, Model: alias, Content: res.Content})
+		emit(log, SessionEvent{Type: evAssistantMessage, Role: "assistant", Turn: turn, RequestID: reqID, Model: alias, Content: res.Content, ToolCalls: res.ToolCalls})
 		if len(res.ToolCalls) == 0 {
 			return msgs, res.Content, nil
 		}
 		for _, call := range res.ToolCalls {
 			path := toolArgPath(call.Function.Arguments)
-			emit(log, SessionEvent{Type: evToolCall, Turn: turn, RequestID: reqID, ToolName: call.Function.Name, ToolCallID: call.ID, Path: path})
+			emit(log, SessionEvent{Type: evToolCall, Turn: turn, RequestID: reqID, ToolName: call.Function.Name, ToolCallID: call.ID, Arguments: call.Function.Arguments, Path: path})
 			fmt.Fprintf(os.Stderr, "gw: [工具] %s %s\n", call.Function.Name, path)
 			result, terr := policy.DispatchTool(call)
 			if terr != nil {
 				result = "错误: " + terr.Error()
 				fmt.Fprintln(os.Stderr, "gw:", terr)
 			}
-			emit(log, SessionEvent{
-				Type: evToolResult, Turn: turn, RequestID: reqID,
+			seq := emit(log, SessionEvent{
+				Type: evToolResult, Role: "tool", Turn: turn, RequestID: reqID,
 				ToolName: call.Function.Name, ToolCallID: call.ID, Path: path,
 				Allowed: terr == nil, Content: result,
 			})
-			// Tool results stay full here; the window compressor trims them only
-			// when the context is nearly full.
+			// The full result is logged; the surface immediately shows a pruned
+			// version if oversized, so later turns never carry a full dump.
+			maybePruneToolResult(log, seq, result)
+			// In-loop the model still sees the full result to finish the turn.
 			msgs = append(msgs, Message{Role: "tool", ToolCallID: call.ID, Content: result})
 		}
 	}
@@ -70,11 +72,13 @@ func agentReply(cfg *Config, alias string, history []Message, policy *FilePolicy
 	return msgs, "", fmt.Errorf("agent 超过 %d 轮工具调用上限", maxAgentTurns)
 }
 
-// emit writes a session event, no-op when logging is disabled.
-func emit(log *Session, ev SessionEvent) {
+// emit writes a session event, no-op when logging is disabled; returns the
+// assigned seq (0 when logging is off).
+func emit(log *Session, ev SessionEvent) int64 {
 	if log != nil {
-		log.Emit(ev)
+		return log.Emit(ev)
 	}
+	return 0
 }
 
 // toolArgPath extracts the path argument from a tool call's JSON arguments.

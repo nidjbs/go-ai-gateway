@@ -4,76 +4,61 @@ import (
 	"strconv"
 )
 
-// maxToolResultBytes caps how much of a tool result survives compression in the
-// model context. The full result always lands in the session log.
-const maxToolResultBytes = 4096
+// Tool-result pruning budgets: a result is pruned when it exceeds the threshold,
+// keeping head + omission marker + tail, bounded. The full original always stays
+// in the session log.
+const (
+	toolResultThreshold = 8192 // prune when content exceeds this
+	toolResultHead      = 4096 // keep this many head chars
+	toolResultTail      = 1024 // keep this many tail chars
+)
 
-// trimToolResult cuts oversized tool results, keeping a head prefix + marker.
-// It only trims when the input clearly exceeds head+marker, so trimming never
-// makes the result longer.
+// trimToolResult prunes an oversized tool result to head + marker + tail, so the
+// end of a large file (often the most relevant part) survives. It only prunes
+// when clearly over budget, so trimming never makes the result longer.
 func trimToolResult(s string) string {
-	marker := "\n… [结果过长,已裁剪前 " + strconv.Itoa(maxToolResultBytes) + " 字节]"
-	if len(s) <= maxToolResultBytes+len(marker) {
+	if len(s) <= toolResultThreshold {
 		return s
 	}
-	return s[:maxToolResultBytes] + marker
-}
-
-// contextCompressor keeps a sliding window of recent messages for the model
-// request. Tool results stay full until the window is nearly full (remaining
-// below triggerPercent of capacity); then large tool results are trimmed and
-// the oldest messages slide out to a 60% low-water mark. The full transcript is
-// kept separately for /save and session logs.
-type contextCompressor struct {
-	capacity     int // message capacity; <= 0 disables compression
-	triggerRatio float64
-	system       string
-	window       []Message
-}
-
-func newContextCompressor(system string, capacity, triggerPercent int) *contextCompressor {
-	triggerRatio := 0.2
-	if triggerPercent > 0 {
-		triggerRatio = float64(triggerPercent) / 100
+	omitted := len(s) - toolResultHead - toolResultTail
+	marker := "\n… [中间省略 " + strconv.Itoa(omitted) + " 字节]\n"
+	head := toolResultHead
+	if head+len(marker)+toolResultTail > toolResultThreshold {
+		head = toolResultThreshold - len(marker) - toolResultTail
 	}
-	return &contextCompressor{system: system, capacity: capacity, triggerRatio: triggerRatio}
+	return s[:head] + marker + s[len(s)-toolResultTail:]
 }
 
-// add appends messages; once the window is nearly full it trims large tool
-// results and slides out the oldest, so compression is lazy, not per-message.
-func (c *contextCompressor) add(msgs ...Message) {
-	c.window = append(c.window, msgs...)
-	if c.capacity <= 0 {
+// maybePruneToolResult replaces an over-budget tool result on the surface with a
+// pruned version via a replace event (the original stays in the log). Called
+// right after the tool result is emitted, so the surface never carries a full
+// oversized result into later turns.
+func maybePruneToolResult(sess *Session, seq int64, result string) {
+	if trimmed := trimToolResult(result); trimmed != result {
+		sess.EmitTrim(seq, trimmed)
+	}
+}
+
+// maybeCompact applies the round-based sliding-window policy: when the surface
+// is nearly full (remaining below triggerPercent of capacity), the oldest
+// messages slide out via a context.compact event. The log keeps every original
+// event. capacity <= 0 disables compression.
+func maybeCompact(sess *Session, capacity, triggerPercent int) {
+	if capacity <= 0 {
 		return
 	}
-	highWater := int(float64(c.capacity) * (1 - c.triggerRatio))
-	if len(c.window) > highWater {
-		c.compress()
+	surface := sess.surfaceEvents()
+	highWater := int(float64(capacity) * (1 - float64(triggerPercent)/100))
+	if len(surface) <= highWater {
+		return
 	}
-}
-
-// compress trims oversized tool results and keeps the newest lowWater messages.
-func (c *contextCompressor) compress() {
-	for i := range c.window {
-		if c.window[i].Role == "tool" {
-			c.window[i].Content = trimToolResult(c.window[i].Content)
+	keep := max(int(float64(capacity)*0.6), 1)
+	drop := max(len(surface)-keep, 0)
+	if drop > 0 {
+		shadow := make([]int64, 0, drop)
+		for i := range drop {
+			shadow = append(shadow, surface[i].Seq)
 		}
+		sess.Compact(shadow)
 	}
-	keep := int(float64(c.capacity) * 0.6)
-	if keep < 1 {
-		keep = 1
-	}
-	if len(c.window) > keep {
-		c.window = append([]Message(nil), c.window[len(c.window)-keep:]...)
-	}
-}
-
-// requestMessages returns the bounded messages for the model: system prompt
-// (if any) then the recent window.
-func (c *contextCompressor) requestMessages() []Message {
-	msgs := make([]Message, 0, 1+len(c.window))
-	if c.system != "" {
-		msgs = append(msgs, Message{Role: "system", Content: c.system})
-	}
-	return append(msgs, c.window...)
 }

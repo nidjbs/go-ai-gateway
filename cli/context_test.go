@@ -10,67 +10,103 @@ func TestTrimToolResult(t *testing.T) {
 	if got := trimToolResult("hello"); got != "hello" {
 		t.Fatalf("short trimmed: %q", got)
 	}
-	long := strings.Repeat("x", maxToolResultBytes+100)
-	got := trimToolResult(long)
-	if len(got) >= len(long) || !strings.Contains(got, "已裁剪") {
-		t.Fatalf("long not trimmed: len=%d", len(got))
+	medium := strings.Repeat("x", toolResultThreshold)
+	if got := trimToolResult(medium); got != medium {
+		t.Fatalf("at-threshold content must stay full")
+	}
+	big := strings.Repeat("H", toolResultHead) + strings.Repeat("M", 5000) + strings.Repeat("T", toolResultTail)
+	got := trimToolResult(big)
+	if len(got) >= len(big) {
+		t.Fatalf("not pruned: %d", len(got))
+	}
+	if !strings.Contains(got, "中间省略") {
+		t.Fatalf("omission marker missing")
+	}
+	if !strings.HasPrefix(got, strings.Repeat("H", toolResultHead)) {
+		t.Fatalf("head not preserved")
+	}
+	if !strings.HasSuffix(got, strings.Repeat("T", toolResultTail)) {
+		t.Fatalf("tail not preserved")
 	}
 }
 
-// window 20, trigger 20% => highWater 16; the 17th add compresses to 12 (60%).
-func TestContextCompressorTrigger(t *testing.T) {
-	c := newContextCompressor("", 20, 20)
-	for i := 0; i < 16; i++ {
-		c.add(Message{Role: "user", Content: fmt.Sprintf("m%d", i)})
+// buildSession creates a session with n user+assistant pairs (2n messages).
+func buildSession(t *testing.T, n int) *Session {
+	t.Helper()
+	s, err := StartSession(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := len(c.requestMessages()); got != 16 {
-		t.Fatalf("after 16 adds window = %d, want 16", got)
+	t.Cleanup(func() { s.Close() })
+	for i := 0; i < n; i++ {
+		s.Emit(SessionEvent{Type: evUserMessage, Role: "user", Content: fmt.Sprintf("u%d", i)})
+		s.Emit(SessionEvent{Type: evAssistantMessage, Role: "assistant", Content: fmt.Sprintf("a%d", i)})
 	}
-	c.add(Message{Role: "user", Content: "m16"})
-	msgs := c.requestMessages()
+	return s
+}
+
+// capacity 20, trigger 20% => highWater 16; 9 pairs (18 messages) compacts to 12.
+func TestMaybeCompactSlidesOldest(t *testing.T) {
+	s := buildSession(t, 9)
+	maybeCompact(s, 20, 20)
+	msgs := s.Messages()
 	if len(msgs) != 12 {
-		t.Fatalf("after trigger window = %d, want 12", len(msgs))
+		t.Fatalf("surface after compact = %d, want 12", len(msgs))
 	}
-	if msgs[len(msgs)-1].Content != "m16" {
-		t.Fatalf("last message = %q, want m16", msgs[len(msgs)-1].Content)
+	if msgs[0].Content != "u3" || msgs[len(msgs)-1].Content != "a8" {
+		t.Fatalf("window edges = %q .. %q", msgs[0].Content, msgs[len(msgs)-1].Content)
+	}
+	var compacts int
+	for _, ev := range s.events {
+		if ev.Type == evContextCompact {
+			compacts++
+			if len(ev.ShadowSeqs) != 6 {
+				t.Fatalf("compact shadow seqs = %v, want 6", ev.ShadowSeqs)
+			}
+		}
+	}
+	if compacts != 1 {
+		t.Fatalf("compaction events = %d, want 1", compacts)
 	}
 }
 
-// A large tool result stays full until the trigger, then gets trimmed.
-func TestContextCompressorTrimsToolResults(t *testing.T) {
-	c := newContextCompressor("", 20, 20)
-	for i := 0; i < 16; i++ {
-		c.add(Message{Role: "user", Content: "u"})
+func TestMaybeCompactNoTrigger(t *testing.T) {
+	s := buildSession(t, 7) // 14 messages <= highWater 16
+	maybeCompact(s, 20, 20)
+	if got := len(s.Messages()); got != 14 {
+		t.Fatalf("surface = %d, want 14", got)
 	}
-	big := strings.Repeat("x", maxToolResultBytes+100)
-	c.add(Message{Role: "tool", Content: big}) // 17th -> trigger
-	msgs := c.requestMessages()
+}
+
+func TestMaybeCompactDisabled(t *testing.T) {
+	s := buildSession(t, 30)
+	maybeCompact(s, 0, 20)
+	if got := len(s.Messages()); got != 60 {
+		t.Fatalf("surface = %d, want 60", got)
+	}
+}
+
+func TestMaybePruneToolResult(t *testing.T) {
+	s, err := StartSession(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	big := strings.Repeat("x", toolResultThreshold+100)
+	seq := s.Emit(SessionEvent{Type: evToolResult, Role: "tool", ToolCallID: "c1", Content: big})
+	maybePruneToolResult(s, seq, big)
+	msgs := s.Messages()
 	last := msgs[len(msgs)-1]
-	if last.Role != "tool" {
-		t.Fatalf("last role = %q", last.Role)
+	if last.Role != "tool" || len(last.Content) >= len(big) || !strings.Contains(last.Content, "中间省略") {
+		t.Fatalf("tool result not pruned on surface: len=%d", len(last.Content))
 	}
-	if len(last.Content) >= len(big) || !strings.Contains(last.Content, "已裁剪") {
-		t.Fatalf("tool result not trimmed: len=%d", len(last.Content))
+	originalKept := false
+	for _, ev := range s.events {
+		if ev.Type == evToolResult && ev.Content == big && len(ev.SourceSeqs) == 0 {
+			originalKept = true
+		}
 	}
-}
-
-func TestContextCompressorDisabled(t *testing.T) {
-	c := newContextCompressor("", 0, 20)
-	for i := 0; i < 50; i++ {
-		c.add(Message{Role: "user", Content: "u"})
-	}
-	if got := len(c.requestMessages()); got != 50 {
-		t.Fatalf("disabled window = %d, want 50", got)
-	}
-}
-
-func TestContextCompressorKeepsSystem(t *testing.T) {
-	c := newContextCompressor("sys-prompt", 3, 20) // highWater 2, lowWater 1
-	for i := 0; i < 5; i++ {
-		c.add(Message{Role: "user", Content: "u"})
-	}
-	msgs := c.requestMessages()
-	if msgs[0].Role != "system" || msgs[0].Content != "sys-prompt" {
-		t.Fatalf("system prompt lost: %+v", msgs[0])
+	if !originalKept {
+		t.Fatal("original tool result not kept in log")
 	}
 }

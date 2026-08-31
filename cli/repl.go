@@ -44,6 +44,7 @@ func cmdRepl(args []string) int {
 	promptShort := fs.String("p", "", "alias for --system")
 	promptLong := fs.String("prompt", "", "alias for --system")
 	file := fs.String("f", "", "file whose content seeds the conversation")
+	resume := fs.String("resume", "", "resume a previous session by id")
 	noStream := fs.Bool("no-stream", false, "non-streaming output")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -66,36 +67,34 @@ func cmdRepl(args []string) int {
 		}
 		seed = strings.TrimSpace(string(data))
 	}
-	return replLoop(cfg, alias, system, seed, *noStream, os.Stdin)
+	var sess *Session
+	if *resume != "" {
+		sess, err = loadSession(sessionsDir(), *resume)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gw: 无法恢复会话 %q: %v\n", *resume, err)
+			return 1
+		}
+	} else {
+		sess, err = StartSession(sessionsDir())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gw: sessionlog:", err)
+			return 1
+		}
+	}
+	return replLoop(cfg, alias, system, seed, *noStream, os.Stdin, sess)
 }
 
-// replLoop runs the interactive session; in is parameterized for tests. The
-// loop is agentic: every user line may trigger file tool calls. Assistant text
-// streams to stdout unless noStream is set.
-func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Reader) int {
-	history := make([]Message, 0, 8)
-	if strings.TrimSpace(system) != "" {
-		history = append(history, Message{Role: "system", Content: system})
-	}
-	if seed != "" {
-		history = append(history, Message{Role: "user", Content: seed})
-	}
-
+// replLoop runs the interactive session event-sourced from sess; in is
+// parameterized for tests. The loop is agentic: every user line may trigger
+// file tool calls, and the model context is projected from the session log.
+// Assistant text streams to stdout unless noStream is set.
+func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Reader, sess *Session) int {
 	policy, err := newFilePolicy(cfg.FileRoots, cfg.WriteConfirm)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gw:", err)
 		return 1
 	}
-	log, err := StartSession(sessionsDir())
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "gw: sessionlog:", err)
-		return 1
-	}
-	defer log.Close()
-	emit(log, SessionEvent{Type: evSessionStarted, Model: alias})
-	if seed != "" {
-		emit(log, SessionEvent{Type: evUserMessage, Content: seed})
-	}
+	defer sess.Close()
 	window := 20
 	if cfg.ContextWindow != nil {
 		window = *cfg.ContextWindow
@@ -104,13 +103,21 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 	if cfg.ContextTrigger != nil {
 		trigger = *cfg.ContextTrigger
 	}
-	comp := newContextCompressor(system, window, trigger)
-	if seed != "" {
-		comp.add(Message{Role: "user", Content: seed})
+	fresh := len(sess.events) == 0
+	if fresh {
+		emit(sess, SessionEvent{Type: evSessionStarted, Model: alias})
+		if strings.TrimSpace(system) != "" {
+			emit(sess, SessionEvent{Type: evSystemContext, Role: "system", Content: system})
+		}
+		if seed != "" {
+			emit(sess, SessionEvent{Type: evUserMessage, Role: "user", Content: seed})
+		}
+		fmt.Fprintln(os.Stderr, "多轮 agent 会话已开始(可读写文件)。/exit 退出,/save <name> 沉淀为可复用命令。")
+	} else {
+		fmt.Fprintf(os.Stderr, "已恢复会话 %s。/exit 退出,/save <name> 沉淀为可复用命令。\n", sess.ID)
 	}
-	endSession := func() { emit(log, SessionEvent{Type: evSessionEnded, Model: alias}) }
+	endSession := func() { emit(sess, SessionEvent{Type: evSessionEnded, Model: alias}) }
 
-	fmt.Fprintln(os.Stderr, "多轮 agent 会话已开始(可读写文件)。/exit 退出,/save <name> 沉淀为可复用命令。")
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for {
@@ -127,30 +134,21 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 			endSession()
 			return 0
 		case strings.HasPrefix(line, "/save"):
-			if err := saveSession(cfg, alias, strings.TrimSpace(strings.TrimPrefix(line, "/save")), history); err != nil {
+			if err := saveSession(cfg, alias, strings.TrimSpace(strings.TrimPrefix(line, "/save")), sess.FullTranscript()); err != nil {
 				fmt.Fprintln(os.Stderr, "gw:", err)
 			}
 		default:
-			history = append(history, Message{Role: "user", Content: line})
-			emit(log, SessionEvent{Type: evUserMessage, Content: line})
+			emit(sess, SessionEvent{Type: evUserMessage, Role: "user", Content: line})
 			var out io.Writer
 			if !noStream {
 				out = os.Stdout
 			}
-			comp.add(Message{Role: "user", Content: line})
-			reqMsgs := comp.requestMessages()
-			next, reply, err := agentReply(cfg, alias, reqMsgs, policy, log, agentTools(), out)
+			_, reply, err := agentReply(cfg, alias, sess.Messages(), policy, sess, agentTools(), out)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "gw:", err)
 				continue
 			}
-			// Feed the agent loop's new messages back into the full transcript
-			// (for /save) and the sliding window.
-			if len(next) > len(reqMsgs) {
-				newMsgs := next[len(reqMsgs):]
-				history = append(history, newMsgs...)
-				comp.add(newMsgs...)
-			}
+			maybeCompact(sess, window, trigger)
 			if reply != "" {
 				if noStream {
 					fmt.Println(reply)

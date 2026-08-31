@@ -48,6 +48,17 @@ func loadTestCLIConfig(t *testing.T) *Config {
 	return cfg
 }
 
+// newTestSession creates a session in a temp dir, cleaned up after the test.
+func newTestSession(t *testing.T) *Session {
+	t.Helper()
+	s, err := StartSession(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
 func TestReplLoopSaveAndExit(t *testing.T) {
 	srv, reqs := replMock(t)
 	defer srv.Close()
@@ -57,7 +68,7 @@ func TestReplLoopSaveAndExit(t *testing.T) {
 	t.Setenv("GW_SESSION_DIR", t.TempDir())
 
 	in := strings.NewReader("hello\n/save weekly-report\n/exit\n")
-	if code := replLoop(loadTestCLIConfig(t), "chat", "", "", false, in); code != 0 {
+	if code := replLoop(loadTestCLIConfig(t), "chat", "", "", false, in, newTestSession(t)); code != 0 {
 		t.Fatalf("replLoop = %d", code)
 	}
 
@@ -98,7 +109,7 @@ func TestReplLoopSeedAndSystem(t *testing.T) {
 	t.Setenv("GW_SESSION_DIR", t.TempDir())
 
 	in := strings.NewReader("hi\n/exit\n")
-	if code := replLoop(loadTestCLIConfig(t), "chat", "sys-prompt", "seed-content", false, in); code != 0 {
+	if code := replLoop(loadTestCLIConfig(t), "chat", "sys-prompt", "seed-content", false, in, newTestSession(t)); code != 0 {
 		t.Fatalf("replLoop = %d", code)
 	}
 	if len(*reqs) != 1 {
@@ -146,6 +157,60 @@ func TestSaveSessionInvalid(t *testing.T) {
 	// No file must be written for the valid-name-but-empty-history case.
 	if _, err := os.Stat(filepath.Join(state, "no-reply.md")); !os.IsNotExist(err) {
 		t.Fatal("unexpected file written")
+	}
+}
+
+func TestReplResume(t *testing.T) {
+	srv, reqs := replMock(t)
+	defer srv.Close()
+	writeTestCLIConfig(t, srv.URL, "default_alias: chat\n")
+	t.Setenv("GW_STATE_DIR", t.TempDir())
+
+	s, err := StartSession(sessionsDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Emit(SessionEvent{Type: evSystemContext, Role: "system", Content: "sys"})
+	s.Emit(SessionEvent{Type: evUserMessage, Role: "user", Content: "old q"})
+	s.Emit(SessionEvent{Type: evAssistantMessage, Role: "assistant", Content: "old a"})
+	id := s.ID
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	in, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	if _, err := in.WriteString("new q\n/exit\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdin
+	os.Stdin = in
+	defer func() { os.Stdin = old }()
+
+	if code := run([]string{"repl", "--resume", id}); code != 0 {
+		t.Fatalf("run(repl --resume) = %d", code)
+	}
+	// The resumed context must include the replayed history + the new message.
+	last := (*reqs)[len(*reqs)-1]
+	want := []Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "old q"},
+		{Role: "assistant", Content: "old a"},
+		{Role: "user", Content: "new q"},
+	}
+	if len(last.Messages) != len(want) {
+		t.Fatalf("resumed messages = %+v", last.Messages)
+	}
+	for i := range want {
+		if !messagesEqual(last.Messages[i], want[i]) {
+			t.Fatalf("messages[%d] = %+v, want %+v", i, last.Messages[i], want[i])
+		}
 	}
 }
 

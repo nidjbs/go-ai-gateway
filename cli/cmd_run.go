@@ -98,15 +98,13 @@ func runCommand(cfg *Config, alias string, cmd *Command, userContent string) int
 	}
 	defer log.Close()
 	emit(log, SessionEvent{Type: evSessionStarted, Model: alias})
-	history := make([]Message, 0, 2)
 	if cmd.Body != "" {
-		history = append(history, Message{Role: "system", Content: cmd.Body})
+		emit(log, SessionEvent{Type: evSystemContext, Role: "system", Content: cmd.Body})
 	}
 	if userContent != "" {
-		history = append(history, Message{Role: "user", Content: userContent})
-		emit(log, SessionEvent{Type: evUserMessage, Content: userContent})
+		emit(log, SessionEvent{Type: evUserMessage, Role: "user", Content: userContent})
 	}
-	_, reply, err := agentReply(cfg, alias, history, policy, log, selectTools(cmd.Tools), nil)
+	_, reply, err := agentReply(cfg, alias, log.Messages(), policy, log, selectTools(cmd.Tools), nil)
 	emit(log, SessionEvent{Type: evSessionEnded, Model: alias})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gw:", err)
