@@ -2,6 +2,40 @@
 
 A lightweight, OpenAI-compatible AI gateway for routing model aliases across OpenAI-compatible and Anthropic upstreams. It supports retries, failover, API-key tenancy, quotas, Redis-backed distributed limits, usage records, metrics, and optional prompt-injection guardrails.
 
+```mermaid
+flowchart LR
+    subgraph Consumers["Consumers"]
+        A1["AI agent services<br/>the primary consumer"]
+        A2["gw CLI<br/>personal / dev tool"]
+    end
+
+    subgraph GW["go-ai-gateway"]
+        direction TB
+        G0["OpenAI-compatible API<br/>chat · responses · embeddings · streaming"]
+        G1["Auth & tenancy<br/>none / static / per-team API keys"]
+        G2["Limits & quotas<br/>per-key · daily / monthly / per-alias"]
+        G3["Alias routing<br/>fallback · loadbalance · least-latency"]
+        G4["Reliability<br/>retry · failover · circuit breaker"]
+        G5["Guardrails & output DLP<br/>injection scan · PII masking"]
+        G0 --> G1 --> G2 --> G3 --> G4 --> G5
+    end
+
+    subgraph Up["Upstreams"]
+        P1["Any provider behind an alias<br/>OpenAI-compatible / Anthropic"]
+    end
+
+    subgraph Ops["Operational layer"]
+        O1["/admin · metrics · access log"]
+        O2["usage (SQLite) · runtime key revoke · Redis"]
+        O1 --- O2
+    end
+
+    A1 -->|"OpenAI API"| G0
+    A2 --> G0
+    G5 --> P1
+    G0 -. "ops port" .-> Ops
+```
+
 ## Quick Start
 
 ### Option A: Docker (recommended)
