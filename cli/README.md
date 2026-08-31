@@ -109,19 +109,20 @@ default_alias: chat      # 默认别名
 
 ## 对话：`gw repl`
 
-agent 会话：模型可调用文件工具，结果自动回填，继续对话（每轮最多 8 次工具往返）。助手文本**流式输出**；`--no-stream` 关闭流式。
+agent 会话：模型可调用文件工具，结果自动回填，继续对话（每轮最多 8 次工具往返）。助手文本**流式输出**；`--no-stream` 关闭流式。会话上下文**事件溯源**自 session 日志（见下），可用 `--resume` 重放恢复上次会话。
 
 ```sh
 gw repl -m common                     # 默认别名可省略 -m
 gw repl --system "你是周报助手"         # 指定系统提示(名字/文件/原文)
 gw repl -f notes.txt                  # 用文件内容作为首条消息
+gw repl --resume 20260831T...-abcd    # 从该 session 日志恢复并继续
 ```
 
 会话内命令：`/save <name>` 沉淀命令，`/exit` 退出。
 
-### 上下文窗口（滑动压缩）
+### 上下文窗口（滑动压缩 = compaction）
 
-repl 用滑动窗口控制模型上下文：默认保留最近 **20** 条消息，工具结果先进窗存完整。**窗口用到近满（剩余 < 20%）才触发压缩**——裁剪窗内大工具响应（>4KB 保留开头 + 标记）并把最旧消息滑出到约 60% 低水位，随后继续积累。完整历史仍保留（`/save` 与 sessionlog 不受影响）。
+repl 用滑动窗口控制模型上下文：默认保留最近 **20** 条 surface 消息。**大工具结果（>8KB）在发射时即裁剪**为"开头 + 省略标记 + 结尾"（保留开头 4096 字节 + 结尾 1024 字节），surface 永不携带完整大结果，原结果仍完整留在日志。**窗口用到近满（剩余 < 20%）才触发**——把最旧消息通过 `context.compact` 事件滑出到约 60% 低水位。原事件全部保留在日志里（标记 shadowed），只影响投影（surface），`/save` 与重放仍取完整转录。
 
 ```yaml
 context_window: 20      # 窗口容量(消息条数); 0 = 不压缩
@@ -194,20 +195,22 @@ gw schedule stop                            # 停止
 
 守护进程按 `scheduler-state.json` 记录上次执行时间，避免手动 `gw schedule run` 与守护进程重复执行。变更 schedule 后需 `gw schedule stop && start` 重载（v1 未做热加载）。
 
-## 会话日志
+## 会话日志（事件溯源）
 
-每次 REPL / `gw run` / 调度执行都会向 `~/.config/gw/sessions/<id>.jsonl` 追加一行一个结构化事件（0600）：
+每次 REPL / `gw run` / 调度执行都是 **append-only 的事件日志**：`~/.config/gw/sessions/<id>.jsonl` 每行一个事件（0600），不变量 **"模型可见即已记录"**——任何进入模型请求的内容都能从日志重建。模型上下文是日志的**派生投影（surface）**；`--resume`、`/save`、未来上下文工程都读同一份日志。
 
 | 类型 | 时机 |
 |---|---|
 | `session.started` / `session.ended` | 会话开 / 关 |
-| `user.message` | 用户输入 |
-| `model.request` | 一次模型往返（tokens、duration_ms） |
-| `assistant.message` | 模型回复文本 |
-| `tool.call` / `tool.result` | 一次工具调用（path、allowed、content） |
+| `system.context` | 系统提示（surface） |
+| `user.message` | 用户输入（surface） |
+| `assistant.message` | 模型回复 + 完整 `tool_calls`（surface，无损） |
+| `tool.call` / `tool.result` | 工具调用（含完整 arguments）/ 结果（surface） |
+| `model.request` | 一次模型往返（tokens、duration_ms，审计） |
+| `context.compact` | 压缩：携带 `shadow_seqs` 折叠最旧（审计，原事件保留） |
 | `agent.error` | 请求失败或超过工具轮数上限 |
 
-每个事件携带 `session_id`、`event_id`、`occurred_at`、`request_id`（同时作为 `X-Request-Id` 转发给 gateway），与 gateway 侧事件（`request.started` 等）对齐，跨层可回溯。扁平 snake_case schema 与 `internal/events.Event` 一致，是未来上下文工程映射的稳定来源。
+每个事件携带 `session_id`、`event_id`、`seq`（单调）、`occurred_at`、`request_id`（同时作为 `X-Request-Id` 转发给 gateway），与 gateway 侧事件对齐，跨层可回溯。扁平 snake_case schema 与 `internal/events.Event` 一致，是未来上下文工程映射的稳定来源。
 
 ## 命令速查
 
@@ -215,7 +218,7 @@ gw schedule stop                            # 停止
 |---|---|
 | `gw up [config.yaml]` / `gw down` | 启动 / 停止本地 gateway |
 | `gw models` | 列出可用别名 |
-| `gw repl [-m alias] [--system p] [-f file]` | 多轮 agent 会话（可读写文件、流式输出）；`/save <name>` 沉淀命令 |
+| `gw repl [-m alias] [--system p] [-f file] [--resume id]` | 多轮 agent 会话（可读写文件、流式输出、事件溯源）；`/save <name>` 沉淀命令，`--resume` 恢复上次会话 |
 | `gw run <command> [input]` | 以 agent 方式运行保存的命令（声明 tools 自动可用） |
 | `gw schedule [set/unset/run/start/stop]` | 管理内置调度器 |
 | `gw ask [-m alias] [-p prompt] "问题"` | 单轮对话（无工具） |
