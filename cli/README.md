@@ -82,6 +82,7 @@ Environment variable overrides: `GW_GATEWAY_URL` `GW_ADMIN_URL` `GW_API_KEY` `GW
 |---|---|
 | `gw models` | List available aliases |
 | `gw ask [-m alias] [-p prompt] "question"` | General chat; `-p`/`--prompt` sets a prompt |
+| `gw repl [-m alias] [--system p] [-f file]` | Multi-turn chat; `/save <name>` distills the session into a reusable command |
 | `gw trans [-m alias] [-t lang] "text"` | Translate (built-in prompt; auto-detects 中文↔English) |
 | `gw summarize [-m alias] [-f file\|-]` | Summarize (file / stdin / argument) |
 | `gw explain [-m alias] [-f file\|-] "content"` | Explain |

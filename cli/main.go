@@ -19,6 +19,8 @@ func run(args []string) int {
 		return cmdModels(args[1:])
 	case "ask":
 		return cmdAsk(args[1:])
+	case "repl":
+		return cmdRepl(args[1:])
 	case "trans":
 		return cmdTrans(args[1:])
 	case "summarize":
@@ -53,6 +55,7 @@ func usage() {
 用法:
   gw models                     列出 gateway 可用别名
   gw ask [选项] "问题"           通用对话,可用 --prompt 指定 prompt
+  gw repl [选项]                多轮会话;/save <name> 沉淀为可复用命令
   gw trans [选项] "文本"         翻译(内置 prompt)
   gw summarize [选项]           总结(读取文件或 stdin)
   gw explain [选项] "问题"       解释内容
