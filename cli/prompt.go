@@ -2,9 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 )
 
 // builtinPrompts maps a quick command to its system-prompt template. The "%s"
@@ -25,25 +22,15 @@ func builtinPrompt(name string, args ...any) string {
 	return fmt.Sprintf(tpl, args...)
 }
 
-// systemPromptFor resolves a --prompt argument: custom file by name, then
-// builtin template, then raw prompt text. A path-like argument is read as a
-// file directly.
+// systemPromptFor resolves a --prompt argument to a system prompt, reusing
+// loadCommand so frontmatter metadata is stripped and only the body is used.
 func systemPromptFor(arg, promptsDir string) (string, error) {
 	if arg == "" {
 		return "", nil
 	}
-	if strings.Contains(arg, string(filepath.Separator)) || strings.HasSuffix(arg, ".md") || strings.HasSuffix(arg, ".txt") {
-		if data, err := os.ReadFile(arg); err == nil {
-			return strings.TrimSpace(string(data)), nil
-		}
+	cmd, err := loadCommand(arg, promptsDir)
+	if err != nil {
+		return "", err
 	}
-	if promptsDir != "" {
-		if data, err := os.ReadFile(filepath.Join(promptsDir, arg+".md")); err == nil {
-			return strings.TrimSpace(string(data)), nil
-		}
-	}
-	if tpl, ok := builtinPrompts[arg]; ok {
-		return strings.Replace(tpl, "%s", "", 1), nil
-	}
-	return strings.TrimSpace(arg), nil
+	return cmd.Body, nil
 }

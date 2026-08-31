@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -208,22 +207,7 @@ func startGateway(bin, runtimeConfig, token string) error {
 }
 
 func gatewayRunning(pidPath string) (int, bool) {
-	data, err := os.ReadFile(pidPath)
-	if err != nil {
-		return 0, false
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return 0, false
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return pid, false
-	}
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
-		return pid, false
-	}
-	return pid, true
+	return pidAlive(pidPath)
 }
 
 func cmdUp(args []string) int {

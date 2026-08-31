@@ -17,6 +17,12 @@ type Config struct {
 	APIKey       string `yaml:"api_key"`
 	AdminToken   string `yaml:"admin_token"`
 	DefaultAlias string `yaml:"default_alias"`
+	// FileRoots are the directories read_file/write_file may access in agent
+	// sessions; empty means the working directory at session start.
+	FileRoots []string `yaml:"file_roots"`
+	// WriteConfirm controls write confirmation: auto (TTY prompt, non-TTY deny),
+	// always (prompt, fail on non-TTY), never (skip confirmation inside roots).
+	WriteConfirm string `yaml:"write_confirm"`
 }
 
 // gwStateDir returns the CLI's state directory: config, prompts, and the
@@ -48,6 +54,15 @@ func promptsDir() string {
 	return filepath.Join(gwStateDir(), "prompts")
 }
 
+// sessionsDir returns where session logs are written ($GW_SESSION_DIR or
+// <state>/sessions).
+func sessionsDir() string {
+	if v := os.Getenv("GW_SESSION_DIR"); v != "" {
+		return v
+	}
+	return filepath.Join(gwStateDir(), "sessions")
+}
+
 // loadConfig reads the CLI config file (absent file → defaults) then applies
 // environment overrides: GW_GATEWAY_URL, GW_API_KEY, GW_ADMIN_TOKEN, GW_ALIAS.
 func loadConfig() (*Config, error) {
@@ -77,6 +92,9 @@ func loadConfig() (*Config, error) {
 	}
 	if v := os.Getenv("GW_ALIAS"); v != "" {
 		cfg.DefaultAlias = v
+	}
+	if v := os.Getenv("GW_FILE_ROOTS"); v != "" {
+		cfg.FileRoots = filepath.SplitList(v)
 	}
 	return cfg, nil
 }

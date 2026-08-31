@@ -2,26 +2,34 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 )
 
 // distillPrompt instructs the model to turn a conversation transcript into a
-// reusable command (a system prompt) that is saved under promptsDir().
-const distillPrompt = `你是工作流沉淀助手。用户提供了一段多轮对话记录,请提炼成一个"可复用命令"的系统提示。
+// structured reusable command file (YAML frontmatter + system prompt body) that
+// is saved under promptsDir().
+const distillPrompt = `你是命令沉淀助手。用户提供了一段多轮对话记录(可能包含工具调用),请提炼成一个"可复用命令"文件。
+
+输出格式(只输出这个文件本身,不要前缀/解释/代码块):
+---
+name: <英文/数字/._- 组成的命令名,如 weekly-report>
+description: <一句话职责>
+tools: [read_file, write_file]   # 仅当对话中实际使用了工具;否则留空 []
+schedule: ""                     # 如 "0 9 * * 1" 或 "@every 24h";留空表示不自动执行
+---
+
+<系统提示正文:命令职责、处理输入的方式、执行步骤、工具使用时机(如用到)、产出格式>
 
 要求:
-1. 只输出系统提示本身,不要前缀、解释或代码块。
-2. 描述命令的职责、如何处理用户输入、产出什么格式。
-3. 抽象可复用的步骤/规则/方法论,不要复述对话里的具体内容或数据。
-4. 简洁,用中文,面向之后每次独立调用都能完成任务。`
+1. 正文只描述可复用的职责/规则/流程,不要复述对话里的具体内容或数据。
+2. tools 必须忠实反映对话中用到的工具,不要凭空添加。
+3. 简洁、用中文,面向之后每次独立调用都能完成任务。`
 
 var skillNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
@@ -61,7 +69,9 @@ func cmdRepl(args []string) int {
 	return replLoop(cfg, alias, system, seed, *noStream, os.Stdin)
 }
 
-// replLoop runs the interactive session; in is parameterized for tests.
+// replLoop runs the interactive session; in is parameterized for tests. The
+// loop is agentic: every user line may trigger read_file/write_file tool calls.
+// noStream is accepted for CLI compat; agent turns are non-streaming in v1.
 func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Reader) int {
 	history := make([]Message, 0, 8)
 	if strings.TrimSpace(system) != "" {
@@ -71,7 +81,24 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 		history = append(history, Message{Role: "user", Content: seed})
 	}
 
-	fmt.Fprintln(os.Stderr, "多轮会话已开始。/exit 退出,/save <name> 沉淀为可复用命令。")
+	policy, err := newFilePolicy(cfg.FileRoots, cfg.WriteConfirm)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gw:", err)
+		return 1
+	}
+	log, err := StartSession(sessionsDir())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gw: sessionlog:", err)
+		return 1
+	}
+	defer log.Close()
+	emit(log, SessionEvent{Type: evSessionStarted, Model: alias})
+	if seed != "" {
+		emit(log, SessionEvent{Type: evUserMessage, Content: seed})
+	}
+	endSession := func() { emit(log, SessionEvent{Type: evSessionEnded, Model: alias}) }
+
+	fmt.Fprintln(os.Stderr, "多轮 agent 会话已开始(可读写文件)。/exit 退出,/save <name> 沉淀为可复用命令。")
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for {
@@ -85,6 +112,7 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 		}
 		switch {
 		case line == "/exit" || line == "exit" || line == "quit":
+			endSession()
 			return 0
 		case strings.HasPrefix(line, "/save"):
 			if err := saveSession(cfg, alias, strings.TrimSpace(strings.TrimPrefix(line, "/save")), history); err != nil {
@@ -92,14 +120,19 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 			}
 		default:
 			history = append(history, Message{Role: "user", Content: line})
-			reply, err := replTurn(cfg, alias, history, noStream)
+			emit(log, SessionEvent{Type: evUserMessage, Content: line})
+			next, reply, err := agentReply(cfg, alias, history, policy, log, agentTools())
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "gw:", err)
 				continue
 			}
-			history = append(history, Message{Role: "assistant", Content: reply})
+			history = next
+			if reply != "" {
+				fmt.Println(reply)
+			}
 		}
 	}
+	endSession()
 	if err := sc.Err(); err != nil {
 		fmt.Fprintln(os.Stderr, "gw:", err)
 		return 1
@@ -107,29 +140,8 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 	return 0
 }
 
-// replTurn sends the full history and returns the assistant's full reply,
-// streaming it to stdout unless noStream is set.
-func replTurn(cfg *Config, alias string, history []Message, noStream bool) (string, error) {
-	client := NewClient(cfg)
-	ctx := context.Background()
-	if noStream {
-		out, err := client.Chat(ctx, alias, history)
-		if err != nil {
-			return "", err
-		}
-		fmt.Println(out)
-		return out, nil
-	}
-	var buf bytes.Buffer
-	if err := client.ChatStream(ctx, alias, history, io.MultiWriter(os.Stdout, &buf)); err != nil {
-		return "", err
-	}
-	fmt.Println()
-	return buf.String(), nil
-}
-
-// saveSession distills the conversation into a reusable command (a system
-// prompt) and persists it as promptsDir()/<name>.md.
+// saveSession distills the conversation into a structured reusable command and
+// persists it as promptsDir()/<name>.md (frontmatter + system prompt body).
 func saveSession(cfg *Config, alias, name string, history []Message) error {
 	if !skillNameRe.MatchString(name) {
 		return fmt.Errorf("/save 需要合法的命令名(字母/数字/._- 组成,如 /save weekly-report)")
@@ -145,20 +157,23 @@ func saveSession(cfg *Config, alias, name string, history []Message) error {
 	if err != nil {
 		return err
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
+	cmd, err := parseCommand([]byte(out))
+	if err != nil {
+		return err
+	}
+	if cmd.Body == "" {
 		return fmt.Errorf("沉淀结果为空")
 	}
 	dir := promptsDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := writeCommand(dir, name, cmd); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, name+".md")
-	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
-		return err
+	fmt.Printf("saved command → %s\n", commandPath(dir, name))
+	if len(cmd.Tools) > 0 {
+		fmt.Printf("复用: gw run %s \"输入\"\n", name)
+	} else {
+		fmt.Printf("复用: gw ask --prompt %s \"输入\"\n", name)
 	}
-	fmt.Printf("saved command → %s\n", path)
-	fmt.Printf("复用: gw ask --prompt %s \"输入\"\n", name)
 	return nil
 }
 
@@ -171,7 +186,9 @@ func hasAssistantReply(history []Message) bool {
 	return false
 }
 
-// renderTranscript serializes the history for the distillation request.
+// renderTranscript serializes the history for the distillation request: tool
+// calls render as their own lines so the distiller can decide which tools to
+// declare, and tool results are labeled to keep the transcript readable.
 func renderTranscript(history []Message) string {
 	var b strings.Builder
 	for _, m := range history {
@@ -180,7 +197,21 @@ func renderTranscript(history []Message) string {
 		case "system":
 			label = "系统指令"
 		case "assistant":
-			label = "助手"
+			if m.Content != "" {
+				label = "助手"
+			} else if len(m.ToolCalls) > 0 {
+				label = "工具调用"
+			} else {
+				continue
+			}
+		case "tool":
+			label = "工具结果"
+		}
+		if label == "工具调用" {
+			for _, tc := range m.ToolCalls {
+				b.WriteString("[工具调用] " + tc.Function.Name + " " + toolArgPath(tc.Function.Arguments) + "\n\n")
+			}
+			continue
 		}
 		b.WriteString("[" + label + "] " + m.Content + "\n\n")
 	}

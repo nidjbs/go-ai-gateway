@@ -54,6 +54,7 @@ func TestReplLoopSaveAndExit(t *testing.T) {
 	writeTestCLIConfig(t, srv.URL, "default_alias: chat\n")
 	state := t.TempDir()
 	t.Setenv("GW_PROMPTS_DIR", state)
+	t.Setenv("GW_SESSION_DIR", t.TempDir())
 
 	in := strings.NewReader("hello\n/save weekly-report\n/exit\n")
 	if code := replLoop(loadTestCLIConfig(t), "chat", "", "", false, in); code != 0 {
@@ -81,8 +82,12 @@ func TestReplLoopSaveAndExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "distilled command" {
-		t.Fatalf("saved file = %q", data)
+	cmd, err := parseCommand(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Name != "weekly-report" || cmd.Body != "distilled command" {
+		t.Fatalf("saved command = %+v", cmd)
 	}
 }
 
@@ -90,6 +95,7 @@ func TestReplLoopSeedAndSystem(t *testing.T) {
 	srv, reqs := replMock(t)
 	defer srv.Close()
 	writeTestCLIConfig(t, srv.URL, "default_alias: chat\n")
+	t.Setenv("GW_SESSION_DIR", t.TempDir())
 
 	in := strings.NewReader("hi\n/exit\n")
 	if code := replLoop(loadTestCLIConfig(t), "chat", "sys-prompt", "seed-content", false, in); code != 0 {
@@ -104,10 +110,23 @@ func TestReplLoopSeedAndSystem(t *testing.T) {
 		t.Fatalf("messages = %v", got)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !messagesEqual(got[i], want[i]) {
 			t.Fatalf("messages[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
+}
+
+// messagesEqual compares Message structs (not comparable once ToolCalls exists).
+func messagesEqual(a, b Message) bool {
+	if a.Role != b.Role || a.Content != b.Content || a.ToolCallID != b.ToolCallID || len(a.ToolCalls) != len(b.ToolCalls) {
+		return false
+	}
+	for i := range a.ToolCalls {
+		if a.ToolCalls[i] != b.ToolCalls[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestSaveSessionInvalid(t *testing.T) {
@@ -149,6 +168,7 @@ func TestRunReplExit(t *testing.T) {
 	old := os.Stdin
 	os.Stdin = in
 	defer func() { os.Stdin = old }()
+	t.Setenv("GW_SESSION_DIR", t.TempDir())
 
 	if code := run([]string{"repl"}); code != 0 {
 		t.Fatalf("run(repl) = %d", code)

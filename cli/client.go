@@ -10,10 +10,49 @@ import (
 	"strings"
 )
 
-// Message is one OpenAI-style chat message.
+// Message is one OpenAI-style chat message. ToolCallID is set for role=tool
+// results, ToolCalls for role=assistant function-call turns.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+}
+
+// ToolCall is one function call requested by the model.
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction carries the invoked function's name and JSON arguments.
+type ToolFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// ToolSpec advertises a callable tool to the model (OpenAI function calling).
+type ToolSpec struct {
+	Type     string           `json:"type"`
+	Function ToolSpecFunction `json:"function"`
+}
+
+// ToolSpecFunction describes one function to the model.
+type ToolSpecFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+// AgentResult is one non-streaming agent turn: reply content, requested tool
+// calls, finish reason, and token usage.
+type AgentResult struct {
+	Content      string
+	ToolCalls    []ToolCall
+	FinishReason string
+	InputTokens  int
+	OutputTokens int
 }
 
 // Client talks to a running go-ai-gateway over its OpenAI-compatible API and
@@ -42,15 +81,15 @@ func NewClient(cfg *Config) *Client {
 
 // do performs an authenticated request; body nil means no payload.
 func (c *Client) do(ctx context.Context, method, path, token string, body any) (*http.Response, error) {
-	return c.doURL(ctx, method, c.baseURL, path, token, body)
+	return c.doURL(ctx, method, c.baseURL, path, token, body, "")
 }
 
 // doAdmin is do against the admin (ops) endpoint.
 func (c *Client) doAdmin(ctx context.Context, method, path string, body any) (*http.Response, error) {
-	return c.doURL(ctx, method, c.adminURL, path, c.adminToken, body)
+	return c.doURL(ctx, method, c.adminURL, path, c.adminToken, body, "")
 }
 
-func (c *Client) doURL(ctx context.Context, method, base, path, token string, body any) (*http.Response, error) {
+func (c *Client) doURL(ctx context.Context, method, base, path, token string, body any, reqID string) (*http.Response, error) {
 	var rdr io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -68,6 +107,9 @@ func (c *Client) doURL(ctx context.Context, method, base, path, token string, bo
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if reqID != "" {
+		req.Header.Set("X-Request-Id", reqID)
 	}
 	return c.http.Do(req)
 }
@@ -159,6 +201,51 @@ func (c *Client) Chat(ctx context.Context, model string, messages []Message) (st
 		return "", fmt.Errorf("empty completion response")
 	}
 	return out.Choices[0].Message.Content, nil
+}
+
+// AgentTurn runs one non-streaming chat turn with tools, returning the model's
+// reply plus any tool calls it requested. reqID is forwarded as X-Request-Id so
+// gateway-side events correlate with the CLI session log.
+func (c *Client) AgentTurn(ctx context.Context, reqID, model string, messages []Message, tools []ToolSpec) (*AgentResult, error) {
+	payload := map[string]any{"model": model, "messages": messages, "stream": false}
+	if len(tools) > 0 {
+		payload["tools"] = tools
+	}
+	resp, err := c.doURL(ctx, http.MethodPost, c.baseURL, "/v1/chat/completions", c.apiKey, payload, reqID)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiError(resp)
+	}
+	var out struct {
+		Choices []struct {
+			Message struct {
+				Content   string     `json:"content"`
+				ToolCalls []ToolCall `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if len(out.Choices) == 0 {
+		return nil, fmt.Errorf("empty completion response")
+	}
+	m := out.Choices[0].Message
+	return &AgentResult{
+		Content:      m.Content,
+		ToolCalls:    m.ToolCalls,
+		FinishReason: out.Choices[0].FinishReason,
+		InputTokens:  out.Usage.PromptTokens,
+		OutputTokens: out.Usage.CompletionTokens,
+	}, nil
 }
 
 // Reload triggers the gateway's config hot-reload; path optionally overrides

@@ -21,6 +21,10 @@ func run(args []string) int {
 		return cmdAsk(args[1:])
 	case "repl":
 		return cmdRepl(args[1:])
+	case "run":
+		return cmdRun(args[1:])
+	case "schedule":
+		return cmdSchedule(args[1:])
 	case "trans":
 		return cmdTrans(args[1:])
 	case "summarize":
@@ -55,7 +59,9 @@ func usage() {
 用法:
   gw models                     列出 gateway 可用别名
   gw ask [选项] "问题"           通用对话,可用 --prompt 指定 prompt
-  gw repl [选项]                多轮会话;/save <name> 沉淀为可复用命令
+  gw repl [选项]                多轮 agent 会话(可读写文件);/save <name> 沉淀为可复用命令
+  gw run <command> [input]      以 agent 循环执行保存的命令(声明 tools 时自动可用)
+  gw schedule                   调度:list / set <cmd> <cron> / unset / run / start / stop
   gw trans [选项] "文本"         翻译(内置 prompt)
   gw summarize [选项]           总结(读取文件或 stdin)
   gw explain [选项] "问题"       解释内容
@@ -73,8 +79,10 @@ func usage() {
 
 配置: ~/.config/gw/config.yaml
   gateway_url, api_key, admin_token, default_alias
-  环境变量: GW_GATEWAY_URL GW_API_KEY GW_ADMIN_TOKEN GW_ALIAS
+  file_roots: repl 可读写的目录(默认当前目录);write_confirm: auto/always/never
+  环境变量: GW_GATEWAY_URL GW_API_KEY GW_ADMIN_TOKEN GW_ALIAS GW_FILE_ROOTS
   自定义 prompt: ~/.config/gw/prompts/<name>.md
+  会话日志: ~/.config/gw/sessions/<id>.jsonl(GW_SESSION_DIR 可覆盖)
 `)
 }
 
