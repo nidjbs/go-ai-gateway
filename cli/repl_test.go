@@ -160,6 +160,17 @@ func TestSaveSessionInvalid(t *testing.T) {
 	}
 }
 
+func TestReplExitChinese(t *testing.T) {
+	srv, _ := replMock(t)
+	defer srv.Close()
+	writeTestCLIConfig(t, srv.URL, "default_alias: chat\n")
+
+	in := strings.NewReader("退出\n")
+	if code := replLoop(loadTestCLIConfig(t), "chat", "", "", false, in, newTestSession(t)); code != 0 {
+		t.Fatalf("replLoop with 退出 = %d", code)
+	}
+}
+
 func TestReplResume(t *testing.T) {
 	srv, reqs := replMock(t)
 	defer srv.Close()

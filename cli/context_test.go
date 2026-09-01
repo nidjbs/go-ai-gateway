@@ -78,6 +78,34 @@ func TestMaybeCompactNoTrigger(t *testing.T) {
 	}
 }
 
+func TestForceCompactSlidesToLowWater(t *testing.T) {
+	s := buildSession(t, 9) // 18 messages
+	forceCompact(s, 20)     // force regardless of high-water
+	if got := len(s.Messages()); got != 12 {
+		t.Fatalf("surface after force compact = %d, want 12", got)
+	}
+}
+
+func TestForceCompactPrunesRetainedToolResults(t *testing.T) {
+	s, err := StartSession(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	big := strings.Repeat("x", toolResultThreshold+100)
+	s.Emit(SessionEvent{Type: evUserMessage, Role: "user", Content: "u"})
+	s.Emit(SessionEvent{Type: evToolResult, Role: "tool", ToolCallID: "c1", Content: big})
+	forceCompact(s, 20)
+	msgs := s.Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("surface = %d, want 2 (nothing dropped)", len(msgs))
+	}
+	last := msgs[len(msgs)-1]
+	if len(last.Content) >= len(big) || !strings.Contains(last.Content, "中间省略") {
+		t.Fatalf("retained tool result not pruned: len=%d", len(last.Content))
+	}
+}
+
 func TestMaybeCompactDisabled(t *testing.T) {
 	s := buildSession(t, 30)
 	maybeCompact(s, 0, 20)

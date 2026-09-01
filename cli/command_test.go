@@ -86,6 +86,28 @@ func TestLoadCommandBuiltin(t *testing.T) {
 	}
 }
 
+func TestParseCommandOutput(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		body string
+	}{
+		{"well-formed", "---\nname: x\ndescription: d\n---\n\n正文", "正文"},
+		{"code-fenced", "```\n---\nname: x\n---\n\n正文\n```", "正文"},
+		{"unclosed-frontmatter", "---\nname: x\ndescription: d\n\n正文", "正文"},
+		{"plain-body", "直接正文内容", "直接正文内容"},
+	}
+	for _, tc := range cases {
+		cmd, err := parseCommandOutput(tc.name, tc.in)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if cmd.Name != tc.name || cmd.Body != tc.body {
+			t.Fatalf("%s: got %+v, body want %q", tc.name, cmd, tc.body)
+		}
+	}
+}
+
 func TestSystemPromptForStripsFrontmatter(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "y.md"), []byte("---\nname: y\n---\n\nbody here\n"), 0o600); err != nil {

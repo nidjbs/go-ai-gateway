@@ -46,6 +46,44 @@ func parseCommand(data []byte) (*Command, error) {
 	return cmd, nil
 }
 
+// parseCommandOutput turns a model's distillation output into a Command,
+// tolerating common format drift: surrounding code fences and a missing
+// frontmatter closing marker. Falls back to treating the output as the body.
+func parseCommandOutput(name, out string) (*Command, error) {
+	out = strings.TrimSpace(out)
+	out = strings.TrimPrefix(out, "```")
+	out = strings.TrimSuffix(out, "```")
+	out = strings.TrimSpace(out)
+	parse := func(s string) (*Command, error) {
+		cmd, err := parseCommand([]byte(s))
+		if err != nil || strings.TrimSpace(cmd.Body) == "" {
+			return nil, errors.New("invalid command output")
+		}
+		cmd.Name = name
+		return cmd, nil
+	}
+	if cmd, err := parse(out); err == nil {
+		return cmd, nil
+	}
+	// Repair: if the model opened frontmatter but never closed it, close it at
+	// the first blank line so the rest becomes the body.
+	if strings.HasPrefix(out, frontmatterDelim+"\n") {
+		if idx := strings.Index(out, "\n\n"); idx > 0 {
+			repaired := out[:idx] + "\n" + frontmatterDelim + out[idx:]
+			if cmd, err := parse(repaired); err == nil {
+				return cmd, nil
+			}
+		}
+	}
+	// Last resort: drop a stray opener and use the rest as the body.
+	body := strings.TrimPrefix(out, frontmatterDelim+"\n")
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return nil, errors.New("沉淀结果为空")
+	}
+	return &Command{Name: name, Body: body}, nil
+}
+
 // marshal renders the full command file: frontmatter + blank line + body.
 func (c *Command) marshal() ([]byte, error) {
 	meta := struct {

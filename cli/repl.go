@@ -130,9 +130,14 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 			continue
 		}
 		switch {
-		case line == "/exit" || line == "exit" || line == "quit":
+		case line == "/exit" || line == "exit" || line == "quit" || line == "退出":
 			endSession()
 			return 0
+		case strings.HasPrefix(line, "/compact"):
+			before := len(sess.Messages())
+			forceCompact(sess, window)
+			after := len(sess.Messages())
+			fmt.Fprintf(os.Stderr, "gw: 已压缩上下文 %d → %d 条\n", before, after)
 		case strings.HasPrefix(line, "/save"):
 			if err := saveSession(cfg, alias, strings.TrimSpace(strings.TrimPrefix(line, "/save")), sess.FullTranscript()); err != nil {
 				fmt.Fprintln(os.Stderr, "gw:", err)
@@ -183,12 +188,9 @@ func saveSession(cfg *Config, alias, name string, history []Message) error {
 	if err != nil {
 		return err
 	}
-	cmd, err := parseCommand([]byte(out))
+	cmd, err := parseCommandOutput(name, out)
 	if err != nil {
 		return err
-	}
-	if cmd.Body == "" {
-		return fmt.Errorf("沉淀结果为空")
 	}
 	dir := promptsDir()
 	if err := writeCommand(dir, name, cmd); err != nil {
