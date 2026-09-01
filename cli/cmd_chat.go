@@ -37,13 +37,12 @@ func runChat(cfg *Config, alias, systemPrompt, userContent string, noStream bool
 	return 0
 }
 
-// modelFlags binds both -m and --model and returns the effective alias. The
-// value must be a gateway-configured alias (see `gw models`); it is passed as
-// the request model so the gateway resolves the upstream provider/model.
-func modelFlags(fs *flag.FlagSet, cfg *Config) string {
+// modelFlags binds both -m and --model and returns a resolver for the effective
+// alias. Call the resolver after fs.Parse so the flag values are populated.
+func modelFlags(fs *flag.FlagSet, cfg *Config) func() string {
 	m := fs.String("m", "", "调用模型名(gateway 别名,可用 gw models 查看)")
 	long := fs.String("model", "", "调用模型名(gateway 别名,可用 gw models 查看)")
-	return firstNonEmpty(*m, *long, cfg.DefaultAlias)
+	return func() string { return firstNonEmpty(*m, *long, cfg.DefaultAlias) }
 }
 
 // loadCLIConfig loads the CLI config, printing a failure and exiting on error.
@@ -75,13 +74,14 @@ func cmdAsk(args []string) int {
 		return code
 	}
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
-	alias := modelFlags(fs, cfg)
+	aliasOf := modelFlags(fs, cfg)
 	promptShort := fs.String("p", "", "prompt name, file, or raw prompt text")
 	promptLong := fs.String("prompt", "", "prompt name, file, or raw prompt text")
 	noStream := fs.Bool("no-stream", false, "non-streaming output")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	alias := aliasOf()
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "gw: ask requires a question")
 		return 2
@@ -100,12 +100,13 @@ func cmdTrans(args []string) int {
 		return code
 	}
 	fs := flag.NewFlagSet("trans", flag.ContinueOnError)
-	alias := modelFlags(fs, cfg)
+	aliasOf := modelFlags(fs, cfg)
 	to := fs.String("t", "", "target language (default: auto-detect, 中文↔English)")
 	noStream := fs.Bool("no-stream", false, "non-streaming output")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	alias := aliasOf()
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "gw: trans requires text to translate")
 		return 2
@@ -127,12 +128,13 @@ func cmdSummarize(args []string) int {
 		return code
 	}
 	fs := flag.NewFlagSet("summarize", flag.ContinueOnError)
-	alias := modelFlags(fs, cfg)
+	aliasOf := modelFlags(fs, cfg)
 	file := fs.String("f", "", "file to summarize (- = stdin)")
 	noStream := fs.Bool("no-stream", false, "non-streaming output")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	alias := aliasOf()
 	content, err := readInput(fs, *file)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gw:", err)
@@ -151,12 +153,13 @@ func cmdExplain(args []string) int {
 		return code
 	}
 	fs := flag.NewFlagSet("explain", flag.ContinueOnError)
-	alias := modelFlags(fs, cfg)
+	aliasOf := modelFlags(fs, cfg)
 	file := fs.String("f", "", "file to explain (- = stdin)")
 	noStream := fs.Bool("no-stream", false, "non-streaming output")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	alias := aliasOf()
 	content, err := readInput(fs, *file)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gw:", err)
@@ -175,12 +178,13 @@ func cmdCommit(args []string) int {
 		return code
 	}
 	fs := flag.NewFlagSet("commit", flag.ContinueOnError)
-	alias := modelFlags(fs, cfg)
+	aliasOf := modelFlags(fs, cfg)
 	file := fs.String("f", "", "diff file to use instead of `git diff`")
 	noStream := fs.Bool("no-stream", false, "non-streaming output")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	alias := aliasOf()
 	content, err := readInput(fs, *file)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gw:", err)
