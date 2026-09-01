@@ -14,7 +14,7 @@ cd "$root_dir"
 
 step() { printf '\n\033[1m[%s/%s] %s\033[0m\n' "$1" "$total" "$2"; }
 
-total=8
+total=9
 step 1 "gofmt (no unformatted files)"
 test -z "$(gofmt -l .)"
 
@@ -27,16 +27,19 @@ go test ./...
 step 4 "build gateway binary"
 go build -o /dev/null ./cmd/gateway
 
-step 5 "e2e: core capabilities"
+step 5 "cli: unit + e2e"
+(cd cli && go test ./... && go test -tags e2e ./...)
+
+step 6 "e2e: core capabilities"
 scripts/e2e.sh
 
-step 6 "e2e: api-key auth / rate limits / quotas"
+step 7 "e2e: api-key auth / rate limits / quotas"
 scripts/e2e_apikey.sh
 
-step 7 "e2e: release features (strategies / DLP / idempotency / admin / breaker)"
+step 8 "e2e: release features (strategies / DLP / idempotency / admin / breaker)"
 scripts/e2e_release.sh
 
-step 8 "build container image"
+step 9 "build container image"
 if [[ "${RELEASE_SKIP_DOCKER:-0}" == "1" ]] || ! command -v docker >/dev/null 2>&1; then
   printf 'docker unavailable; skipping container build (RELEASE_SKIP_DOCKER=%s)\n' "${RELEASE_SKIP_DOCKER:-0}"
 else
