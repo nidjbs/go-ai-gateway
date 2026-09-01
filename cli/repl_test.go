@@ -160,6 +160,25 @@ func TestSaveSessionInvalid(t *testing.T) {
 	}
 }
 
+func TestReplDefaultPrompt(t *testing.T) {
+	srv, reqs := replMock(t)
+	defer srv.Close()
+	writeTestCLIConfig(t, srv.URL, "default_alias: chat\n")
+	t.Setenv("GW_STATE_DIR", t.TempDir()) // no agent.md
+
+	in := strings.NewReader("hi\n/exit\n")
+	if code := replLoop(loadTestCLIConfig(t), "chat", "", "", false, in, newTestSession(t)); code != 0 {
+		t.Fatalf("replLoop = %d", code)
+	}
+	if len(*reqs) == 0 {
+		t.Fatal("no requests")
+	}
+	msgs := (*reqs)[0].Messages
+	if len(msgs) == 0 || msgs[0].Role != "system" || msgs[0].Content != defaultAgentPrompt {
+		t.Fatalf("default prompt not injected: %+v", msgs)
+	}
+}
+
 func TestReplAgentRules(t *testing.T) {
 	srv, reqs := replMock(t)
 	defer srv.Close()
