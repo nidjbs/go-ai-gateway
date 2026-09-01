@@ -118,7 +118,7 @@ gw repl -f notes.txt                  # 用文件内容作为首条消息
 gw repl --resume 20260831T...-abcd    # 从该 session 日志恢复并继续
 ```
 
-会话内命令：`/save <name>` 沉淀命令，`/exit` 退出。
+会话内命令：`/compact` 立即压缩上下文（压到约 60% 低水位），`/save <name>` 沉淀命令，`/exit` 退出。
 
 ### 上下文窗口（滑动压缩 = compaction）
 
