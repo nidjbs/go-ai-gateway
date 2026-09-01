@@ -16,11 +16,12 @@ func cmdRun(args []string) int {
 		return code
 	}
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	alias := modelFlags(fs, cfg)
+	aliasOf := modelFlags(fs, cfg)
 	file := fs.String("f", "", "read input from file (- = stdin)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	alias := aliasOf()
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "gw: usage: gw run <command> [input...]")
 		return 2
@@ -101,9 +102,11 @@ func runCommand(cfg *Config, alias string, cmd *Command, userContent string) int
 	if rules := loadAgentRules(); rules != "" {
 		emit(log, SessionEvent{Type: evSystemContext, Role: "system", Content: rules})
 	}
-	if cmd.Body != "" {
-		emit(log, SessionEvent{Type: evSystemContext, Role: "system", Content: cmd.Body})
+	body := strings.TrimSpace(cmd.Body)
+	if body == "" {
+		body = defaultAgentPrompt
 	}
+	emit(log, SessionEvent{Type: evSystemContext, Role: "system", Content: body})
 	if userContent != "" {
 		emit(log, SessionEvent{Type: evUserMessage, Role: "user", Content: userContent})
 	}

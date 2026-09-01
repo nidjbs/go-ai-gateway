@@ -39,7 +39,7 @@ func cmdRepl(args []string) int {
 		return code
 	}
 	fs := flag.NewFlagSet("repl", flag.ContinueOnError)
-	alias := modelFlags(fs, cfg)
+	aliasOf := modelFlags(fs, cfg)
 	systemShort := fs.String("system", "", "initial system prompt (name, file, or raw text)")
 	promptShort := fs.String("p", "", "alias for --system")
 	promptLong := fs.String("prompt", "", "alias for --system")
@@ -49,6 +49,7 @@ func cmdRepl(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	alias := aliasOf()
 	if fs.NArg() > 0 {
 		fmt.Fprintln(os.Stderr, "gw: repl takes no positional args")
 		return 2
@@ -106,9 +107,11 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 	fresh := len(sess.events) == 0
 	if fresh {
 		emit(sess, SessionEvent{Type: evSessionStarted, Model: alias})
-		if strings.TrimSpace(system) != "" {
-			emit(sess, SessionEvent{Type: evSystemContext, Role: "system", Content: system})
+		systemPrompt := strings.TrimSpace(system)
+		if systemPrompt == "" {
+			systemPrompt = defaultAgentPrompt
 		}
+		emit(sess, SessionEvent{Type: evSystemContext, Role: "system", Content: systemPrompt})
 		if rules := loadAgentRules(); rules != "" {
 			emit(sess, SessionEvent{Type: evSystemContext, Role: "system", Content: rules})
 		}

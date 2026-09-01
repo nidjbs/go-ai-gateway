@@ -47,6 +47,33 @@ func TestRunCommandWithTools(t *testing.T) {
 	}
 }
 
+func TestRunDefaultPrompt(t *testing.T) {
+	t.Setenv("GW_SESSION_DIR", t.TempDir())
+	t.Setenv("GW_STATE_DIR", t.TempDir()) // no agent.md
+	var got []Message
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []Message `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		got = req.Messages
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "ok"}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := &Config{GatewayURL: srv.URL, APIKey: "sk-test", DefaultAlias: "chat"}
+	cmd := &Command{Name: "empty"} // no body
+	captureStdout(t, func() int { return runCommand(cfg, "chat", cmd, "hi") })
+	if len(got) != 2 || got[0].Role != "system" || got[0].Content != defaultAgentPrompt || got[1].Role != "user" {
+		t.Fatalf("default prompt not injected: %+v", got)
+	}
+}
+
 func TestRunAgentRules(t *testing.T) {
 	t.Setenv("GW_SESSION_DIR", t.TempDir())
 	state := t.TempDir()
