@@ -160,6 +160,34 @@ func TestSaveSessionInvalid(t *testing.T) {
 	}
 }
 
+func TestReplAgentRules(t *testing.T) {
+	srv, reqs := replMock(t)
+	defer srv.Close()
+	writeTestCLIConfig(t, srv.URL, "default_alias: chat\n")
+	state := t.TempDir()
+	t.Setenv("GW_STATE_DIR", state)
+	if err := os.WriteFile(filepath.Join(state, "agent.md"), []byte("必须用中文回复"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	in := strings.NewReader("hi\n/exit\n")
+	if code := replLoop(loadTestCLIConfig(t), "chat", "", "", false, in, newTestSession(t)); code != 0 {
+		t.Fatalf("replLoop = %d", code)
+	}
+	if len(*reqs) == 0 {
+		t.Fatal("no requests")
+	}
+	var lastSystem *Message
+	for i := range (*reqs)[0].Messages {
+		if (*reqs)[0].Messages[i].Role == "system" {
+			lastSystem = &(*reqs)[0].Messages[i]
+		}
+	}
+	if lastSystem == nil || lastSystem.Content != "必须用中文回复" {
+		t.Fatalf("agent rules not injected: %+v", (*reqs)[0].Messages)
+	}
+}
+
 func TestReplExitChinese(t *testing.T) {
 	srv, _ := replMock(t)
 	defer srv.Close()

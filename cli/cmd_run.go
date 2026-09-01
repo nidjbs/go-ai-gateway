@@ -98,6 +98,9 @@ func runCommand(cfg *Config, alias string, cmd *Command, userContent string) int
 	}
 	defer log.Close()
 	emit(log, SessionEvent{Type: evSessionStarted, Model: alias})
+	if rules := loadAgentRules(); rules != "" {
+		emit(log, SessionEvent{Type: evSystemContext, Role: "system", Content: rules})
+	}
 	if cmd.Body != "" {
 		emit(log, SessionEvent{Type: evSystemContext, Role: "system", Content: cmd.Body})
 	}

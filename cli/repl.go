@@ -109,6 +109,9 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 		if strings.TrimSpace(system) != "" {
 			emit(sess, SessionEvent{Type: evSystemContext, Role: "system", Content: system})
 		}
+		if rules := loadAgentRules(); rules != "" {
+			emit(sess, SessionEvent{Type: evSystemContext, Role: "system", Content: rules})
+		}
 		if seed != "" {
 			emit(sess, SessionEvent{Type: evUserMessage, Role: "user", Content: seed})
 		}

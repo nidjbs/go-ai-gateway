@@ -47,6 +47,46 @@ func TestRunCommandWithTools(t *testing.T) {
 	}
 }
 
+func TestRunAgentRules(t *testing.T) {
+	t.Setenv("GW_SESSION_DIR", t.TempDir())
+	state := t.TempDir()
+	t.Setenv("GW_STATE_DIR", state)
+	if err := os.WriteFile(filepath.Join(state, "agent.md"), []byte("必须用中文"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var got []Message
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []Message `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		got = req.Messages
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "ok"}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := &Config{GatewayURL: srv.URL, APIKey: "sk-test", DefaultAlias: "chat"}
+	cmd := &Command{Name: "plain", Body: "你是助手。"}
+	captureStdout(t, func() int { return runCommand(cfg, "chat", cmd, "hi") })
+	if len(got) != 3 {
+		t.Fatalf("messages = %d, want 3 (rules + body + user)", len(got))
+	}
+	if got[0].Role != "system" || got[0].Content != "必须用中文" {
+		t.Fatalf("first message = %+v, want agent rules", got[0])
+	}
+	if got[1].Role != "system" || got[1].Content != "你是助手。" {
+		t.Fatalf("second message = %+v, want command body", got[1])
+	}
+	if got[2].Role != "user" {
+		t.Fatalf("third = %+v", got[2])
+	}
+}
+
 func TestRunCommandNoToolsSingleTurn(t *testing.T) {
 	t.Setenv("GW_SESSION_DIR", t.TempDir())
 	hadTools := false
