@@ -153,6 +153,21 @@ context_trigger: 20     # 剩余容量低于该百分比时触发压缩
 | `delete_file` | 删文件 |
 | `rename` | 移动 / 重命名文件或目录 |
 
+### 剪贴板历史（本地模型召回）
+
+`gw clipboard start` 启动后台 watcher（轮询 `pbpaste`，去重、上限 500 条），把复制过的内容累积到 `<state>/clipboard.jsonl`（0600）。
+
+**安全模型（远端模型不可信）**：剪贴板是密钥库，agent 的远端模型**不接触剪贴板**。语义召回走**独立本地模型 alias**（`clipboard_local_alias` 配置，指向本地 Ollama 等）——剪贴板内容只在本机处理：
+
+```sh
+gw clipboard start                       # 启动后台 watcher
+gw clipboard find password               # 本地模糊召回(子串/leet/n-gram), 展示全文
+gw clipboard recall "找回那个密码"        # 本地模型语义召回, 自动复制回剪贴板
+gw clipboard stop / clear
+```
+
+配置：`~/.config/gw/config.yaml` 加 `clipboard_local_alias: local`（指向本地模型的 gateway 别名，如 Ollama qwen），或用 `GW_CLIPBOARD_LOCAL_ALIAS`。REPL 内 `/clipboard recall <描述>` 同样走本地模型、不进会话上下文。
+
 ### 权限模型
 
 - `file_roots`（配置，默认 = 会话启动时的工作目录）白名单允许访问的目录。路径先规范化（解析符号链接与 `..`）再校验，白名单外一律拒绝。
@@ -233,6 +248,7 @@ gw schedule stop                            # 停止
 | `gw repl [-m alias] [--system p] [-f file] [--resume id]` | 多轮 agent 会话（可读写文件、流式输出、事件溯源）；`/save <name>` 沉淀命令，`--resume` 恢复上次会话 |
 | `gw run <command> [input]` | 以 agent 方式运行保存的命令（声明 tools 自动可用） |
 | `gw schedule [set/unset/run/start/stop]` | 管理内置调度器 |
+| `gw clipboard [list/find/start/stop/clear]` | 剪贴板历史（供 `clipboard_find` 工具召回） |
 | `gw ask [-m alias] [-p prompt] "问题"` | 单轮对话（无工具） |
 | `gw trans [-m alias] [-t lang] "文本"` | 翻译 |
 | `gw summarize [-m alias] [-f file\|-]` | 总结 |

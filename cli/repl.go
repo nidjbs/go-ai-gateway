@@ -144,6 +144,24 @@ func replLoop(cfg *Config, alias, system, seed string, noStream bool, in io.Read
 			forceCompact(sess, window)
 			after := len(sess.Messages())
 			fmt.Fprintf(os.Stderr, "gw: 已压缩上下文 %d → %d 条\n", before, after)
+		case strings.HasPrefix(line, "/clipboard"):
+			// Clipboard content is sensitive: recall goes through the LOCAL model
+			// only, never into the remote agent's context or the session log.
+			q := strings.TrimSpace(strings.TrimSpace(strings.TrimPrefix(line, "/clipboard")))
+			q = strings.TrimSpace(strings.TrimPrefix(q, "recall"))
+			if q == "" {
+				fmt.Fprintln(os.Stderr, "gw: 用法 /clipboard recall <描述> (本地模型召回,不经远端)")
+				continue
+			}
+			text, err := recallClipboard(cfg, q)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "gw:", err)
+				continue
+			}
+			fmt.Println(text)
+			if copyToPasteboard(text) {
+				fmt.Fprintln(os.Stderr, "gw: 已复制到剪贴板")
+			}
 		case strings.HasPrefix(line, "/save"):
 			if err := saveSession(cfg, alias, strings.TrimSpace(strings.TrimPrefix(line, "/save")), sess.FullTranscript()); err != nil {
 				fmt.Fprintln(os.Stderr, "gw:", err)

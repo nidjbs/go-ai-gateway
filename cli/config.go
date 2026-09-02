@@ -30,6 +30,9 @@ type Config struct {
 	// ContextTrigger is the remaining-window percentage below which compression
 	// kicks in (trim large tool results + slide out the oldest). nil = 20.
 	ContextTrigger *int `yaml:"context_trigger"`
+	// ClipboardLocalAlias is a gateway alias pointing at a LOCAL model, used for
+	// clipboard recall so sensitive content never reaches a remote provider.
+	ClipboardLocalAlias string `yaml:"clipboard_local_alias"`
 }
 
 // gwStateDir returns the CLI's state directory: config, prompts, and the
@@ -112,6 +115,9 @@ func loadConfig() (*Config, error) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.ContextTrigger = &n
 		}
+	}
+	if v := os.Getenv("GW_CLIPBOARD_LOCAL_ALIAS"); v != "" {
+		cfg.ClipboardLocalAlias = v
 	}
 	return cfg, nil
 }

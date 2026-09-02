@@ -25,6 +25,8 @@ func run(args []string) int {
 		return cmdRun(args[1:])
 	case "schedule":
 		return cmdSchedule(args[1:])
+	case "clipboard":
+		return cmdClipboard(args[1:])
 	case "trans":
 		return cmdTrans(args[1:])
 	case "summarize":
@@ -62,6 +64,7 @@ func usage() {
   gw repl [选项]                多轮 agent 会话(可读写文件);/save <name> 沉淀为可复用命令
   gw run <command> [input]      以 agent 循环执行保存的命令(声明 tools 时自动可用)
   gw schedule                   调度:list / set <cmd> <cron> / unset / run / start / stop
+  gw clipboard                  剪贴板历史:list / start / stop / clear(供 clipboard_find 工具召回)
   gw trans [选项] "文本"         翻译(内置 prompt)
   gw summarize [选项]           总结(读取文件或 stdin)
   gw explain [选项] "问题"       解释内容
