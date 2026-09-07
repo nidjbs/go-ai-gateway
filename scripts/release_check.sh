@@ -30,6 +30,9 @@ go build -o /dev/null ./cmd/gateway
 step 5 "cli: unit + e2e"
 (cd cli && go test ./... && go test -tags e2e ./...)
 
+step "5.5" "cli: eval snapshot 回归(确定性 fake)"
+(cd cli && go run . eval snapshot eval/cases --golden eval/golden --report "$(mktemp)")
+
 step 6 "e2e: core capabilities"
 scripts/e2e.sh
 

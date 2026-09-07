@@ -1,0 +1,11 @@
+name: real-ask-single
+strategy: real
+command: ask
+input: 用中文解释 goroutine 与线程的区别,并给出一个避免数据竞争的具体做法。简洁一点。
+expect:
+  contains:
+    - goroutine
+    - 线程
+  regex:
+    - 锁|Mutex|原子|channel|Channel
+timeout: 120s

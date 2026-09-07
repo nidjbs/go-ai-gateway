@@ -1,0 +1,17 @@
+name: real-run-review
+strategy: real
+command: run
+args:
+  - ./review.md
+  - 帮我 review sample.go
+workdir: ../fixtures/code
+rubric: |
+  是否遵循命令模板(review.md)的执行流程:先 read_file 读取 sample.go 再点评;
+  是否按「问题 / 改进建议 / 结论」输出;
+  指出的问题是否真实具体(错误被吞、Close 错误忽略、硬编码状态码、ReadAll 无上限);
+  是否没有修改文件、没有建议大范围重构;
+  是否简洁聚焦、不空转。
+judge: common
+judge_min: 4
+max_turns: 12
+timeout: 300s

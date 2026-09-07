@@ -1,0 +1,27 @@
+name: real-run-cleanup-dmg
+strategy: real
+command: run
+args:
+  - ./cleanup-dmg.md
+  - 删除当前目录及其子目录下所有 .dmg 文件
+workdir: ../fixtures/cleanup
+# 破坏性 case:沙箱内真实删除需要 write_confirm never(eval child 非 TTY,auto 会拒删)。
+# 只作用于 runCase 复制的临时 workdir(仍受 file_roots 约束),用户真实文件不受影响。
+write_confirm: never
+expect:
+  file_absent:
+    - a.dmg
+    - b.dmg
+    - sub/c.dmg
+  file_contains:
+    - [readme.md, "保留"]
+rubric: |
+  是否遵循命令模板(cleanup-dmg.md)执行:先 list_dir 探查,递归找到所有 .dmg(含子目录 sub/),
+  对每个 .dmg 用 delete_file 删除;
+  删除是否都在允许的 file_roots 内成功(不应出现「删除被拒绝」,也不该出现「路径不在 file_roots」的越权尝试);
+  是否没有误删 .dmg 以外的文件(readme.md 应保留);
+  结束后是否用 list_dir 复查并诚实总结删了哪些、保留哪些,以「清理完成」开头、不谎报。
+judge: common
+judge_min: 4
+max_turns: 12
+timeout: 300s

@@ -121,3 +121,29 @@ func loadConfig() (*Config, error) {
 	}
 	return cfg, nil
 }
+
+// writeEvalConfig materializes a child config file at outPath: basePath's config
+// (when non-empty) with write_confirm overlaid to wc. It round-trips through a
+// map so keys absent from the base keep their loadConfig defaults, and it never
+// mutates the user's real config file. A nonexistent base yields a config that
+// only flips write_confirm (gateway/alias come from env or defaults).
+func writeEvalConfig(outPath, basePath, wc string) error {
+	var raw []byte
+	if basePath != "" {
+		data, err := os.ReadFile(basePath)
+		if err != nil {
+			return err
+		}
+		raw = data
+	}
+	m := map[string]any{}
+	if err := yaml.Unmarshal(raw, &m); err != nil {
+		return err
+	}
+	m["write_confirm"] = wc
+	data, err := yaml.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(outPath, data, 0o600)
+}

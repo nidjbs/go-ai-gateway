@@ -1,0 +1,9 @@
+name: run-demo
+strategy: mock
+command: run
+args:
+  - ./demo.md
+  - 演示一下
+workdir: ../fixtures/run-demo
+stub:
+  - text: 演示命令执行成功。

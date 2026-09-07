@@ -1,0 +1,19 @@
+name: real-repl-advice
+strategy: real
+command: repl
+alias: common
+workdir: ../fixtures/code
+script: |
+  读 sample.go,指出里面的问题并给 3 条具体改进建议。不要改文件。
+  /exit
+rubric: |
+  是否真的先用 read_file 读了文件(而非凭空猜内容);
+  指出的问题是否真实且具体(错误被静默吞掉、resp.Body.Close() 错误被忽略、
+  状态码硬编码 200、io.ReadAll 无大小上限等);
+  建议是否可执行、是否落到具体行/函数;
+  是否遵守"不要改文件";
+  是否礼貌简洁、不空转、不编造。
+judge: common
+judge_min: 4
+max_turns: 12
+timeout: 300s

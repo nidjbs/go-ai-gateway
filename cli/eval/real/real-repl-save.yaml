@@ -1,0 +1,18 @@
+name: real-repl-save
+strategy: real
+command: repl
+alias: common
+script: |
+  你好
+  /save weekly-report 每周一早汇总销售数据,按产品汇总金额与同比,输出 markdown 周报到 weekly-report.md
+  y
+  退出
+artifacts:
+  - prompts/weekly-report.md
+expect:
+  contains:
+    - saved command
+  file_contains:
+    - [prompts/weekly-report.md, "name: weekly-report"]
+max_turns: 6
+timeout: 300s

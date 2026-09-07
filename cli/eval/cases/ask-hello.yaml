@@ -1,0 +1,6 @@
+name: ask-hello
+strategy: mock
+command: ask
+input: 你好
+stub:
+  - text: 你好，我是 gw，可以帮你处理重复工作。
