@@ -19,7 +19,8 @@ const truncMarker = "\n… [截断,超过 64KiB]"
 
 // agentTools returns the tool set advertised to the model in agent sessions.
 func agentTools() []ToolSpec {
-	return []ToolSpec{toolReadFile, toolWriteFile, toolListDir, toolDeleteFile, toolMkdir, toolDeleteDir, toolRename}
+	return []ToolSpec{toolReadFile, toolWriteFile, toolListDir, toolDeleteFile, toolMkdir, toolDeleteDir, toolRename,
+		toolFindFiles, toolSearchText, toolTailFile, toolRememberNotes, toolRecallNotes}
 }
 
 var toolReadFile = ToolSpec{
@@ -468,6 +469,12 @@ func (p *FilePolicy) DispatchTool(call ToolCall) (string, error) {
 		Recursive bool   `json:"recursive"`
 		Src       string `json:"src"`
 		Dst       string `json:"dst"`
+		Name      string `json:"name"`
+		Pattern   string `json:"pattern"`
+		Regex     bool   `json:"regex"`
+		Lines     int    `json:"lines"`
+		Text      string `json:"text"`
+		Query     string `json:"query"`
 	}
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 		return "", fmt.Errorf("tool %s 参数解析失败: %w", call.Function.Name, err)
@@ -505,7 +512,66 @@ func (p *FilePolicy) DispatchTool(call ToolCall) (string, error) {
 			return "", fmt.Errorf("rename 缺少 src/dst")
 		}
 		return p.rename(args.Src, args.Dst)
+	case "find_files":
+		return p.findFiles(args.Name, args.Path)
+	case "search_text":
+		return p.searchText(args.Pattern, args.Path, args.Regex)
+	case "tail_file":
+		return p.tailFile(args.Path, args.Lines)
+	case "remember":
+		return p.remember(args.Text)
+	case "recall_notes":
+		return p.recallNotes(args.Query)
 	default:
 		return "", fmt.Errorf("未知工具 %q", call.Function.Name)
 	}
+}
+
+var toolFindFiles = ToolSpec{
+	Type: "function",
+	Function: ToolSpecFunction{
+		Name:        "find_files",
+		Description: "Recursively find files under a directory (within the allowed roots) whose name matches a glob like \"*.go\" or \"*test*\". Skips hidden dirs and symlinks. Returns matching paths relative to the base.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name": map[string]any{"type": "string", "description": "Glob pattern to match file names against."},
+				"path": map[string]any{"type": "string", "description": "Directory to search from (default: the working directory)."},
+			},
+			"required": []string{"name"},
+		},
+	},
+}
+
+var toolSearchText = ToolSpec{
+	Type: "function",
+	Function: ToolSpecFunction{
+		Name:        "search_text",
+		Description: "Search file contents under a directory (within the allowed roots) for a substring (case-insensitive) or a regex when regex=true. Returns \"path:line: text\" matches; skips binary and oversized files.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pattern": map[string]any{"type": "string", "description": "Substring (case-insensitive) or, when regex=true, an RE2 regex."},
+				"path":    map[string]any{"type": "string", "description": "Directory to search from (default: the working directory)."},
+				"regex":   map[string]any{"type": "boolean", "description": "Treat pattern as a regex (default false)."},
+			},
+			"required": []string{"pattern"},
+		},
+	},
+}
+
+var toolTailFile = ToolSpec{
+	Type: "function",
+	Function: ToolSpecFunction{
+		Name:        "tail_file",
+		Description: "Return the last N lines of a text file within the allowed roots (default 200). Useful for large logs; reads only the tail of big files.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":  map[string]any{"type": "string", "description": "Path to the file to tail."},
+				"lines": map[string]any{"type": "integer", "description": "Number of trailing lines to return (default 200)."},
+			},
+			"required": []string{"path"},
+		},
+	},
 }

@@ -110,7 +110,7 @@ func runCommand(cfg *Config, alias string, cmd *Command, userContent string) int
 	if userContent != "" {
 		emit(log, SessionEvent{Type: evUserMessage, Role: "user", Content: userContent})
 	}
-	_, reply, err := agentReply(cfg, alias, log.Messages(), policy, log, selectTools(cmd.Tools), nil)
+	_, reply, err := agentReply(cfg, alias, log.Messages(), policy, log, memoryTools(selectTools(cmd.Tools)), nil)
 	emit(log, SessionEvent{Type: evSessionEnded, Model: alias})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gw:", err)

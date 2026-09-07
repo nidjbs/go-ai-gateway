@@ -67,25 +67,23 @@ func TestReplLoopSaveAndExit(t *testing.T) {
 	t.Setenv("GW_PROMPTS_DIR", state)
 	t.Setenv("GW_SESSION_DIR", t.TempDir())
 
-	in := strings.NewReader("hello\n/save weekly-report\n/exit\n")
+	in := strings.NewReader("hello\n/save weekly-report 每周一早汇总上周销售生成周报\ny\n/exit\n")
 	if code := replLoop(loadTestCLIConfig(t), "chat", "", "", false, in, newTestSession(t)); code != 0 {
 		t.Fatalf("replLoop = %d", code)
 	}
 
-	// The distill request must carry the distillation prompt + transcript.
-	var saveReq *replReq
-	for i := range *reqs {
-		if !(*reqs)[i].Stream {
-			saveReq = &(*reqs)[i]
-		}
+	// The distill request must carry the distillation prompt + goal + transcript.
+	saveReq := distillReqs(reqs)
+	if len(saveReq) != 1 {
+		t.Fatalf("distill requests = %d, want 1", len(saveReq))
 	}
-	if saveReq == nil {
-		t.Fatal("no non-stream (distill) request found")
-	}
-	if got := saveReq.Messages[0].Role; got != "system" {
+	if got := saveReq[0].Messages[0].Role; got != "system" {
 		t.Fatalf("distill system role = %q", got)
 	}
-	if got := saveReq.Messages[1].Content; !strings.Contains(got, "[助手]") || !strings.Contains(got, "hello") {
+	if got := saveReq[0].Messages[1].Content; !strings.Contains(got, "目的/目标") || !strings.Contains(got, "周报") {
+		t.Fatalf("distill goal = %q", got)
+	}
+	if got := saveReq[0].Messages[2].Content; !strings.Contains(got, "[助手]") || !strings.Contains(got, "hello") {
 		t.Fatalf("distill transcript = %q", got)
 	}
 
@@ -99,6 +97,78 @@ func TestReplLoopSaveAndExit(t *testing.T) {
 	}
 	if cmd.Name != "weekly-report" || cmd.Body != "distilled command" {
 		t.Fatalf("saved command = %+v", cmd)
+	}
+}
+
+// distillReqs returns the non-stream chat requests (each one is a /save distill call).
+func distillReqs(reqs *[]replReq) []replReq {
+	var out []replReq
+	for _, r := range *reqs {
+		if !r.Stream {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func TestReplSaveAskGoalThenCancel(t *testing.T) {
+	srv, reqs := replMock(t)
+	defer srv.Close()
+	writeTestCLIConfig(t, srv.URL, "default_alias: chat\n")
+	state := t.TempDir()
+	t.Setenv("GW_PROMPTS_DIR", state)
+	t.Setenv("GW_SESSION_DIR", t.TempDir())
+
+	// 缺省目的句 → 会话内补问一行("生成周报");确认输 n → 不落盘。
+	in := strings.NewReader("hello\n/save demo-cmd\n生成周报\nn\n/exit\n")
+	if code := replLoop(loadTestCLIConfig(t), "chat", "", "", false, in, newTestSession(t)); code != 0 {
+		t.Fatalf("replLoop = %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(state, "demo-cmd.md")); !os.IsNotExist(err) {
+		t.Fatal("cancel must not write a file")
+	}
+	ds := distillReqs(reqs)
+	if len(ds) != 1 {
+		t.Fatalf("distill requests = %d, want 1", len(ds))
+	}
+	if got := ds[0].Messages[1].Content; !strings.Contains(got, "目的/目标: 生成周报") {
+		t.Fatalf("goal message = %q", got)
+	}
+}
+
+func TestReplSaveRedraftOnNewGoal(t *testing.T) {
+	srv, reqs := replMock(t)
+	defer srv.Close()
+	writeTestCLIConfig(t, srv.URL, "default_alias: chat\n")
+	state := t.TempDir()
+	t.Setenv("GW_PROMPTS_DIR", state)
+	t.Setenv("GW_SESSION_DIR", t.TempDir())
+
+	// 确认时输入非 y/n 文本 → 当作新目的句重新提炼,再 y 保存。
+	in := strings.NewReader("hello\n/save demo-cmd 目标甲\n目标乙\ny\n/exit\n")
+	if code := replLoop(loadTestCLIConfig(t), "chat", "", "", false, in, newTestSession(t)); code != 0 {
+		t.Fatalf("replLoop = %d", code)
+	}
+	ds := distillReqs(reqs)
+	if len(ds) != 2 {
+		t.Fatalf("distill requests = %d, want 2", len(ds))
+	}
+	if got := ds[0].Messages[1].Content; !strings.Contains(got, "目标甲") {
+		t.Fatalf("first goal = %q", got)
+	}
+	if got := ds[1].Messages[1].Content; !strings.Contains(got, "目标乙") {
+		t.Fatalf("second goal = %q", got)
+	}
+	data, err := os.ReadFile(filepath.Join(state, "demo-cmd.md"))
+	if err != nil {
+		t.Fatalf("confirmed save missing: %v", err)
+	}
+	cmd, err := parseCommand(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Name != "demo-cmd" {
+		t.Fatalf("saved name = %q", cmd.Name)
 	}
 }
 
@@ -147,16 +217,34 @@ func TestSaveSessionInvalid(t *testing.T) {
 	t.Setenv("GW_PROMPTS_DIR", state)
 
 	for _, name := range []string{"", "a b", "../evil", "-lead", "a/b"} {
-		if err := saveSession(cfg, "chat", name, history); err == nil {
-			t.Fatalf("saveSession(%q) = nil, want error", name)
+		if _, err := distillCommand(cfg, "chat", name, "", history); err == nil {
+			t.Fatalf("distillCommand(%q) = nil, want error", name)
 		}
 	}
-	if err := saveSession(cfg, "chat", "no-reply", nil); err == nil {
-		t.Fatal("saveSession with no assistant reply = nil, want error")
+	if _, err := distillCommand(cfg, "chat", "no-reply", "", nil); err == nil {
+		t.Fatal("distillCommand with no assistant reply = nil, want error")
 	}
 	// No file must be written for the valid-name-but-empty-history case.
 	if _, err := os.Stat(filepath.Join(state, "no-reply.md")); !os.IsNotExist(err) {
 		t.Fatal("unexpected file written")
+	}
+}
+
+func TestReplRememberSlash(t *testing.T) {
+	// /remember 走本地写入,不触发网络调用。
+	state := t.TempDir()
+	t.Setenv("GW_STATE_DIR", state)
+	cfg := &Config{GatewayURL: "http://127.0.0.1:1", DefaultAlias: "chat"}
+	in := strings.NewReader("/remember 部署在 10.0.0.7 端口 3000\n/exit\n")
+	if code := replLoop(cfg, "chat", "", "", false, in, newTestSession(t)); code != 0 {
+		t.Fatalf("replLoop = %d", code)
+	}
+	data, err := os.ReadFile(filepath.Join(state, "notes.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "10.0.0.7") {
+		t.Fatalf("notes = %s", data)
 	}
 }
 

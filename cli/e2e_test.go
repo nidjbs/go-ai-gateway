@@ -277,8 +277,8 @@ func TestCLIE2E(t *testing.T) {
 		}
 	}
 
-	// /save：mock 返回未闭合 frontmatter → 自动修复并落盘
-	runREPLInput(t, "你好\n/save demo-cmd\n退出\n")
+	// /save：mock 返回未闭合 frontmatter → 自动修复;预览后确认(y)才落盘
+	runREPLInput(t, "你好\n/save demo-cmd e2e 演示的可复用命令\ny\n退出\n")
 	cmdData, err := os.ReadFile(filepath.Join(state, "prompts", "demo-cmd.md"))
 	if err != nil {
 		t.Fatalf("saved command missing: %v", err)
