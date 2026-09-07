@@ -16,8 +16,11 @@
 # ① 对话 —— agent 会话，可读写文件（流式输出）
 gw repl -m common
 
-# ② 沉淀 —— 把一段成功的对话蒸馏成一个可复用命令
-gw> /save weekly-report
+# ② 沉淀 —— 给一段成功的对话加上"目的句"，蒸馏成可复用命令
+#    预览确认后才会落盘（可输入新目的句重新提炼，n 取消）
+gw> /save weekly-report 每周一早汇总上周销售、产出周报
+…（打印完整草稿预览，含整体执行流程）…
+gw: 确认? [y]保存 [n]取消 [输入新目的句重新提炼]: y
 saved command → ~/.config/gw/prompts/weekly-report.md
 
 # ③ 执行 —— 随时以 agent 方式运行，命令声明的工具自动可用
@@ -118,7 +121,7 @@ gw repl -f notes.txt                  # 用文件内容作为首条消息
 gw repl --resume 20260831T...-abcd    # 从该 session 日志恢复并继续
 ```
 
-会话内命令：`/compact` 立即压缩上下文（压到约 60% 低水位），`/save <name>` 沉淀命令，`/exit` 退出。
+会话内命令：`/compact` 立即压缩上下文（压到约 60% 低水位），`/save <name>` 沉淀命令，`/remember <text>` 记一条跨会话笔记，`/clipboard recall <描述>` 本地模型召回剪贴板，`/exit` 退出。
 
 ### 全局规范：`agent.md`
 
@@ -143,15 +146,18 @@ context_trigger: 20     # 剩余容量低于该百分比时触发压缩
 
 环境变量：`GW_CONTEXT_WINDOW` `GW_CONTEXT_TRIGGER`。
 
-### 工具集（文件/目录增删改查）
+### 工具集
 
 | 工具 | 作用 |
 |---|---|
 | `read_file` / `write_file` | 读 / 写文件（写会自动建父目录） |
 | `list_dir` | 列出目录条目（d/f 前缀 + 名称 + 大小 + 时间） |
 | `mkdir` / `delete_dir` | 建目录 / 删目录（`recursive: true` 连内容删） |
-| `delete_file` | 删文件 |
-| `rename` | 移动 / 重命名文件或目录 |
+| `delete_file` / `rename` | 删文件 / 移动或重命名文件或目录 |
+| `find_files` | 递归找文件（`*.go` 等 glob，跳过隐藏目录与软链） |
+| `search_text` | 搜文件内容（子串或 `regex: true` 正则，输出 `path:line: text`） |
+| `tail_file` | 返回大文件末尾 N 行（默认 200，只读尾部） |
+| `remember` / `recall_notes` | 写/取跨会话笔记（见下「跨会话记忆」） |
 
 ### 剪贴板历史（本地模型召回）
 
@@ -168,6 +174,24 @@ gw clipboard stop / clear
 
 配置：`~/.config/gw/config.yaml` 加 `clipboard_local_alias: local`（指向本地模型的 gateway 别名，如 Ollama qwen），或用 `GW_CLIPBOARD_LOCAL_ALIAS`。REPL 内 `/clipboard recall <描述>` 同样走本地模型、不进会话上下文。
 
+### 跨会话记忆：笔记（`remember` / `recall_notes`）
+
+**与剪贴板的区别**：剪贴板按“远端不可信、绝不外泄”处理；笔记则是**显式写入的记忆，本来就要在需要时交给 agent**（它被 `recall_notes` 取回时会进入远程 model 上下文并写入会话日志）。因此**别把密钥/密码写进笔记**——要保存秘密用剪贴板，别用笔记。
+
+```sh
+gw remember 用户偏好用中文回复        # 记一条(本地 <state>/notes.jsonl, 0600)
+gw notes list                       # 列出(带行号)
+gw notes find 部署                   # 本地模糊召回(复用剪贴板的子串/leet/n-gram 打分)
+gw notes forget 3                   # 忘掉第 3 条
+```
+
+REPL 内：`/remember 部署在 10.0.0.7 端口 3000` 直接记一条。agent 会话里模型可用两个工具：
+
+- `remember <text>` —— agent 发起写入，**需交互确认**（TTY 上提示笔记内容确认；非交互自动拒绝，遵循 `write_confirm` 的 auto/never 语义）。
+- `recall_notes <query>` —— 只读召回：带 query 按模糊分返回最相关的几条，空 query 返回最近几条。
+
+只有当笔记库非空时才会向模型**广告** `recall_notes`（空库不暴露，避免模型空转）；`remember` 始终可用。
+
 ### 权限模型
 
 - `file_roots`（配置，默认 = 会话启动时的工作目录）白名单允许访问的目录。路径先规范化（解析符号链接与 `..`）再校验，白名单外一律拒绝。
@@ -179,9 +203,13 @@ file_roots:
 write_confirm: auto      # auto | always | never
 ```
 
-## 沉淀：`/save <name>`
+## 沉淀：`/save <name> [目的句]`
 
 把一段成功的对话蒸馏成一个可复用命令，存为 `~/.config/gw/prompts/<name>.md`（YAML frontmatter + 正文）。模型会根据对话中实际用到的工具，自动声明 `tools`。
+
+- 命令名后加一句**目的/目标**（如 `/save weekly-report 每周一早汇总上周销售`），蒸馏就会围绕该目标撰写 `description` 与正文，而不是让模型自由发挥；缺省时 REPL 会在会话内补问一句（直接回车＝按对话内容概括）。
+- 蒸馏出的正文会含一段编号的**整体执行流程**（输入→处理→产出、何时用工具），让之后每次独立调用都能可靠完成。
+- 保存前先打印完整**草稿预览**，等确认后才写盘：`y` 保存；`n` 或空回车取消；输入**其它文本**＝当作新目的句重新提炼。
 
 ```markdown
 ---
@@ -194,7 +222,7 @@ schedule: "0 9 * * 1"
 你是周报助手。汇总本周提交并生成周报...
 ```
 
-- `tools` — 命令可调用的工具（`read_file` `write_file` `list_dir` `delete_file` `mkdir` `delete_dir` `rename`）。
+- `tools` — 命令可调用的工具（`read_file` `write_file` `list_dir` `delete_file` `mkdir` `delete_dir` `rename` `find_files` `search_text` `tail_file` `remember` `recall_notes`）。
 - `schedule` — cron 表达式（`0 9 * * 1`）或 `@every 24h` / `@daily`，用于定时执行。
 - 旧的无 frontmatter 的 `.md` 提示文件仍然兼容。
 
@@ -247,8 +275,10 @@ gw schedule stop                            # 停止
 | `gw models` | 列出可用别名 |
 | `gw repl [-m alias] [--system p] [-f file] [--resume id]` | 多轮 agent 会话（可读写文件、流式输出、事件溯源）；`/save <name>` 沉淀命令，`--resume` 恢复上次会话 |
 | `gw run <command> [input]` | 以 agent 方式运行保存的命令（声明 tools 自动可用） |
+| `gw eval [snapshot\|quality] <dir> …` | 黄金回归（mock 快照）/ 真实多轮评测（judge 硬门禁） |
 | `gw schedule [set/unset/run/start/stop]` | 管理内置调度器 |
-| `gw clipboard [list/find/start/stop/clear]` | 剪贴板历史（供 `clipboard_find` 工具召回） |
+| `gw clipboard [list/find/start/stop/clear]` | 剪贴板历史（本地模型召回，不触远端） |
+| `gw remember <text>` / `gw notes [list/find/forget/count]` | 跨会话笔记：记一条 / 管理（供 agent `remember`/`recall_notes` 取回） |
 | `gw ask [-m alias] [-p prompt] "问题"` | 单轮对话（无工具） |
 | `gw trans [-m alias] [-t lang] "文本"` | 翻译 |
 | `gw summarize [-m alias] [-f file\|-]` | 总结 |
@@ -259,6 +289,39 @@ gw schedule stop                            # 停止
 | `gw usage [--alias a] [--from t] [--to t]` | 用量查询（需 admin_token） |
 
 通用选项：`-m/--model <别名>` 指定本次调用别名（默认 `default_alias`）；`--no-stream` 关闭流式。
+
+## 评测：gw eval
+
+golden 回归 + 真实多轮评测，见 docs/superpowers/specs/2026-09-03-cli-eval-golden-design.md。
+
+```sh
+# 确定性快照回归(mock,可入 release 门禁;比对 stdout/退出码/声明产物)
+gw eval snapshot cli/eval/cases --record      # 首次/缺 golden 时生成
+gw eval snapshot cli/eval/cases               # 回归: 变更会以 DIFF/退出码 1 暴露
+gw eval snapshot cli/eval/cases --update      # 有意刷新 golden(配合 git diff 审阅)
+
+# 真实多轮评测(需 gateway 就绪;不进 release 门禁)
+gw eval quality cli/eval/cases --report /tmp/q.md
+# case 显式写 judge: <alias> 才启用打分; judge < judge_min(默认4) → NEEDS_REVIEW 进人审,退出码 1
+
+# 真实评测集(cli/eval/real/, 用真实 LLM 跑 5 大域)
+gw eval quality cli/eval/real --filter real-repl-*   # 只跑 repl 域
+gw eval quality cli/eval/real --report /tmp/q.md     # 全量; 结果有 judge 层方差
+```
+
+### 真实评测集 cli/eval/real
+
+覆盖 repl 多轮核心 / 权限与安全边界 / `/save` 沉淀 / `run` 快捷固定命令 / 单轮 `ask` / 沙箱内
+文件清理六个域，fixtures 在 `cli/eval/fixtures/`。质量分三层：objective（expect 子串/正则/
+产物内容/文件不存在 `file_absent`）+ trajectory（越权/报错/超轮数）+ judge（LLM 按 rubric 打分，
+< judge_min → NEEDS_REVIEW）。已知两点：
+
+- 单轮 `ask`/`trans` 等不写 session 日志 → judge 拿不到回放，只能靠 objective 断言兜底。
+- `/save` 的提炼是第二次真实模型调用，上游偶发 5xx 会中断落盘并让后续确认流错位（产品层暂无重试）。
+
+破坏性删除 case（如删除 *.dmg）声明 `write_confirm: never`：eval 把 child config 覆盖到派生文件，
+`file_roots` 仍钉在临时 workdir，删除只发生在沙箱副本上，用户真实文件不受影响，用 `file_absent`
+确定性断言删除效果。
 
 ## 自定义 prompt
 
